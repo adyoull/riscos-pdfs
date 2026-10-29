@@ -27,7 +27,7 @@ module_start:
 	.word	flags - module_start
 
 title:	.asciz	"PDFS"
-help:	.asciz	"PDFS\t\t0.07 (29 Oct 2026)"
+help:	.asciz	"PDFS\t\t0.11 (29 Oct 2026)"
 	.align	2
 flags:	.word	1				@ 32-bit compatible
 
@@ -99,12 +99,27 @@ pd_service:
 @ Module start code, entered in USR mode by *Desktop_PDFSFiler or by
 @ *RMRun (double-clicking the module): no stack is given, so it sets its
 @ own (pd_task_stack in filer.c) before any C.
+@
+@ The start code can run while the filer task is already running: *RMRun
+@ (a double-click) enters it after the module's callback has started the
+@ filer. So it starts on a small stack of its own (pd_entry_stack), and
+@ moves to the filer task's stack (pd_task_stack) only when it is to be the
+@ filer (pd_run_filer). 0.09 started on the filer's stack, overwriting the
+@ running filer's frames: "abort on instruction fetch" when it next ran.
 pd_start:
 	ldr	sp, 2f
 1:	add	sp, sp, pc
 	bl	filer_entry
 	swi	0x11				@ OS_Exit (filer_entry doesn't return)
-2:	.word	pd_task_stack + 16384 - (1b + 8)
+2:	.word	pd_entry_stack + 2048 - (1b + 8)
+
+	.global	pd_run_filer
+pd_run_filer:
+	ldr	sp, 4f
+3:	add	sp, sp, pc
+	bl	filer_main
+	swi	0x11				@ OS_Exit (filer_main doesn't return)
+4:	.word	pd_task_stack + 16384 - (3b + 8)
 
 @ The Free module's call for free space (Free_Register): r0-r11 as a
 @ block for free_entry, which returns 1 to set Z (reason 3: same device).

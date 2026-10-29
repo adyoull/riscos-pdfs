@@ -44,7 +44,9 @@
 #define ICON_PRIORITY           0x30000000      /* right of the discs; each next icon one lower */
 
 int filer_task;                 /* 0: not running, -1: starting, else the task handle */
-uint32_t pd_task_stack[STACK_SIZE / 4];   /* the task's stack (pd_start) */
+uint32_t pd_task_stack[STACK_SIZE / 4];   /* the task's stack (pd_run_filer) */
+uint32_t pd_entry_stack[512];   /* the start code's (pd_start): never the task's */
+void pd_run_filer (void);       /* header.s: filer_main on pd_task_stack */
 
 /* Fixed slots: each icon's indirected text points into its slot, so slots
    never move while their icon exists */
@@ -654,7 +656,7 @@ filer_entry (void)
       || (filer_task == 0 && !swix_regs (0x400F2, &w) && w.r[0]))   /* Wimp_ReadSysInfo 3 */
     {
       filer_task = -1;
-      filer_main ();
+      pd_run_filer ();
     }
   regs x = {{ 0, 0, 0 }};
   swix_regs (OS_Exit, &x);
