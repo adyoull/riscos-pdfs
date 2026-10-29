@@ -1,0 +1,21 @@
+PDFSMount 127.0.0.1:7015
+Info PDFS::SimPhone-Internal.$.Download.pic/jpg
+CDir PDFS::SimPhone-Internal.$.Books
+CDir PDFS::SimPhone-Internal.$.Books.SF
+Copy rand PDFS::SimPhone-Internal.$.Books.SF.rand ~C~V
+Copy local PDFS::SimPhone-Internal.$.Books.Letter ~C~V
+Ex PDFS::SimPhone-Internal.$.Books
+Copy PDFS::SimPhone-Internal.$.Books.SF.rand back ~C~V
+Rename PDFS::SimPhone-Internal.$.Books.Letter PDFS::SimPhone-Internal.$.Books.Letter2
+Rename PDFS::SimPhone-Internal.$.Books.Letter2 PDFS::SimPhone-Internal.$.Books.SF.Letter3
+Copy PDFS::SimPhone-Internal.$.Books.SF.Letter3 PDFS::SimPhone-SD_card.$.OnCard ~C~V
+Run basic1
+Type PDFS::SimPhone-Internal.$.Books.made
+Run free
+Dir PDFS::SimPhone-Internal.$.Books
+Cat
+Delete PDFS::SimPhone-Internal.$.Books.made
+Wipe PDFS::SimPhone-Internal.$.Books R~C~V
+Cat PDFS::SimPhone-Internal.$
+Cat PDFS::SimPhone-SD_card.$
+PDFSDevices

@@ -9,6 +9,7 @@
 #define OS_Word                 0x07
 #define OS_FSControl            0x29
 #define OS_ReadMonotonicTime    0x42
+#define XReport_Text0           (0x20000 | 0x54C80)
 #define OS_SWINumberFromString  0x39
 #define Socket_Creat            0x41200
 #define Socket_Connect          0x41204
@@ -98,6 +99,12 @@ pd_log (const char *s)
     return;
   log_chars (s);
   log_chars ("\n");
+  if (pdfs_trace)                   /* also to Reporter (the test bed: RISCOS_REPORT) */
+    {
+      regs r = { { 0 } };
+      r.r[0] = (unsigned) s;
+      swix_regs (XReport_Text0, &r);
+    }
 }
 
 void
