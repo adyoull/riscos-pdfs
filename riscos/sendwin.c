@@ -28,6 +28,7 @@
 #define MessageTrans_OpenFile   0x41501
 #define MessageTrans_Lookup     0x41502
 #define MessageTrans_CloseFile  0x41504
+#define TaskManager_TaskNameFromHandle 0x42680
 
 /* FCount's icons (FilerAct h/actionwind) */
 #define I_PATH          2
@@ -269,6 +270,26 @@ close_window (void)
   is_open = 0;
 }
 
+/* Is this task a Filer_Action still running? Then its own window is (or
+   may be) showing this copy: ours waits till it has gone, and then opens
+   where Filer_Action's was (they're the same template), so the copy reads
+   as one window going on from reading to writing. */
+static int
+filer_action_running (uint32_t task)
+{
+  if (!task)
+    return 0;
+  regs r = {{ task }};
+  if (swix_regs (TaskManager_TaskNameFromHandle, &r))
+    return 0;                                     /* gone */
+  char name[48];
+  word (name, sizeof name, "89", "Filer Action Window");
+  const char *a = (const char *) r.r[0], *b = name;
+  while (*a >= ' ' && *a == *b)
+    a++, b++;
+  return *a < ' ' && *b < ' ';
+}
+
 void
 sendwin_update (void)
 {
@@ -318,7 +339,7 @@ sendwin_update (void)
       paused_shown = st.paused;
     }
   set_bar (st.batch_done, st.batch);
-  if (!is_open)
+  if (!is_open && !filer_action_running (st.owner))
     open_window ();
 }
 

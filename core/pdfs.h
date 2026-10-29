@@ -9,7 +9,7 @@
 #include <stdint.h>
 #include "transport.h"
 
-#define PDFS_VERSION "0.11"
+#define PDFS_VERSION "0.12"
 
 /* Filing system number: provisional until allocated by RISC OS Open. */
 #define PDFS_FSNUM 0xFA
@@ -55,6 +55,7 @@ typedef struct
   uint64_t left;                /* bytes still to send, of everything waiting */
   uint64_t batch, batch_done;   /* bytes since the queue was last empty, and sent */
   int files_done;               /* files sent since then */
+  uint32_t owner;               /* the task that wrote the one being sent */
 } pdfs_bg_state;
 void pdfs_bg_status (pdfs_bg_state *s);
 void pdfs_bg_pause (int on);

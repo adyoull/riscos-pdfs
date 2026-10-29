@@ -11,7 +11,8 @@ void *pd_alloc (size_t n);              /* zeroed; NULL if out of memory */
 void pd_free (void *p);
 void *pd_realloc (void *p, size_t n);   /* contents kept; NULL on failure (p kept) */
 
-unsigned pd_time_cs (void);             /* monotonic centiseconds */
+unsigned pd_time_cs (void);
+uint32_t pd_current_task (void);        /* the Wimp task running now (0: none) */             /* monotonic centiseconds */
 uint32_t pd_unix_time (void);           /* seconds since 1970, UTC */
 
 /* Log a line (no newline in s). Platforms may ignore it unless logging is on. */

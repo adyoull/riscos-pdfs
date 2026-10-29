@@ -27,7 +27,7 @@ module_start:
 	.word	flags - module_start
 
 title:	.asciz	"PDFS"
-help:	.asciz	"PDFS\t\t0.11 (29 Oct 2026)"
+help:	.asciz	"PDFS\t\t0.12 (29 Oct 2026)"
 	.align	2
 flags:	.word	1				@ 32-bit compatible
 

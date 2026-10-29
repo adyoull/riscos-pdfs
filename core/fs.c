@@ -1798,7 +1798,7 @@ stream_finish (ofile *f)
 
 #define BG_AT     (1u << 20)
 #define BG_PIECE  65536
-#define BG_QUEUE  4              /* files waiting at most; more: wait for the first */
+#define BG_QUEUE  24             /* files waiting at most (each holds its contents); more: wait for the first */
 
 typedef struct job job;
 struct job
@@ -1808,6 +1808,7 @@ struct job
   node *n;
   device *dv;
   int closing;                  /* all sent: waiting for the device's answer */
+  uint32_t owner;               /* the task that wrote it (Filer_Action, say) */
   unsigned wait_from;
   uint32_t sendlen;             /* bytes in the SendObject (the last may go by an edit) */
   uint64_t sent;
@@ -2089,6 +2090,7 @@ bg_queue (node *n, ofile *f)
   j->f = f;
   j->n = n;
   j->dv = n->st->dev;
+  j->owner = pd_current_task ();
   n->sending = 1;
   if (!jobs)
     {
@@ -2188,6 +2190,7 @@ pdfs_bg_status (pdfs_bg_state *s)
       s->batch_done += j->sent;
       if (!s->path[0] && j->n->parent)
         {
+          s->owner = j->owner;
           char tmp[512];
           node_path (tmp, tmp + sizeof tmp - 1, j->n);
           int l = (int) strlen (tmp);

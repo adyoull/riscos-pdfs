@@ -43,6 +43,12 @@ void *pd_alloc (size_t n) { return calloc (1, n ? n : 1); }
 void pd_free (void *p) { free (p); }
 void *pd_realloc (void *p, size_t n) { return realloc (p, n ? n : 1); }
 
+uint32_t
+pd_current_task (void)
+{
+  return 0;
+}
+
 unsigned
 pd_time_cs (void)
 {

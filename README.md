@@ -5,7 +5,7 @@ MTP (Media Transfer Protocol). A connected device's storages show up as
 discs, such as `PDFS::Pixel-Internal.$`, and work with the Filer, `*Copy`,
 BASIC's OPENIN/OPENOUT and every program that uses FileSwitch.
 
-Status: **0.11.** USB (the RISC OS 5 USB stack), the icon bar filer and
+Status: **0.12.** USB (the RISC OS 5 USB stack), the icon bar filer and
 filetype extensions are done. It's tested against a simulated device, over
 TCP and through an emulation of USBDriver and DeviceFS; it still has to be
 tried with more real devices (see docs/TESTING-ON-A-PI.md).
@@ -124,8 +124,12 @@ Files up to 4 GB (MTP's limit).
   (reading back a file being sent, deleting, renaming, ejecting) waits for
   the sending to finish. If a send fails (the device unplugged, say), the
   filer reports it and the file isn't left on the device half-written.
-- At most four big files wait at once (each holds its contents); a fifth
-  waits for the first to go. Quitting the desktop sends what's left first.
+- At most 24 files wait at once (each holds its contents); another waits
+  for the first to go.
+- When Filer_Action did the copy, its own window shows the copy first
+  (reading the files); PDFS's window opens when Filer_Action has finished,
+  in the same place (it's the same window design), and carries on with the
+  writing to the device: one window at a time, as if one copy. Quitting the desktop sends what's left first.
 - A file being written is kept in memory up to 4 MB; beyond that in a
   dynamic area, "PDFS transfer" (Task Manager shows it), while there's the
   memory (48 MB is always left free), and otherwise in a scrap file in

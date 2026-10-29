@@ -74,6 +74,13 @@ pd_realloc (void *p, size_t n)
 
 /* --- time -------------------------------------------------------------------------- */
 
+uint32_t
+pd_current_task (void)
+{
+  regs r = {{ 5 }};                 /* Wimp_ReadSysInfo 5: the current task */
+  return swix_regs (Wimp_ReadSysInfo, &r) ? 0 : r.r[0];
+}
+
 unsigned
 pd_time_cs (void)
 {
