@@ -889,7 +889,15 @@ mod_service (regs *r)
       break;
     case 0x79:                      /* Service_DeviceDead: R3 = the device's name */
       if (r->r[3])
-        usb_device_dead ((const char *) r->r[3]);
+        {
+          char m[64] = "Service_DeviceDead ";
+          int k = 19;
+          for (const char *q = (const char *) r->r[3]; *q > ' ' && k < 62; q++)
+            m[k++] = *q;
+          m[k] = 0;
+          pd_log (m);
+          usb_device_dead ((const char *) r->r[3]);
+        }
       break;
     case 0xD2:                      /* Service_USB */
       if (r->r[0] == 0)             /* Attach: the filer mounts it */

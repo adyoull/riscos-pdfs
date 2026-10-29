@@ -223,7 +223,24 @@ close_stream (int *h)
   if (handle)
     {
       regs r = {{ 0, (unsigned) handle }};
-      swix_regs (OS_Find, &r);
+      oserror *e = swix_regs (OS_Find, &r);
+      if (e)
+        {
+          /* FileSwitch keeps a written-to handle whose close fails */
+          char m[200] = "usb: closing handle ";
+          char *p = m;
+          while (*p)
+            p++;
+          *p++ = (char) ('0' + handle / 100 % 10);
+          *p++ = (char) ('0' + handle / 10 % 10);
+          *p++ = (char) ('0' + handle % 10);
+          *p++ = ':';
+          *p++ = ' ';
+          for (int i = 0; e->errmess[i] && p < m + sizeof m - 1; i++)
+            *p++ = e->errmess[i];
+          *p = 0;
+          pd_log (m);
+        }
     }
 }
 
@@ -541,6 +558,7 @@ usb_device_dead (const char *name)
           a++, b++;
         if (!*a && *b <= ' ')
           {
+            pd_log ("usb: the device has gone (Service_DeviceDead): closing its streams");
             /* Its streams are closed now, as SCSISoftUSB closes its pipes on
                Service_DeviceDead: left open, FileSwitch handles on a device
                DeviceFS has forgotten fail later ("Device not found" from
