@@ -716,6 +716,18 @@ mtp_stream_result (mtp_dev *d, uint32_t *rparams, int wait_cs)
   return e;
 }
 
+/* Give up a streamed transaction part way: the device is told to cancel
+   it (or the pipes are reset) before the next transaction. */
+void
+mtp_stream_abort (mtp_dev *d)
+{
+  if (!d->streaming)
+    return;
+  stream_failed (d);
+  if (mtp_recover (d, 1) < 0)
+    mtp_recover (d, 2);
+}
+
 int
 mtp_stream_end (mtp_dev *d, uint32_t *rparams)
 {

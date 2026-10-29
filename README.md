@@ -1,14 +1,14 @@
 # PDFS: Portable Device Filing System
 
-A RISC OS filing system module for phones, tablets and cameras that use
+A RISC OS filing system module for phones, tablets, media players and cameras that use
 MTP (Media Transfer Protocol). A connected device's storages show up as
 discs, such as `PDFS::Pixel-Internal.$`, and work with the Filer, `*Copy`,
 BASIC's OPENIN/OPENOUT and every program that uses FileSwitch.
 
-Status: **0.08.** USB (the RISC OS 5 USB stack), the icon bar filer and
+Status: **0.09.** USB (the RISC OS 5 USB stack), the icon bar filer and
 filetype extensions are done. It's tested against a simulated device, over
 TCP and through an emulation of USBDriver and DeviceFS; it still has to be
-tried with a real phone (see docs/TESTING-ON-A-PI.md).
+tried with more real devices (see docs/TESTING-ON-A-PI.md).
 
 Licence: Apache 2.0 (see LICENSE). It contains no GPL code.
 
@@ -22,6 +22,7 @@ Licence: Apache 2.0 (see LICENSE). It contains no GPL code.
 | `riscos/module.c`, `header.s` | the RISC OS module: header, veneers, *commands, TCP transport over the Internet module, MimeMap |
 | `riscos/usb.c` | the USB transport: finds MTP interfaces (Service_USB), DeviceFS streams for the endpoints |
 | `riscos/filer.c` | the icon bar filer: a drive icon for each storage, its menu, drag to copy, Free |
+| `riscos/sendwin.c` | Filer_Action's window (its own template and messages), shown while files are sent in the background |
 | `tools/mksprites.py` | draws the drive icon and makes the ResourceFS block |
 | `host/host.c` | `pdfs-host`: the same core on Linux, driven from the command line, for tests |
 | `sim/mtpsim.py` | a simulated MTP device over TCP; host folders are its storages |
@@ -40,7 +41,7 @@ Needs riscos-crossdev's toolchain (`RISCOS_TOOLCHAIN`, default
 
     *RMLoad PDFS
 
-In the desktop, plug the phone in and set it to *File transfer* (Android) or
+In the desktop, plug the device in and, on an Android device, set it to *File transfer* (Android) or
 unlock it: a drive icon appears on the icon bar for each of its storages
 ("Internal", "SD card"). Click it to open it; drag files to it to copy them.
 Its menu has Open '$', Free, **Eject** (that storage) and, when the device
@@ -66,7 +67,7 @@ Outside the desktop:
 
 Paths are `PDFS::<Model>-<Storage>.$.…`, e.g. `PDFS::Pixel_7-Internal.$.DCIM`.
 
-To try it without a phone: `python3 sim/mtpsim.py --port 7015 "Internal=/some/folder"`
+To try it without a device: `python3 sim/mtpsim.py --port 7015 "Internal=/some/folder"`
 and `*PDFSMount 127.0.0.1:7015`.
 
 ## Tests in riscos-linux-testbed
@@ -76,16 +77,16 @@ and `*PDFSMount 127.0.0.1:7015`.
     make out/PDFS-usbemu,ffa && TB=... tests/rol/run.sh --usbemu [--old-usbdriver] [--desktop]
 
 `--usbemu` uses a test build whose USB transport talks to an emulation of
-USBDriver and DeviceFS (tests/rol/usbemu.c): a fake phone, USB9, bridged to
+USBDriver and DeviceFS (tests/rol/usbemu.c): a fake MTP device, USB9, bridged to
 the simulator, which then fails any data phase that would need a USB
 zero-length packet (`--zlp-strict 512`).
 
 The CLI test covers *Cat/*Ex/*Info, *CDir, *Copy both ways and between
 storages, *Rename, BASIC OPENOUT/OPENUP/append, *Wipe, and free space.
-The desktop test opens Filer windows on the phone, copies a folder to it
+The desktop test opens Filer windows on the simulated device, copies a folder to it
 and a photo back with Filer_Action, saves 12 MB with one OS_File call, and
 saves screenshots; it measures the longest pause in the desktop during each
-(`PDFS_SIM_RATE=3000` makes the simulated phone take 3 MB/s).
+(`PDFS_SIM_RATE=3000` makes the simulated device take 3 MB/s).
 
 ## Names and types
 
@@ -109,17 +110,20 @@ Files up to 4 GB (MTP's limit).
   Filer copies a file that fits in its memory, it saves it with one
   OS_File call, and FileSwitch hands the whole file over inside that one
   call: if PDFS sent it there, the desktop would stop (the pointer moving,
-  nothing else) until the phone had it all. So, while the PDFS filer task
+  nothing else) until the device had it all. So, while the PDFS filer task
   is running, a new file of 1 MB or more is only kept as it's written, and
   closing it returns at once. The filer task then sends it a piece at a
-  time between other tasks' turns, and the device's icon shows how far it
-  has got (`42%`). Files, and new folders, that come while one is waiting
+  time between other tasks' turns, and shows Filer_Action's own window
+  while it does ("Copying files - Writing", the file's path, bytes to go,
+  files copied, the progress bar, Abort and Pause), loaded from Filer_Action's
+  resources so it looks and reads as every other copy does. Abort cancels
+  the transfer and removes the part-sent file from the device. Files, and new folders, that come while one is waiting
   go after it, in order.
 - Meanwhile directory listings come from what PDFS already knows, and the
   Free window shows the last figures. Anything else that needs the device
   (reading back a file being sent, deleting, renaming, ejecting) waits for
-  the sending to finish. If a send fails (the phone unplugged, say), the
-  filer reports it and the file isn't left on the phone half-written.
+  the sending to finish. If a send fails (the device unplugged, say), the
+  filer reports it and the file isn't left on the device half-written.
 - At most four big files wait at once (each holds its contents); a fifth
   waits for the first to go. Quitting the desktop sends what's left first.
 - A file being written is kept in memory up to 4 MB; beyond that in a
@@ -155,6 +159,6 @@ ROOL's documentation; on the Pi they didn't work, so they were taken out.)
 
 ## Not done yet
 
-- Testing with real phones and cameras (docs/TESTING-ON-A-PI.md).
+- Testing with more real devices: phones, tablets, media players, cameras (docs/TESTING-ON-A-PI.md).
 - SWIs (no SWI chunk yet). Filing system number &FA and error base &1FA00 are
   provisional until allocated by ROOL.

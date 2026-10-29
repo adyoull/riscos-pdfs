@@ -1,4 +1,4 @@
-# Testing PDFS with a real phone
+# Testing PDFS with a real device
 
 PDFS has mostly been tested against a simulated phone: over TCP, and
 through an emulation of RISC OS's USB stack. These steps try it with a real
@@ -48,14 +48,13 @@ class `06/01/01` and `- MTP`. Then:
 - Copy a file of exactly 500 bytes (500 + 12 = one 512-byte packet: the
   case that needs the zero-length-packet workaround).
 - Copy a large file (100 MB+) both ways: note the time.
-- Copying a big file to the phone (0.08): Filer_Action should finish
-  quickly, then the phone's icon counts up (`12%`, `13%`...) while it's
-  sent, and the desktop keeps going: move windows, the clock ticks. When the
-  icon shows its name again the file is on the phone. Try Eject during a
-  send (an hourglass, then it ejects once the file is there), and unplugging
+- Copying a big file to the device (0.09): Filer_Action reads the file;
+  then a "Copying files - Writing" window (Filer_Action's own) shows the
+  transfer to the device: bytes to go and the bar, while the desktop keeps
+  going (move windows, the clock ticks). Try Pause/Continue, and Abort (the
+  part-sent file should not be left on the device). Try Eject during a send
+  (an hourglass, then it ejects once the file is there), and unplugging
   during one (an error box saying the file couldn't be sent).
-- Make a directory, rename a file, delete it.
-- Menu > Free on the icon.
 - With an SD card in the phone: Menu > Eject on the SD card icon (only that
   icon goes), then Menu > Eject all on the other (a box says it can be
   unplugged). Try Eject while a file on the phone is open in an

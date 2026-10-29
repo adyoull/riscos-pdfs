@@ -20,6 +20,7 @@
 #include "pdfs.h"
 #include "filer.h"
 #include "usb.h"
+#include "sendwin.h"
 
 #define OS_CLI                  0x05
 #define OS_Exit                 0x11
@@ -51,7 +52,7 @@ typedef struct
 {
   int used, handle;
   char disc[40];
-  char text[16];                /* shown: the label, or how far a send has got */
+  char text[16];                /* shown under it */
   char label[16];               /* the storage's description */
 } baricon;
 
@@ -216,51 +217,23 @@ open_root (int k)
 /* --- files being sent in the background ------------------------------------------------
    PDFS returns from closing a big new file at once and sends it from here,
    a piece at a time on null events, so the desktop keeps going. Meanwhile
-   the device's icon shows how far it has got ("42%"). */
+   Filer_Action's own window shows how it's going (sendwin.c). */
 
 static int sending;
 
 static void
-show_progress (void)
-{
-  for (int k = 0; k < MAX_ICONS; k++)
-    {
-      if (!icons[k].used)
-        continue;
-      char t[16];
-      int p = pdfs_bg_progress (icons[k].disc);
-      if (p < 0)
-        for (int i = 0; i < 16; i++)
-          t[i] = icons[k].label[i];
-      else
-        {
-          int i = 0;
-          if (p >= 10)
-            t[i++] = (char) ('0' + p / 10);
-          t[i++] = (char) ('0' + p % 10);
-          t[i++] = '%';
-          t[i] = 0;
-        }
-      if (str_eq (t, icons[k].text))
-        continue;
-      for (int i = 0; i < 16; i++)
-        icons[k].text[i] = t[i];
-      unsigned blk[4] = { (unsigned) -2, (unsigned) icons[k].handle, 0, 0 };
-      regs r = {{ 0, (unsigned) blk }};
-      swix_regs (Wimp_SetIconState, &r);
-    }
-}
-
-static void
 send_some (void)
 {
-  sending = pdfs_bg_run (10);
+  int more = pdfs_bg_run (10);
+  pdfs_bg_state st;
+  pdfs_bg_status (&st);
+  sending = more && !st.paused;     /* paused: no need for null events */
   static unsigned shown;
   regs t = {{ 0 }};
   swix_regs (0x42, &t);                             /* OS_ReadMonotonicTime */
-  if (!sending || (int) (t.r[0] - shown) >= 0)
+  if (!more || (int) (t.r[0] - shown) >= 0)
     {
-      show_progress ();
+      sendwin_update ();
       shown = t.r[0] + 25;
     }
   const pd_error *e = pdfs_bg_error ();
@@ -477,7 +450,7 @@ message (int code)
         if ((int) block[8] != -2 || k < 0)
           return;
         char *e = append ((char *) &block[5],
-                          "This is a portable device's storage (a phone, tablet or camera).|M"
+                          "This is a portable device's storage (a phone, tablet, media player or camera).|M"
                           "Click SELECT to open it.|MDrag files here to copy them to it.|M"
                           "Click MENU for its menu.");
         send (block, 0x503, (int) (e - (char *) block) + 1, block[1], block[2]);
@@ -569,8 +542,10 @@ free_register (int on)
 void
 filer_quit (void)
 {
+  pdfs_bg_pause (0);
   pdfs_bg_finish ();            /* files still to send: now */
   pdfs_background = 0;
+  sendwin_finish ();
   free_register (0);
   if (filer_task > 0)
     {
@@ -625,6 +600,13 @@ filer_main (void)
           continue;
         }
       poll_errors = 0;
+      if (sendwin_event ((int) p.r[0], block))
+        {
+          pdfs_bg_state st;
+          pdfs_bg_status (&st);
+          sending = st.active && !st.paused;
+          continue;
+        }
       switch ((int) p.r[0])
         {
         case 0:                                     /* Null_Reason_Code */

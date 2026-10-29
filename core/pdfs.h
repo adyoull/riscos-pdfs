@@ -9,7 +9,7 @@
 #include <stdint.h>
 #include "transport.h"
 
-#define PDFS_VERSION "0.08"
+#define PDFS_VERSION "0.09"
 
 /* Filing system number: provisional until allocated by RISC OS Open. */
 #define PDFS_FSNUM 0xFA
@@ -47,6 +47,18 @@ int pdfs_bg_run (unsigned cs);             /* send for cs centiseconds; 1: more 
 void pdfs_bg_finish (void);                /* send the rest now */
 int pdfs_bg_progress (const char *disc);   /* percent, or -1: nothing being sent */
 const pd_error *pdfs_bg_error (void);      /* a send that failed, once */
+typedef struct
+{
+  int active;                   /* files waiting or being sent */
+  int paused;
+  char path[256];               /* the one being sent: "PDFS::disc.$.dir.name" */
+  uint64_t left;                /* bytes still to send, of everything waiting */
+  uint64_t batch, batch_done;   /* bytes since the queue was last empty, and sent */
+  int files_done;               /* files sent since then */
+} pdfs_bg_state;
+void pdfs_bg_status (pdfs_bg_state *s);
+void pdfs_bg_pause (int on);
+void pdfs_bg_abort_all (void);             /* stop: nothing half-sent is left */
 
 /* Settings */
 extern unsigned pdfs_dir_ttl_cs;          /* how long a directory listing stays fresh */

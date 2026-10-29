@@ -160,6 +160,7 @@ int mtp_stream_end (mtp_dev *d, uint32_t *rparams);
 /* end in two halves, so the response can be waited for a bit at a time */
 int mtp_stream_close (mtp_dev *d);
 int mtp_stream_result (mtp_dev *d, uint32_t *rparams, int wait_cs);
+void mtp_stream_abort (mtp_dev *d);
 
 /* Recover after a failed transfer (called by mtp_transaction itself). */
 int mtp_recover (mtp_dev *d, int level);

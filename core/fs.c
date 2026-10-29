@@ -1817,6 +1817,9 @@ struct job
 
 static job *jobs;
 static int in_job;
+static int bg_paused;
+static uint64_t bg_batch, bg_batch_done;   /* bytes queued since the queue was empty, sent */
+static int bg_files_done;
 static pd_error bg_err;
 static int bg_err_set;
 
@@ -1842,6 +1845,11 @@ job_free (job *j)
   ofile *f = j->f;
   node *n = j->n;
   n->sending = 0;
+  if (f)
+    {
+      bg_batch_done += f->size;
+      bg_files_done++;
+    }
   if (f)
     {
       f_free (f);
@@ -2082,6 +2090,13 @@ bg_queue (node *n, ofile *f)
   j->n = n;
   j->dv = n->st->dev;
   n->sending = 1;
+  if (!jobs)
+    {
+      bg_batch = bg_batch_done = 0;
+      bg_files_done = 0;
+    }
+  if (f)
+    bg_batch += f->size;
   job **pp = &jobs;
   while (*pp)
     pp = &(*pp)->next;
@@ -2123,6 +2138,8 @@ int
 pdfs_bg_run (unsigned cs)
 {
   unsigned until = (pd_time_cs () + cs) | 1;
+  if (bg_paused)
+    return jobs != 0;
   while (jobs)
     {
       job *j = jobs;
@@ -2134,6 +2151,93 @@ pdfs_bg_run (unsigned cs)
         break;
     }
   return jobs != 0;
+}
+
+static char *
+node_path (char *o, char *end, node *n)
+{
+  if (!n->parent)
+    {
+      o = cat (o, "PDFS::");
+      o = cat (o, n->st->disc);
+      return cat (o, ".$");
+    }
+  o = node_path (o, end, n->parent);
+  if (o < end - 2)
+    *o++ = '.';
+  for (const char *p = n->ro_name; p && *p && o < end - 1; p++)
+    *o++ = *p;
+  *o = 0;
+  return o;
+}
+
+void
+pdfs_bg_status (pdfs_bg_state *s)
+{
+  memset (s, 0, sizeof *s);
+  s->paused = bg_paused;
+  s->batch = bg_batch;
+  s->batch_done = bg_batch_done;
+  s->files_done = bg_files_done;
+  for (job *j = jobs; j; j = j->next)
+    {
+      if (!j->f)
+        continue;
+      s->active = 1;
+      s->left += j->f->size - j->sent;
+      s->batch_done += j->sent;
+      if (!s->path[0] && j->n->parent)
+        {
+          char tmp[512];
+          node_path (tmp, tmp + sizeof tmp - 1, j->n);
+          int l = (int) strlen (tmp);
+          const char *from = l > 255 ? tmp + l - 255 : tmp;   /* the end of a long one */
+          memcpy (s->path, from, strlen (from) + 1);
+        }
+    }
+  if (jobs)
+    s->active = 1;
+}
+
+void
+pdfs_bg_pause (int on)
+{
+  bg_paused = on;
+}
+
+/* Abort: everything waiting is dropped; the file being sent is cancelled
+   on the device and deleted there */
+void
+pdfs_bg_abort_all (void)
+{
+  bg_paused = 0;
+  while (jobs)
+    {
+      job *j = jobs;
+      jobs = j->next;
+      node *n = j->n;
+      mtp_dev *m = dev_of (n);
+      in_job = 1;
+      if (j->f && j->started)
+        {
+          if (m->streaming)
+            mtp_stream_abort (m);
+          if (n->handle && !m->tr->gone)
+            delete_object (n);
+          n->handle = 0;
+          n->pending = 1;
+        }
+      in_job = 0;
+      if (j->f)
+        j->f->size = 0;           /* not counted as sent */
+      /* a directory made in its turn stays; a file never sent isn't shown */
+      if (n->pending && n->refs == 1 && !n->gone && j->f)
+        drop_node (n);
+      else if (n->pending && !j->f && n->refs == 1 && !n->gone)
+        drop_node (n);
+      job_free (j);
+      bg_files_done--;
+    }
 }
 
 /* Send everything still waiting (the filer task is stopping) */

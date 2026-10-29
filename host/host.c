@@ -653,6 +653,21 @@ run (int argc, char **argv)
       printf ("bg: %d%%\n", pdfs_bg_progress (argv[1]));
       return 0;
     }
+  if (!strcmp (cmd, "bgabort"))
+    {
+      pdfs_bg_abort_all ();
+      printf ("bg: aborted\n");
+      return 0;
+    }
+  if (!strcmp (cmd, "bgstatus"))
+    {
+      pdfs_bg_state st;
+      pdfs_bg_status (&st);
+      printf ("bg: active %d left %llu batch %llu done %llu files %d path %s\n", st.active,
+              (unsigned long long) st.left, (unsigned long long) st.batch,
+              (unsigned long long) st.batch_done, st.files_done, st.path);
+      return 0;
+    }
   if (!strcmp (cmd, "bgdone"))
     {
       int steps = 0;

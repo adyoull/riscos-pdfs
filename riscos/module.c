@@ -639,7 +639,7 @@ mount_tcp (const char *arg)
 
 /* --- USB ---------------------------------------------------------------------------- */
 
-ERROR_BLOCK (err_nomtp, 0x1FAE6, "No MTP device found (*PDFSUSB lists the USB devices; a phone must be set to File transfer)");
+ERROR_BLOCK (err_nomtp, 0x1FAE6, "No MTP device found (*PDFSUSB lists the USB devices; an Android device must be set to File transfer)");
 ERROR_BLOCK (err_nousbdev, 0x1FAE7, "That USB device has no interface with bulk endpoints (see *PDFSUSB)");
 
 static int word_is (const char *tail, const char *w);

@@ -364,6 +364,19 @@ def background():
                and open(local(s, "Download", "nd", "sub", "s"), "rb").read() == b"small file",
                "folders and small files queued behind a big one %s" % flags)
             os.unlink(small)
+            # the window's figures, and Abort: the file being sent is cancelled
+            # and deleted on the device, the ones waiting are dropped; the
+            # device works on afterwards
+            r = s.run(["save", src, D + ".Download.ab1", "FFD"], ["save", src, D + ".Download.ab2", "FFD"],
+                      ["bgstatus"], ["bgstep"], ["bgstatus"], ["bgabort"], ["bgstatus"],
+                      ["save", small2 := tmpfile(b"after"), D + ".Download.after", "FFD"],
+                      ["ls", D + ".Download"], env=env)
+            ok(r.returncode == 0 and "bg: active 1 left %d batch %d done 0 files 0 path PDFS::SimPhone-Internal.$.Download.ab1"
+               % (2 * len(data), 2 * len(data)) in r.stdout and "bg: active 0" in r.stdout
+               and not os.path.exists(local(s, "Download", "ab1")) and not os.path.exists(local(s, "Download", "ab2"))
+               and open(local(s, "Download", "after"), "rb").read() == b"after",
+               "Abort cancels the sends, and the device works on %s" % flags)
+            os.unlink(small2)
             # many queued at once
             r = s.run(*[["save", src, D + ".Download.q%d" % k, "FFD"] for k in range(6)], env=env)
             ok(r.returncode == 0 and all(open(local(s, "Download", "q%d" % k), "rb").read() == data
