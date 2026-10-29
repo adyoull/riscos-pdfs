@@ -1032,6 +1032,30 @@ dev_of (node *n)
   return &n->st->dev->mtp;
 }
 
+/* Android's SendPartialObject, in two parts if one would need a zero-length
+   packet the transport can't send. data has HEADROOM bytes before it. */
+static int
+send_partial (mtp_dev *m, uint32_t h, uint64_t off, uint8_t *data, uint32_t len)
+{
+  uint32_t first = mtp_needs_zlp (m, len) && len > 1 ? len - 1 : len;
+  uint32_t sp[4] = { h, (uint32_t) off, (uint32_t) (off >> 32), first };
+  int rc = mtp_transaction (m, OP_SendPartialObject, sp, 4, data, first, 0, 0);
+  if (rc == RC_OK && first < len)
+    {
+      uint64_t o2 = off + first;
+      uint32_t sp2[4] = { h, (uint32_t) o2, (uint32_t) (o2 >> 32), len - first };
+      rc = mtp_transaction (m, OP_SendPartialObject, sp2, 4, data + first, len - first, 0, 0);
+    }
+  return rc;
+}
+
+static int
+can_edit (mtp_dev *m)
+{
+  return mtp_supports (m, OP_BeginEditObject) && mtp_supports (m, OP_SendPartialObject)
+         && mtp_supports (m, OP_TruncateObject) && mtp_supports (m, OP_EndEditObject);
+}
+
 /* Create an object on the device: a directory, or a file with the given
    data (which has HEADROOM bytes before it). Sets n->handle. */
 static const pd_error *
@@ -1061,10 +1085,15 @@ send_object (node *n, uint8_t *data, uint32_t len)
         }
       pd_free (dn);
     }
+  /* A file whose data phase would need a zero-length packet that can't be
+     sent: send all but its last byte, then add that with an edit */
+  uint32_t sendlen = len;
+  if (!n->isdir && len > 1 && mtp_needs_zlp (m, len) && can_edit (m))
+    sendlen = len - 1;
   memset (p, 0, 52);
   put32 (p, n->st->id);
   put16 (p + 4, n->isdir ? FMT_Association : FMT_Undefined);
-  put32 (p + 8, n->isdir ? 0 : len);
+  put32 (p + 8, n->isdir ? 0 : sendlen);
   put32 (p + 38, dir == &n->st->root ? 0 : dir->handle);
   put16 (p + 42, n->isdir ? 1 : 0);            /* association type: generic folder */
   int k = 52;
@@ -1083,7 +1112,19 @@ send_object (node *n, uint8_t *data, uint32_t len)
   n->pending = 0;
   if (n->isdir)
     return 0;
-  rc = mtp_transaction (m, OP_SendObject, 0, 0, data ? data : info + HEADROOM, len, 0, 0);
+  rc = mtp_transaction (m, OP_SendObject, 0, 0, data ? data : info + HEADROOM, sendlen, 0, 0);
+  if (rc == RC_OK && sendlen < len)
+    {
+      uint32_t h = n->handle;
+      rc = mtp_transaction (m, OP_BeginEditObject, &h, 1, 0, 0, 0, 0);
+      if (rc == RC_OK)
+        {
+          rc = send_partial (m, h, sendlen, data + sendlen, len - sendlen);
+          int rc2 = mtp_transaction (m, OP_EndEditObject, &h, 1, 0, 0, 0, 0);
+          if (rc == RC_OK)
+            rc = rc2;
+        }
+    }
   n->size = len;
   return rc_error (rc);
 }
@@ -1153,18 +1194,15 @@ commit (ofile *f)
   uint8_t *data = f->wbuf ? f->wbuf + HEADROOM : empty + HEADROOM;
   n->mtime = pd_unix_time ();
 
-  if (!n->pending && n->handle && mtp_supports (m, OP_BeginEditObject)
-      && mtp_supports (m, OP_SendPartialObject) && mtp_supports (m, OP_TruncateObject)
-      && mtp_supports (m, OP_EndEditObject))
+  if (!n->pending && n->handle && can_edit (m))
     {
       /* Android: edit the object in place, so it keeps its handle */
       uint32_t h = n->handle;
       int rc = mtp_transaction (m, OP_BeginEditObject, &h, 1, 0, 0, 0, 0);
       if (rc == RC_OK)
         {
-          uint32_t sp[4] = { h, 0, 0, len };
           if (len)
-            rc = mtp_transaction (m, OP_SendPartialObject, sp, 4, data, len, 0, 0);
+            rc = send_partial (m, h, 0, data, len);
           uint32_t tp[3] = { h, len, 0 };
           if (rc == RC_OK)
             rc = mtp_transaction (m, OP_TruncateObject, tp, 3, 0, 0, 0, 0);
@@ -1941,6 +1979,8 @@ fs_func (pd_regs *r)
 
 /* --- entry ------------------------------------------------------------------------------ */
 
+static void release (device *dv);
+
 static void
 poll_events (void)
 {
@@ -1951,6 +1991,12 @@ poll_events (void)
       uint32_t p1;
       if (!dv->used)
         continue;
+      if (dv->mtp.tr && dv->mtp.tr->gone)
+        {
+          pd_log ("pdfs: device unplugged");
+          release (dv);
+          continue;
+        }
       while (mtp_poll_event (&dv->mtp, &code, &p1))
         {
           pd_log_hex ("pdfs: event", code);

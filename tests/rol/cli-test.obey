@@ -3,6 +3,7 @@ Info PDFS::SimPhone-Internal.$.Download.pic/jpg
 CDir PDFS::SimPhone-Internal.$.Books
 CDir PDFS::SimPhone-Internal.$.Books.SF
 Copy rand PDFS::SimPhone-Internal.$.Books.SF.rand ~C~V
+Copy z500 PDFS::SimPhone-Internal.$.Download.z500 ~C~V
 Copy local PDFS::SimPhone-Internal.$.Books.Letter ~C~V
 Ex PDFS::SimPhone-Internal.$.Books
 Copy PDFS::SimPhone-Internal.$.Books.SF.rand back ~C~V

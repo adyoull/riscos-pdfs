@@ -18,8 +18,15 @@ ROOT=$(cd "$HERE/../.." && pwd)
 : "${TB:?set TB to the riscos-linux-testbed directory}"
 MOD=$ROOT/out/PDFS,ffa
 [ -f "$MOD" ] || { echo "make first" >&2; exit 1; }
-DESKTOP=0
-[ "${1:-}" = --desktop ] && DESKTOP=1
+DESKTOP=0 USBEMU=0 SIMFLAGS=
+for a in "$@"; do
+  case "$a" in
+    --desktop) DESKTOP=1 ;;
+    --usbemu)  USBEMU=1 SIMFLAGS="--zlp-strict 512"
+               MOD=$ROOT/out/PDFS-usbemu,ffa
+               [ -f "$MOD" ] || { echo "make out/PDFS-usbemu,ffa first" >&2; exit 1; } ;;
+  esac
+done
 OUT=$ROOT/out/rol
 mkdir -p "$OUT"
 T=$(mktemp -d /tmp/pdfs-rol.XXXXXX)
@@ -40,14 +47,25 @@ open(os.path.join(t, 'phone/int/Documents/Shopping list.txt'), 'w').write('milk\
 w('phone/int/Documents/Boarding pass.pdf', 80000)
 w('phone/sd/Movies/Holiday.mkv', 250000)
 w('w/rand,ffd', 100000); w('w/ToPhone/Archive,ffd', 100000)
+w('w/z500,ffd', 500)       # with its 12-byte header, one 512-byte packet: needs care on USB
 open(os.path.join(t, 'w/local,fff'), 'w').write('a local text file\n')
 open(os.path.join(t, 'w/ToPhone/ReadMe,fff'), 'w').write('Written on RISC OS\nand copied by the Filer\n')
 PY
 for b in basic1 free desktop; do python3 "$ROOT/tools/bbcbasic.py" tok "$HERE/$b.bas" "$T/w/$b,ffb"; done
 mv "$T/w/desktop,ffb" "$T/w/desk,ffb"
 cp "$HERE/cli-test.obey" "$T/w/t,feb"
+if [ $USBEMU = 1 ]; then
+  # mount through the USB transport (a fake USB phone bridged to the simulator);
+  # in the desktop the filer mounts it by itself
+  sed -i 's/^PDFSMount 127.0.0.1:7015$/PDFSUSB\nPDFSMount/' "$T/w/t,feb"
+  python3 - "$T/w/desk,ffb" <<'PY'
+import sys
+p = sys.argv[1]; b = open(p, "rb").read()
+open(p, "wb").write(b.replace(b"PDFSMount 127.0.0.1:7015", b"PDFSDevices".ljust(24)))
+PY
+fi
 
-python3 "$ROOT/sim/mtpsim.py" --port 7015 -v "Internal=$T/phone/int" "SD card=$T/phone/sd" 2> "$OUT/sim.log" &
+python3 "$ROOT/sim/mtpsim.py" --port 7015 -v $SIMFLAGS "Internal=$T/phone/int" "SD card=$T/phone/sd" 2> "$OUT/sim.log" &
 SIM=$!
 trap 'kill $SIM 2>/dev/null || true' EXIT
 sleep 1
@@ -62,6 +80,12 @@ if [ $DESKTOP = 0 ]; then
   check '[ -f "$T/phone/sd/OnCard.txt" ]' "*Copy between storages; a Text file gets .txt"
   check '[ ! -e "$T/phone/int/Books" ]' "*Wipe R deletes a tree"
   check 'grep -q "0 errors, 0 recoveries" "$OUT/cli.txt"' "no transport errors"
+  check 'cmp -s "$T/w/z500,ffd" "$T/phone/int/Download/z500"' "a 500-byte file (one 512-byte data phase)"
+  check '! grep -q "ZLP needed" "$OUT/sim.log"' "no data phase that would need a zero-length packet"
+  if [ $USBEMU = 1 ]; then
+    check 'grep -q "USB9 .*18D1:4EE1.*06/01/01" "$OUT/cli.txt" && grep -q "MTP" "$OUT/cli.txt"' "*PDFSUSB lists the phone as MTP"
+    check 'grep -q "USB8 .*08/06/50" "$OUT/cli.txt" && grep -q "PDFS test SimPhone (USB USB9)" "$OUT/cli.txt"' "the memory stick is listed but not mounted; the phone is, over USB"
+  fi
 else
   : "${ROL_HARDDISC:?set ROL_HARDDISC to a HardDisc4 (desktop mode)}"
   ROL_HARDDISC=$ROL_HARDDISC "$TB/bin/rol-run" ${ROL_VERBOSE:+-v} -t 90 -w 45 -s "$OUT/desktop.png" -m "$MOD" -C "$T/w" -c 'Run desk' || true
@@ -73,6 +97,9 @@ else
   check 'grep -q "icon .*: Internal" "$T/w/results" && grep -q "icon .*: SD card" "$T/w/results"' "icon bar icons for both storages"
   check 'cmp -s "$T/w/local,fff" "$T/phone/sd/local.txt"' "a file dropped on the SD card's icon is copied there"
   check 'grep -q "ShowFree ok" "$T/w/results"' "*ShowFree (the icon menu's Free) works"
+  if [ $USBEMU = 1 ]; then
+    check 'grep -q "icons after unplug: 0" "$T/w/results"' "unplugging the phone removes its icons"
+  fi
   echo "screenshots: $OUT/desktop*.png"
 fi
 rm -rf "$T"

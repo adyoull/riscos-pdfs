@@ -77,6 +77,17 @@ SYS "XOS_CLI","ShowFree -fs PDFS SimPhone-Internal" TO e%;f%
 IF f% AND 1 THEN PROClog("ShowFree: "+FNstr(e%+4)) ELSE PROClog("ShowFree ok")
 PROCwait(200)
 OSCLI "TBShot"
+REM unplug (the USB emulator's device handle is &9999)
+SYS "OS_ServiceCall",0,&79,&9999
+PROCwait(300)
+n%=0
+FOR i%=0 TO 60
+  b%!0=-2:b%!4=i%
+  SYS "XWimp_GetIconState",,b% TO ;f%
+  IF (f% AND 1)=0 THEN IF (b%!24 AND &101)=&101 THEN IF FNstr(b%!32)="Spdfs_dev" THEN n%+=1
+NEXT
+PROClog("icons after unplug: "+STR$n%)
+OSCLI "TBShot"
 PROClog("done")
 CLOSE#log%
 END

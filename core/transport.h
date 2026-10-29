@@ -30,6 +30,14 @@ struct pd_transport
   int (*reset) (pd_transport *t, uint32_t transaction_id, int level);
   void (*close) (pd_transport *t);
   const char *name;           /* for messages: "USB", "TCP 127.0.0.1:7015" */
+  /* USB bulk OUT: the packet size, and whether a transfer that's a whole
+     number of packets can't be ended with a zero-length packet (RISC OS's
+     DeviceFS streams). Then PDFS never sends one: it pads datasets by a
+     byte and sends file data in two parts. 0, 0 for a stream (TCP). */
+  uint32_t max_packet;
+  int no_zlp;
+  /* Set by the transport when the device has been unplugged. */
+  volatile int gone;
 };
 
 #endif

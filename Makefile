@@ -25,9 +25,26 @@ LDFLAGS := -nostdlib -static -Wl,--no-dynamic-linker -Wl,-T,riscos/module.ld \
            -Wl,--build-id=none -Wl,-z,norelro
 
 CORE := core/fs.c core/mtp.c
-OBJS := $(OBJ)/header.o $(OBJ)/module.o $(OBJ)/filer.o $(OBJ)/cmodule.o $(OBJ)/fs.o $(OBJ)/mtp.o
+OBJS := $(OBJ)/header.o $(OBJ)/module.o $(OBJ)/filer.o $(OBJ)/usb.o $(OBJ)/cmodule.o $(OBJ)/fs.o $(OBJ)/mtp.o
 
 all: $(OUT)/PDFS,ffa $(OUT)/pdfs-host
+
+# Test build: USB through tests/rol/usbemu.c (a fake USB phone bridged to
+# the simulator), for tests/rol/run.sh --usbemu
+EMU_OBJS := $(filter-out $(OBJ)/usb.o,$(OBJS)) $(OBJ)/usb-emu.o $(OBJ)/usbemu.o
+$(OBJ)/usb-emu.o: riscos/usb.c riscos/usb.h riscos/cmodule.h core/pdfs.h core/transport.h | $(OBJ)
+	$(CC) $(CFLAGS) -DUSB_EMU -c -o $@ $<
+$(OBJ)/usbemu.o: tests/rol/usbemu.c riscos/cmodule.h | $(OBJ)
+	$(CC) $(CFLAGS) -c -o $@ $<
+$(OUT)/PDFS-usbemu,ffa: $(EMU_OBJS) riscos/module.ld
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $(OBJ)/PDFS-usbemu.elf $(EMU_OBJS) -lgcc
+	$(CC) $(CFLAGS) $(LDFLAGS) -Wl,--defsym=__link_base=0x10000 -o $(OBJ)/PDFS-usbemu-64k.elf $(EMU_OBJS) -lgcc
+	$(OBJCOPY) -O binary $(OBJ)/PDFS-usbemu.elf $(OBJ)/e0.bin
+	$(OBJCOPY) -O binary $(OBJ)/PDFS-usbemu-64k.elf $(OBJ)/e1.bin
+	python3 -B riscos/check-pic.py $(OBJ)/e0.bin $(OBJ)/e1.bin 0x10000 \
+	  0x$$($(NM) $(OBJ)/PDFS-usbemu.elf | awk '$$3=="__got_start"{print $$1}') \
+	  0x$$($(NM) $(OBJ)/PDFS-usbemu.elf | awk '$$3=="__got_end"{print $$1}')
+	cp $(OBJ)/e0.bin $@
 
 $(OBJ):
 	mkdir -p $@
@@ -36,9 +53,11 @@ $(OBJ)/resources.bin: tools/mksprites.py | $(OBJ)
 	python3 tools/mksprites.py $@
 $(OBJ)/header.o: riscos/header.s riscos/cmodule.inc $(OBJ)/resources.bin | $(OBJ)
 	$(AS) -I riscos -o $@ $<
+$(OBJ)/usb.o: riscos/usb.c riscos/usb.h riscos/cmodule.h core/pdfs.h core/transport.h | $(OBJ)
+	$(CC) $(CFLAGS) -c -o $@ $<
 $(OBJ)/filer.o: riscos/filer.c riscos/filer.h riscos/cmodule.h core/pdfs.h | $(OBJ)
 	$(CC) $(CFLAGS) -c -o $@ $<
-$(OBJ)/module.o: riscos/module.c riscos/filer.h riscos/cmodule.h core/pdfs.h core/plat.h core/transport.h | $(OBJ)
+$(OBJ)/module.o: riscos/module.c riscos/usb.h riscos/filer.h riscos/cmodule.h core/pdfs.h core/plat.h core/transport.h | $(OBJ)
 	$(CC) $(CFLAGS) -c -o $@ $<
 $(OBJ)/cmodule.o: riscos/cmodule.c riscos/cmodule.h | $(OBJ)
 	$(CC) $(CFLAGS) -c -o $@ $<

@@ -515,6 +515,12 @@ main (int argc, char **argv)
       fprintf (stderr, "can't connect to %s\n", argv[1]);
       return 2;
     }
+  if (getenv ("PDFS_NO_ZLP"))
+    {
+      /* behave as RISC OS's USB transport does: no zero-length packets */
+      t->max_packet = (uint32_t) atoi (getenv ("PDFS_NO_ZLP"));
+      t->no_zlp = 1;
+    }
   if (check (pdfs_mount (t), "mount"))
     return 1;
   int i = 2;

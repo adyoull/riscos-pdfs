@@ -146,4 +146,13 @@ int mtp_get_string (const uint8_t *p, const uint8_t *end, char *out, int outsz);
 /* Write UTF-8 s as an MTP string at p; returns bytes written (max 1+2*255). */
 int mtp_put_string (uint8_t *p, const char *s);
 
+/* Would a data phase of len bytes (plus the 12-byte header) need a
+   zero-length packet that the transport can't send? */
+static inline int
+mtp_needs_zlp (const mtp_dev *d, uint32_t len)
+{
+  /* USB packet sizes are powers of two */
+  return d->tr->no_zlp && d->tr->max_packet && ((12 + len) & (d->tr->max_packet - 1)) == 0;
+}
+
 #endif

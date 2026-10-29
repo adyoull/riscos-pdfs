@@ -223,6 +223,41 @@ def recovery():
         s.stop()
 
 
+def zlp():
+    print("== USB without zero-length packets (data phases of 512n bytes)")
+    for flags in ([], ["--no-edit"]):
+        s = Sim("--zlp-strict", "512", *flags)
+        env = {"PDFS_NO_ZLP": "512"}
+        try:
+            for size in (500, 1012, 499, 1):
+                data = random.randbytes(size)
+                src = tmpfile(data)
+                r = s.run(["save", src, D + ".Download.z%d/bin" % size, "FFD"], env=env,
+                          expect=None)
+                p = local(s, "Download", "z%d.bin" % size)
+                if size in (500, 1012) and flags:
+                    ok(r.returncode != 0, "no edit operations: a 512n data phase still fails (%d)" % size)
+                else:
+                    ok(r.returncode == 0 and open(p, "rb").read() == data,
+                       "file of %d bytes sent without a zero-length packet %s" % (size, flags))
+                os.unlink(src)
+            # an ObjectInfo dataset of 500 bytes: a name of 189 characters
+            name = "N" * 185 + "/bin"
+            src = tmpfile(b"x")
+            r = s.run(["save", src, D + ".Download." + name, "FFD"], env=env, expect=None)
+            ok(r.returncode == 0 and os.path.isfile(local(s, "Download", "N" * 185 + ".bin")),
+               "an ObjectInfo of 500 bytes is padded %s" % flags)
+            if not flags:
+                # in-place edit (Android) of a 500-byte file
+                data = random.randbytes(500)
+                src = tmpfile(data)
+                r = s.run(["openout", src, D + ".Download.z1/bin"], env=env)
+                ok(r.returncode == 0 and open(local(s, "Download", "z1.bin"), "rb").read() == data,
+                   "an edit in place of 500 bytes goes in two parts")
+        finally:
+            s.stop()
+
+
 def main():
     random.seed(1)
     if not os.path.exists(HOST):
@@ -233,6 +268,7 @@ def main():
     suite(["--no-proplist", "--no-partial64", "--no-edit", "--delay-ms", "2"])
     suite(["--no-rename"])
     recovery()
+    zlp()
     print("%d passed, %d failed" % (passed, failed))
     sys.exit(1 if failed else 0)
 

@@ -27,7 +27,7 @@ module_start:
 	.word	flags - module_start
 
 title:	.asciz	"PDFS"
-help:	.asciz	"PDFS\t\t0.01 (29 Oct 2026) test build"
+help:	.asciz	"PDFS\t\t0.02 (29 Oct 2026)"
 	.align	2
 flags:	.word	1				@ 32-bit compatible
 
@@ -84,13 +84,15 @@ fs_return:
 
 @ Service call handler: reject all but the ones that matter quickly:
 @ Reset (&27), FSRedeclare (&40), StartWimp (&49), StartedWimp (&4A),
-@ ResourceFSStarting (&60).
+@ ResourceFSStarting (&60), DeviceDead (&79), USB (&D2).
 pd_service:
 	teq	r1, #0x40
 	teqne	r1, #0x27
 	teqne	r1, #0x49
 	teqne	r1, #0x4A
 	teqne	r1, #0x60
+	teqne	r1, #0x79
+	teqne	r1, #0xD2
 	movne	pc, lr
 	b	cm_service
 
@@ -148,7 +150,7 @@ commands:
 	.asciz	"PDFSMount"
 	.align	2
 	.word	cm_command_1 - module_start
-	.word	0x00020001			@ 1 to 2 parameters
+	.word	0x00020000			@ 0 to 2 parameters
 	.word	syn_mount - module_start
 	.word	help_mount - module_start
 
@@ -180,6 +182,13 @@ commands:
 	.word	syn_ext - module_start
 	.word	help_ext - module_start
 
+	.asciz	"PDFSUSB"
+	.align	2
+	.word	cm_command_7 - module_start
+	.word	0x00020000			@ 0 to 2 parameters
+	.word	syn_usb - module_start
+	.word	help_usb - module_start
+
 	.asciz	"Desktop_PDFSFiler"
 	.align	2
 	.word	cm_command_6 - module_start
@@ -189,14 +198,16 @@ commands:
 
 	.word	0
 
+help_usb:	.asciz	"*PDFSUSB lists the connected USB devices' interfaces that have bulk endpoints, and which are MTP. *PDFSUSB control on|off lets PDFS use USB class requests (Cancel) when it recovers from errors: off by default, as some USB drivers do them synchronously."
+syn_usb:	.asciz	"Syntax: *PDFSUSB [control on|off]"
 help_desk:	.asciz	"*Desktop_PDFSFiler starts PDFS's icon bar filer. The desktop starts it; after loading PDFS in the desktop, use *WimpTask Desktop_PDFSFiler."
 syn_desk:	.asciz	"Syntax: *Desktop_PDFSFiler"
 help_ext:	.asciz	"*PDFSExtensions sets how names with a filetype extension are shown: hide (the default) shows Letter.txt as Letter, a Text file; show shows it as Letter/txt. Files saved from RISC OS always get the extension for their type, or ,xxx if it has none."
 syn_ext:	.asciz	"Syntax: *PDFSExtensions [show|hide]"
 help_pdfs:	.asciz	"*PDFS selects the Portable Device Filing System as the current filing system."
 syn_pdfs:	.asciz	"Syntax: *PDFS"
-help_mount:	.asciz	"*PDFSMount connects to a simulated portable device over TCP (for testing)."
-syn_mount:	.asciz	"Syntax: *PDFSMount <address>:<port>"
+help_mount:	.asciz	"*PDFSMount mounts portable devices: with no parameter, every MTP device connected by USB (the desktop does this by itself); USB<n> [<interface>] mounts that USB device (for ones that don't say they are MTP); <address>:<port> connects to a simulated device over TCP."
+syn_mount:	.asciz	"Syntax: *PDFSMount [USB<n> [<interface>] | <address>:<port>]"
 help_dismount:	.asciz	"*PDFSDismount disconnects a portable device (all devices if no disc is given)."
 syn_dismount:	.asciz	"Syntax: *PDFSDismount [<disc>]"
 help_devices:	.asciz	"*PDFSDevices lists the portable devices connected and their storages."
@@ -214,3 +225,4 @@ syn_log:	.asciz	"Syntax: *PDFSLog [on|off|trace]"
 	CM_COMMAND 4
 	CM_COMMAND 5
 	CM_COMMAND 6
+	CM_COMMAND 7

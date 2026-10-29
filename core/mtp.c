@@ -197,6 +197,24 @@ transaction (mtp_dev *d, uint16_t op, const uint32_t *params, int nparams,
          contiguous, so out must have 12 bytes of headroom (mtp.h). */
       uint8_t *h = (uint8_t *) out - 12;
       uint8_t save[12];
+      if (mtp_needs_zlp (d, outlen) && op != OP_SendObject && op != OP_SendPartialObject)
+        {
+          /* No zero-length packet possible: pad the dataset by a byte (the
+             device reads the fields it knows and ignores the rest) */
+          uint8_t *t = pd_alloc (12 + outlen + 1);
+          if (!t)
+            return MTP_ENOMEM;
+          memcpy (t + 12, out, outlen);
+          put32 (t, 12 + outlen + 1);
+          put16 (t + 4, MTP_DATA);
+          put16 (t + 6, op);
+          put32 (t + 8, tid);
+          e = d->tr->write (d->tr, t, 12 + outlen + 1, d->timeout_cs);
+          pd_free (t);
+          if (e < 0)
+            return e;
+          goto response;
+        }
       memcpy (save, h, 12);
       put32 (h, 12 + outlen);
       put16 (h + 4, MTP_DATA);
@@ -208,6 +226,7 @@ transaction (mtp_dev *d, uint16_t op, const uint32_t *params, int nparams,
         return e;
     }
 
+response:
   if (in)
     in->len = 0;
   for (;;)

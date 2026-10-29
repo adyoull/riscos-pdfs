@@ -6,6 +6,7 @@
 #include "../core/pdfs.h"
 #include "../core/plat.h"
 #include "filer.h"
+#include "usb.h"
 
 #define OS_Word                 0x07
 #define OS_FSControl            0x29
@@ -382,6 +383,125 @@ mount_tcp (const char *arg)
   return (oserror *) pdfs_mount (&c->t);
 }
 
+/* --- USB ---------------------------------------------------------------------------- */
+
+ERROR_BLOCK (err_nomtp, 0x1FAC6, "No MTP device found (*PDFSUSB lists the USB devices; a phone must be set to File transfer)");
+ERROR_BLOCK (err_nousbdev, 0x1FAC7, "That USB device has no interface with bulk endpoints (see *PDFSUSB)");
+
+static int word_is (const char *tail, const char *w);
+
+/* "USB5" against a command's word (case-insensitive) */
+static int
+dev_eq (const char *a, const char *b)
+{
+  while (*a && (*a | 0x20) == (*b | 0x20))
+    a++, b++;
+  return !*a && *b <= ' ';
+}
+
+/* Mount USB devices: dev 0 = every MTP device not mounted yet; else that
+   device ("USB5"), the given interface or its MTP one or its first usable */
+static oserror *
+mount_usb (const char *dev, int iface, int quiet)
+{
+  usb_iface c[24];
+  int n = usb_scan (c, 24, dev != 0), mounted = 0;
+  oserror *first = 0;
+  for (int i = 0; i < n; i++)
+    {
+      if (dev)
+        {
+          if (!dev_eq (c[i].dev, dev) || !c[i].usable)
+            continue;
+          if (iface >= 0 ? c[i].iface != iface : !c[i].mtp)
+            {
+              /* no MTP interface named: take the first usable one after
+                 checking there's no MTP one */
+              int better = 0;
+              for (int j = 0; j < n; j++)
+                if (j != i && c[j].mtp && dev_eq (c[j].dev, dev))
+                  better = 1;
+              if (iface >= 0 || better)
+                continue;
+            }
+        }
+      if (usb_is_open (c[i].dev))
+        continue;
+      oserror *e = (oserror *) usb_mount (&c[i]);
+      if (e && !first)
+        first = e;
+      if (!e)
+        mounted++;
+      if (dev)
+        break;
+    }
+  if (mounted || quiet)
+    return 0;
+  if (first)
+    return first;
+  return dev ? ERR (err_nousbdev) : ERR (err_nomtp);
+}
+
+static void
+hex (unsigned v, int digits)
+{
+  char b[9];
+  for (int i = 0; i < digits; i++)
+    b[i] = "0123456789ABCDEF"[(v >> (4 * (digits - 1 - i))) & 15];
+  b[digits] = 0;
+  write0 (b);
+}
+
+static void
+list_usb (void)
+{
+  usb_iface c[24];
+  int n = usb_scan (c, 24, 1);
+  static const char speeds[][6] = { "?", "low", "full", "high", "super" };
+  if (!n)
+    {
+      write0 ("No USB interfaces with bulk endpoints");
+      newline ();
+    }
+  for (int i = 0; i < n; i++)
+    {
+      write0 (c[i].dev);
+      write0 ("  ");
+      hex (c[i].vid, 4);
+      write0 (":");
+      hex (c[i].pid, 4);
+      write0 ("  interface ");
+      write_dec (c[i].iface);
+      write0 ("/");
+      write_dec (c[i].alt);
+      write0 ("  class ");
+      hex (c[i].cls, 2);
+      write0 ("/");
+      hex (c[i].sub, 2);
+      write0 ("/");
+      hex (c[i].proto, 2);
+      write0 ("  ");
+      write0 (speeds[c[i].speed < 5 ? c[i].speed : 0]);
+      write0 (" speed");
+      newline ();
+      write0 ("      endpoints: bulk in ");
+      write_dec (c[i].ep_in);
+      write0 (", bulk out ");
+      write_dec (c[i].ep_out);
+      write0 (", interrupt in ");
+      write_dec (c[i].ep_int);
+      write0 (", packet ");
+      write_dec (c[i].mps_out);
+      /* vendor-specific interfaces may be MTP (older Androids) */
+      int maybe = !c[i].mtp && c[i].usable && c[i].cls == 0xFF;
+      write0 (c[i].mtp ? "  - MTP" : maybe ? "  - if it's MTP: *PDFSMount " : "");
+      if (maybe)
+        write0 (c[i].dev);
+      write0 (usb_is_open (c[i].dev) ? "  (mounted)" : "");
+      newline ();
+    }
+}
+
 /* --- module entry points ------------------------------------------------------------- */
 
 static oserror *
@@ -467,6 +587,15 @@ mod_service (regs *r)
     case 0x27:                      /* Service_Reset */
       filer_task = 0;
       break;
+    case 0x79:                      /* Service_DeviceDead: R2 = device handle */
+      usb_device_dead (r->r[2]);
+      break;
+    case 0xD2:                      /* Service_USB */
+      if (r->r[0] == 0)             /* Attach: the filer mounts it */
+        usb_attached = 1;
+      else if (r->r[0] == 4)        /* Dying */
+        usb_dying ();
+      break;
     case 0x60:                      /* Service_ResourceFSStarting */
       call_resourcefs ((void *) r->r[2], (void *) r->r[3], resource_files);
       break;
@@ -506,16 +635,50 @@ mod_command (int index, const char *tail, int argc)
       {
         while (*tail == ' ')
           tail++;
-        oserror *e = mount_tcp (tail);
-        if (!e)
-          for (int i = 0; pdfs_disc_name (i); i++)
+        int before = pdfs_disc_count (), quiet = 0;
+        oserror *e;
+        if (word_is (tail, "-auto"))
+          {
+            quiet = 1;
+            e = mount_usb (0, -1, 1);
+          }
+        else if (!argc)
+          e = mount_usb (0, -1, 0);
+        else if ((tail[0] | 0x20) == 'u' && (tail[1] | 0x20) == 's' && (tail[2] | 0x20) == 'b')
+          {
+            int iface = -1;
+            const char *q = tail;
+            while (*q > ' ')
+              q++;
+            while (*q == ' ')
+              q++;
+            if (*q >= '0' && *q <= '9')
+              for (iface = 0; *q >= '0' && *q <= '9'; q++)
+                iface = iface * 10 + (*q - '0');
+            e = mount_usb (tail, iface, 0);
+          }
+        else
+          e = mount_tcp (tail);
+        if (!e && !quiet)
+          for (int i = before; pdfs_disc_name (i); i++)
             {
               write0 ("PDFS::");
               write0 (pdfs_disc_name (i));
               newline ();
             }
-        return e;
+        return quiet ? 0 : e;
       }
+    case 7:                         /* *PDFSUSB */
+      if (argc >= 2 && word_is (tail, "control"))
+        {
+          const char *q = tail + 7;
+          while (*q == ' ')
+            q++;
+          usb_control_requests = word_is (q, "on");
+          return 0;
+        }
+      list_usb ();
+      return 0;
     case 2:                         /* *PDFSDismount */
       {
         char disc[40];

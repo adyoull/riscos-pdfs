@@ -16,6 +16,7 @@
 #include "cmodule.h"
 #include "pdfs.h"
 #include "filer.h"
+#include "usb.h"
 
 #define OS_CLI                  0x05
 #define OS_Exit                 0x11
@@ -148,6 +149,12 @@ remove_icon (int k)
 static void
 refresh (void)
 {
+  pdfs_tick ();                 /* device events; drops unplugged devices */
+  if (usb_attached)
+    {
+      usb_attached = 0;
+      oscli ("PDFSMount -auto", 0, 0);
+    }
   for (int k = nicons - 1; k >= 0; k--)
     {
       int found = 0;
@@ -464,6 +471,7 @@ filer_main (void)
   free_register (1);
   oscli ("IconSprites Resources:$.Resources.PDFS.Sprites", 0, 0);
   nicons = 0;
+  oscli ("PDFSMount -auto", 0, 0);  /* devices already plugged in */
   refresh ();
   unsigned next = 0;
   for (;;)

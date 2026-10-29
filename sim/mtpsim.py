@@ -14,6 +14,8 @@ Options for testing PDFS's behaviour:
     --no-partial64    don't support Android's GetPartialObject64
     --no-edit         don't support Android's edit operations
     --no-rename       don't support SetObjectPropValue (renaming)
+    --zlp-strict N    fail data phases that are a multiple of N bytes (USB
+                      without zero-length packets)
     --delay-ms N      sleep N ms before each response (a slow device)
     --stall-op CODE   never answer the first command with this code
                       (tests time-outs and recovery)
@@ -94,6 +96,7 @@ class Device:
         self.next_handle = 1
         self.pending = None                   # (storage, parent path, info) after SendObjectInfo
         self.stalled = False
+        self.zlp_violations = 0
         self.ops = set(OP.values())
         if args.no_proplist:
             self.ops.discard(OP["GetObjectPropList"])
@@ -442,6 +445,14 @@ class Device:
                 dtype, dcode, dtid, data_in = self.recv_container(s)
                 if dtype != DATA:
                     log("expected data for %04x, got type %d" % (code, dtype))
+                if self.args.zlp_strict and (12 + len(data_in)) % self.args.zlp_strict == 0:
+                    # A real USB device would wait for a zero-length packet
+                    # that DeviceFS can't send (Android: the next command
+                    # is then taken as data and the transaction fails)
+                    log("ZLP needed: %04x data phase of %d bytes" % (code, 12 + len(data_in)))
+                    self.zlp_violations += 1
+                    self.send_container(s, RESP, GENERAL, tid, b"")
+                    continue
             if self.args.stall_op is not None and code == self.args.stall_op and not self.stalled:
                 self.stalled = True
                 log("stalling op %04x (tid %d): no response" % (code, tid))
@@ -475,6 +486,7 @@ def main():
     ap.add_argument("--no-partial64", action="store_true")
     ap.add_argument("--no-edit", action="store_true")
     ap.add_argument("--no-rename", action="store_true")
+    ap.add_argument("--zlp-strict", type=int, default=0, metavar="N")
     ap.add_argument("--delay-ms", type=int, default=0)
     ap.add_argument("--stall-op", type=lambda x: int(x, 0))
     ap.add_argument("--once", action="store_true")
