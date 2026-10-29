@@ -280,24 +280,34 @@ def big():
             for size in (sizes[0], sizes[1] + 4093):
                 data = random.randbytes(size)
                 src = tmpfile(data)
-                # no scrap directory: it must go straight to the device
-                # (but a USB transfer needing a zero-length packet goes the
-                # long way, through a scrap file)
-                fenv = dict(env) if "--zlp-strict" in flags else dict(env, PDFS_SPILL_DIR="/nonexistent")
+                # sent as it's written; kept too (a scrap file here), as
+                # FileSwitch can write a block after ones beyond it
+                fenv = dict(env)
                 r = s.run(["facopy", src, D + ".Download.fa%d" % size, "C85"], env=fenv)
                 p = local(s, "Download", "fa%d.jpg" % size)
                 ok(r.returncode == 0 and os.path.isfile(p) and open(p, "rb").read() == data,
                    "a %d-byte file copied as Filer_Action does %s" % (size, flags))
+                os.unlink(src)
+            if "--zlp-strict" in flags:
+                # one that would need a zero-length packet, copied as Filer_Action
+                # does, with no scrap directory: streamed, its last byte by an edit
+                size = 512 * 10241 - 12          # over 4MB
+                data = random.randbytes(size)
+                src = tmpfile(data)
+                r = s.run(["facopy", src, D + ".Download.zlpfa", "FFD"], env=env)
+                p = local(s, "Download", "zlpfa")
+                ok(r.returncode == 0 and os.path.isfile(p) and open(p, "rb").read() == data,
+                   "a %d-byte file streamed, its last byte by an edit %s" % (size, flags))
                 os.unlink(src)
             # written out of order: refused, and nothing left on the device
             data = random.randbytes(6 * 1048576)
             src = tmpfile(data)
             r = s.run(["facopy", src, D + ".Download.swapped", "FFD", "1048576"],
                       env=dict(env, PDFS_FA_SWAP="1"), expect=None)
-            ok(not os.path.exists(local(s, "Download", "swapped")) and (
-               "wasn't written in order" in r.stdout or r.returncode == 0 and
-               open(local(s, "Download", "swapped"), "rb").read() == data),
-               "a big file written out of order is refused (or sent right) %s" % flags)
+            sp = local(s, "Download", "swapped")
+            ok(("wasn't written in order" in r.stdout and not os.path.exists(sp))
+               or (r.returncode == 0 and os.path.exists(sp) and open(sp, "rb").read() == data),
+               "a big file written out of order is sent right (or refused) %s" % flags)
             os.unlink(src)
             # append to a big file: it's loaded into a scrap file first
             tail = b"--tail--"

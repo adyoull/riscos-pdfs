@@ -23,6 +23,7 @@
 #define Socket_Connect          0x41204
 #define Socket_Recv             0x41205
 #define Socket_Send             0x41208
+#define Socket_Setsockopt       0x4120C
 #define Socket_Close            0x41210
 #define Socket_Select           0x41211
 
@@ -497,6 +498,7 @@ ERROR_BLOCK (err_nomem, 0x1FAB8, "Not enough memory");
 ERROR_BLOCK (err_desktop, 0x1FAE3, "Use *Desktop to start the PDFS filer");
 ERROR_BLOCK (err_usb_syntax, 0x1FAE8, "Syntax: *PDFSUSB [control on|off]");
 ERROR_BLOCK (err_ext_syntax, 0x1FAE2, "Syntax: *PDFSExtensions [show|hide]");
+ERROR_BLOCK (err_bg_syntax, 0x1FAE9, "Syntax: *PDFSBackground [on|off]");
 
 static int
 tcp_connect (tcp *c)
@@ -505,6 +507,11 @@ tcp_connect (tcp *c)
   if (swix_regs (Socket_Creat, &r))
     return -1;
   c->fd = (int) r.r[0];
+  /* a small send buffer: a write waits for the device to take it, as a USB
+     write does (DeviceFS's buffer is 64KB), not megabytes in a socket */
+  int sndbuf = 32768;
+  regs so = {{ (unsigned) c->fd, 0xFFFF, 0x1001, (unsigned) &sndbuf, 4 }};   /* SOL_SOCKET, SO_SNDBUF */
+  swix_regs (Socket_Setsockopt, &so);
   uint8_t sa[16];
   for (int style = 0; style < 2; style++)
     {
@@ -1042,6 +1049,24 @@ mod_command (int index, const char *tail, int argc)
                                 : "Names are shown whole (Letter.txt is shown as Letter/txt)");
           newline ();
         }
+      return 0;
+    case 9:                         /* *PDFSBackground [on|off] */
+      if (argc && word_is (tail, "on"))
+        pdfs_background_option = 1;
+      else if (argc && word_is (tail, "off"))
+        pdfs_background_option = 0;
+      else if (argc)
+        return ERR (err_bg_syntax);
+      else
+        {
+          write0 (pdfs_background_option
+                  ? "Big new files are sent in the background, after the program has written them"
+                  : "Files are written to the device while the program writes them");
+          newline ();
+        }
+      /* the filer task, if it's running, follows it at once */
+      if (filer_task > 0)
+        pdfs_background = pdfs_background_option;
       return 0;
     case 6:                         /* *Desktop_PDFSFiler */
       {

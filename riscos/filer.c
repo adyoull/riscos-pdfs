@@ -574,7 +574,7 @@ filer_main (void)
       swix_regs (OS_Exit, &x);
     }
   filer_task = (int) r.r[1];
-  pdfs_background = 1;
+  pdfs_background = pdfs_background_option;
   sending = 0;
   free_register (1);
   oscli ("IconSprites Resources:$.Resources.PDFS.Sprites", 0, 0);

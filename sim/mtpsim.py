@@ -499,6 +499,10 @@ def main():
     dev = Device(args)
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if args.rate:
+        # a small window, so the sender is held up as a USB device's buffer
+        # holds up DeviceFS (64KB), not by megabytes in the kernel
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 32768)
     srv.bind(("127.0.0.1", args.port))
     srv.listen(1)
     log("listening on 127.0.0.1:%d" % args.port)

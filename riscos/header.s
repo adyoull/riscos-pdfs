@@ -27,7 +27,7 @@ module_start:
 	.word	flags - module_start
 
 title:	.asciz	"PDFS"
-help:	.asciz	"PDFS\t\t0.12 (29 Oct 2026)"
+help:	.asciz	"PDFS\t\t0.13 (29 Oct 2026)"
 	.align	2
 flags:	.word	1				@ 32-bit compatible
 
@@ -225,6 +225,13 @@ commands:
 	.word	syn_usb - module_start
 	.word	help_usb - module_start
 
+	.asciz	"PDFSBackground"
+	.align	2
+	.word	cm_command_9 - module_start
+	.word	0x00010000			@ 0 to 1 parameters
+	.word	syn_bg - module_start
+	.word	help_bg - module_start
+
 	.asciz	"Desktop_PDFSFiler"
 	.align	2
 	.word	cm_command_6 - module_start
@@ -234,6 +241,8 @@ commands:
 
 	.word	0
 
+help_bg:	.asciz	"*PDFSBackground sets how files are written to a device in the desktop. off (the default): as any filing system does, while the program writes them, so Filer_Action's window shows the whole copy. on: big new files are kept and sent afterwards by PDFS's filer, with a window of its own, so a program that saves a big file all at once isn't held up while it goes."
+syn_bg:	.asciz	"Syntax: *PDFSBackground [on|off]"
 help_eject:	.asciz	"*PDFSEject makes a storage safe to remove: it writes what's waiting and stops using it. With all, every storage of that device is ejected and its session is closed, so the device can be unplugged. Refused while files on it are open."
 syn_eject:	.asciz	"Syntax: *PDFSEject <disc> [all]"
 help_usb:	.asciz	"*PDFSUSB lists the connected USB devices' interfaces that have bulk endpoints, and which are MTP. *PDFSUSB control on|off lets PDFS use USB class requests (Cancel) when it recovers from errors: off by default, as some USB drivers do them synchronously."
@@ -265,3 +274,4 @@ syn_log:	.asciz	"Syntax: *PDFSLog [on|off|trace]"
 	CM_COMMAND 6
 	CM_COMMAND 7
 	CM_COMMAND 8
+	CM_COMMAND 9

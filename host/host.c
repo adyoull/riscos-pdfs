@@ -478,13 +478,19 @@ do_facopy (const char *local, const char *path, int type, uint32_t chunk)
   pd_regs c = { { 7, (pd_reg) p, 0xDEADDEAD, 0xDEADDEAD, 0, len } };
   if (check (call (PD_FILE, &c), "create"))
     return -1;
+  /* as RISC OS 5's Filer_Action does: its info written before it's opened
+     (File 1), then written from 0 with no change of extent (PDFS_FA_EXT0:
+     setting it to 0 first, as older ones may) */
+  pd_regs wi0 = { { 1, (pd_reg) p, 0xDEADDEAD, 0xDEADDEAD, 0, 3 } };
+  if (check (call (PD_FILE, &wi0), "write info"))
+    return -1;
   pd_regs o = { { 2, (pd_reg) p, 0, 103 } };
   if (check (call (PD_OPEN, &o), "open"))
     return -1;
   pd_reg h = o.r[1];
   uint32_t bs = (uint32_t) o.r[2];
   pd_regs z = { { 3, h, 0 } };
-  if (check (call (PD_ARGS, &z), "setext 0"))
+  if (getenv ("PDFS_FA_EXT0") && check (call (PD_ARGS, &z), "setext 0"))
     return -1;
   /* FileSwitch: whole aligned blocks go straight through, a partial block
      waits in its buffer until it's full or the file is closed */

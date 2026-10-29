@@ -16,7 +16,7 @@ unsigned pdfs_timeout_cs = 1000;
 #define READAHEAD     65536
 #define MAX_WRITE     0xFFFFFFF0u   /* largest file (MTP sizes are 32 bits) */
 #define SPILL_AT      (4u << 20)    /* bigger files being written go to a scrap file */
-#define STREAM_AT     SPILL_AT      /* files this big or bigger are streamed (no filer task) */
+#define STREAM_AT     (1u << 20)    /* new files this big or bigger are sent as they're written */
 #define HEADROOM      12            /* bytes before out-data for the container header */
 
 /* --- types -------------------------------------------------------------------- */
@@ -77,14 +77,14 @@ struct ofile
   int spill;                  /* or, when it's big, a scrap file (pd_spill_open) */
   int lazy;                   /* created big: no storage yet (it may be streamed) */
   /* Or sent to the device as it's written (a big file created with its
-     size, written in order: Filer_Action, *Copy): stream 1 while sending,
-     2 once it has gone wrong (out of order); sent = bytes sent so far;
-     the last bytes written are kept, for FileSwitch to read back */
+     size, written from the start: Filer_Action, *Copy): stream 1 while
+     sending, 2 once it has gone wrong (written again, differently, where
+     it had gone), 3 failed; sent = bytes sent so far. What's written is
+     kept as well (wbuf / spill) */
   int stream;
   uint64_t sent;
-  uint8_t *tail;
-  uint64_t tail_off;
-  uint32_t tail_len;
+  uint32_t slen;              /* bytes in the SendObject (the last may follow by an edit) */
+  uint8_t *tail;              /* while streaming: a bit for each 4K block written */
   uint8_t *rbuf;              /* read-ahead */
   uint64_t roff;
   uint32_t rlen;
@@ -99,6 +99,7 @@ static device devices[MAX_DEVICES];
 static ofile *files;
 static node *pending_create;   /* created by FSEntry_File 7, not yet sent */
 int pdfs_background;            /* the filer task sends big files in the background */
+int pdfs_background_option;     /* *PDFSBackground: whether it should (off by default) */
 
 /* --- errors -------------------------------------------------------------------- */
 
@@ -1637,108 +1638,139 @@ fs_open (pd_regs *r)
 
 /* --- streaming a big file to the device as it's written ------------------------------
    Filer_Action and FileSwitch's *Copy create a file with its size (FSEntry_
-   File 7), open it, and write it in order. Sending it as it comes, not all
-   at the close, keeps the desktop going; and it needs no scrap file. */
+   File 7), open it, and write it from the start. Sending it as it comes,
+   not all at the close, is what makes it act as other filing systems do:
+   each write takes as long as the device does, so Filer_Action's window
+   shows the copy, and the desktop runs between its writes.
 
-#define TAIL        65536         /* the last bytes written, kept */
+   FileSwitch doesn't pass the writes quite in order: a 4K buffer it's
+   filling can go after data beyond it. So what's written is kept (as any
+   file being written is: memory, or a scrap file), each 4K block written is
+   marked, and the file goes to the device as far as it's been written
+   without a gap. */
+
+#define SBLOCK      4096
+
+static int
+block_done (ofile *f, uint64_t blk)
+{
+  return (f->tail[blk >> 3] >> (blk & 7)) & 1;
+}
+
+/* Send what's written from f->sent on, up to the first gap (all: up to
+   the end, gaps as zeros, at the close) */
+static const pd_error *
+stream_pump (ofile *f, int all)
+{
+  mtp_dev *m = dev_of (f->n);
+  uint8_t buf[2048];
+  while (f->sent < f->slen && f->stream == 1)
+    {
+      if (!all && !block_done (f, f->sent / SBLOCK))
+        break;
+      /* the run of written blocks from here (all: to the end) */
+      uint64_t end = f->sent;
+      while (end < f->slen && (all || block_done (f, end / SBLOCK)))
+        end = (end / SBLOCK + 1) * SBLOCK;
+      if (end > f->slen)
+        end = f->slen;
+      while (f->sent < end)
+        {
+          uint32_t k = end - f->sent > sizeof buf ? sizeof buf : (uint32_t) (end - f->sent);
+          if (f->sent >= f->size)
+            memset (buf, 0, k);                   /* never written: zeros */
+          else
+            {
+              uint32_t have = f->size - f->sent < k ? (uint32_t) (f->size - f->sent) : k;
+              if (f_read (f, f->sent, buf, have) < 0)
+                {
+                  f->stream = 3;
+                  return &err_scrapio;
+                }
+              if (have < k)
+                memset (buf + have, 0, k - have);
+            }
+          int rc = mtp_stream_put (m, buf, k);
+          if (rc < 0)
+            {
+              f->stream = 3;                      /* the transfer failed */
+              return rc_error (rc);
+            }
+          f->sent += k;
+        }
+    }
+  return 0;
+}
 
 static const pd_error *
 stream_start (ofile *f)
 {
   node *n = f->n;
   mtp_dev *m = dev_of (n);
-  const pd_error *e = send_info (n, n->decl);
+  /* a data phase that would need a zero-length packet: all but the last
+     byte, which goes by an edit at the close */
+  uint32_t slen = n->decl > 1 && mtp_needs_zlp (m, n->decl) ? n->decl - 1 : n->decl;
+  pd_free (f->tail);
+  f->tail = pd_alloc (n->decl / SBLOCK / 8 + 2);     /* the blocks written */
+  if (!f->tail)
+    return &err_nomem;
+  const pd_error *e = send_info (n, slen);
   if (e)
     return e;
-  int rc = mtp_stream_begin (m, OP_SendObject, 0, 0, n->decl);
+  f->slen = slen;
+  int rc = mtp_stream_begin (m, OP_SendObject, 0, 0, slen);
   if (rc < 0)
     return rc_error (rc);
   f->stream = 1;
   f->sent = 0;
-  f->tail_len = 0;
-  f->tail_off = 0;
-  if (!f->tail && !(f->tail = pd_alloc (TAIL)))
-    f->stream = 2;
   return 0;
-}
-
-static void
-keep_tail (ofile *f, uint64_t off, const uint8_t *src, uint32_t len)
-{
-  if (!f->tail || !len)
-    return;
-  if (off != f->tail_off + f->tail_len)
-    f->tail_len = 0;              /* not following on: start again */
-  if (len >= TAIL)
-    {
-      memcpy (f->tail, src + len - TAIL, TAIL);
-      f->tail_off = off + len - TAIL;
-      f->tail_len = TAIL;
-      return;
-    }
-  if (!f->tail_len)
-    f->tail_off = off;
-  if (f->tail_len + len > TAIL)
-    {
-      uint32_t drop = f->tail_len + len - TAIL;
-      memmove (f->tail, f->tail + drop, f->tail_len - drop);
-      f->tail_len -= drop;
-      f->tail_off += drop;
-    }
-  memcpy (f->tail + f->tail_len, src, len);
-  f->tail_len += len;
 }
 
 static const pd_error *
 stream_put (ofile *f, uint64_t off, const uint8_t *src, uint32_t len)
 {
-  mtp_dev *m = dev_of (f->n);
-  if (off + len > f->size)
-    f->size = off + len;
+  const pd_error *e;
   if (f->stream != 1)
-    return 0;
+    {
+      if (off + len > f->size)
+        f->size = off + len;
+      return 0;
+    }
   if (off < f->sent)
     {
-      /* written again: fine if it's the same as what went (FileSwitch
-         writing its buffer out twice) */
+      /* written again where it's already gone: fine if it's the same
+         (FileSwitch writing its buffer out twice) */
       uint64_t end = off + len < f->sent ? off + len : f->sent;
-      if (off >= f->tail_off && end <= f->tail_off + f->tail_len
-          && !memcmp_bytes (f->tail + (off - f->tail_off), src, (uint32_t) (end - off)))
+      uint8_t buf[512];
+      for (uint64_t o = off; o < end; )
         {
-          src += end - off;
-          len -= (uint32_t) (end - off);
-          off = end;
+          uint32_t k = end - o > sizeof buf ? sizeof buf : (uint32_t) (end - o);
+          uint32_t have = o >= f->size ? 0 : (f->size - o < k ? (uint32_t) (f->size - o) : k);
+          memset (buf, 0, k);
+          if (have && f_read (f, o, buf, have) < 0)
+            return &err_scrapio;
+          if (memcmp_bytes (buf, src + (o - off), k))
+            {
+              f->stream = 2;
+              return 0;
+            }
+          o += k;
         }
-      else
-        {
-          f->stream = 2;
-          return 0;
-        }
-      if (!len)
-        return 0;
     }
-  int rc = 0;
-  if (off > f->sent)                    /* a gap: zeros */
+  if ((e = f_write (f, off, src, len)))
     {
-      uint64_t gap = off - f->sent;
-      while (gap && rc >= 0)
-        {
-          uint32_t k = gap > 65536 ? 65536 : (uint32_t) gap;
-          rc = mtp_stream_put (m, 0, k);
-          gap -= k;
-        }
-      f->sent = off;
+      f->stream = 3;
+      return e;
     }
-  if (rc >= 0)
-    rc = mtp_stream_put (m, src, len);  /* beyond the size given: dropped */
-  if (rc < 0)
+  /* mark the blocks it fills (to the end of the file, for the last) */
+  uint64_t end = off + len > f->n->decl ? f->n->decl : off + len;
+  for (uint64_t blk = off / SBLOCK; blk * SBLOCK < end; blk++)
     {
-      f->stream = 3;                    /* the transfer failed */
-      return rc_error (rc);
+      uint64_t b0 = blk * SBLOCK, b1 = b0 + SBLOCK < f->n->decl ? b0 + SBLOCK : f->n->decl;
+      if (off <= b0 && end >= b1)
+        f->tail[blk >> 3] |= (uint8_t) (1 << (blk & 7));
     }
-  keep_tail (f, off, src, len);
-  f->sent = off + len;
-  return 0;
+  return stream_pump (f, 0);
 }
 
 /* At the close: finish the transfer; the file must be the size it was
@@ -1749,11 +1781,11 @@ stream_finish (ofile *f)
   node *n = f->n;
   mtp_dev *m = dev_of (n);
   uint32_t rp[5];
+  if (f->stream == 1)
+    stream_pump (f, 1);         /* the rest (any gap left: zeros) */
   int rc = m->streaming ? mtp_stream_end (m, rp) : PDT_IO;
   int state = f->stream;
-  f->stream = 0;
-  pd_free (f->tail);
-  f->tail = 0;
+  f->stream = 0;                /* (the tail is freed with the file, at the close) */
   if (rc != RC_OK || state != 1 || f->size > n->decl)
     {
       if (n->handle)
@@ -1764,6 +1796,31 @@ stream_finish (ofile *f)
       if (rc < 0 && rc != MTP_EBUSY)
         return rc_error (rc);
       return state == 2 ? &err_order : rc != RC_OK ? rc_error (rc) : &err_stream_size;
+    }
+  if (f->slen < n->decl && f->size >= n->decl)
+    {
+      /* the last byte, by an edit */
+      uint64_t last = n->decl - 1;
+      uint8_t b[HEADROOM + 1];
+      uint32_t h = n->handle, sp[4] = { h, (uint32_t) last, (uint32_t) (last >> 32), 1 };
+      int ok = f_read (f, last, b + HEADROOM, 1) == 0;
+      if (ok)
+        {
+          ok = (rc = mtp_transaction (m, OP_BeginEditObject, &h, 1, 0, 0, 0, 0)) == RC_OK;
+        }
+      if (ok)
+        {
+          rc = mtp_transaction (m, OP_SendPartialObject, sp, 4, b + HEADROOM, 1, 0, 0);
+          int rc2 = mtp_transaction (m, OP_EndEditObject, &h, 1, 0, 0, 0, 0);
+          ok = rc == RC_OK && rc2 == RC_OK;
+        }
+      if (!ok)
+        {
+          delete_object (n);
+          n->handle = 0;
+          n->pending = 1;
+          return &err_stream_size;
+        }
     }
   if (f->size < n->decl)
     {
@@ -2304,20 +2361,7 @@ fs_getbytes (pd_regs *r)
   if (!avail)
     return 0;
   if (f->stream)
-    {
-      /* being sent: only what's still kept can be read back */
-      if (f->tail && off >= f->tail_off && off + avail <= f->tail_off + f->tail_len)
-        {
-          memcpy (dst, f->tail + (off - f->tail_off), avail);
-          return 0;
-        }
-      if (off >= f->sent)
-        {
-          memset (dst, 0, avail);         /* not written yet */
-          return 0;
-        }
-      return &err_busy;
-    }
+    return f_read (f, off, dst, avail) < 0 ? &err_scrapio : 0;   /* it's all kept */
   if (f->writable || f->loaded)
     {
       if (!f->loaded && (e = load_whole (f)))
@@ -2369,8 +2413,10 @@ fs_putbytes (pd_regs *r)
   if (!f)
     return &err_badhandle;
   node *nd = f->n;
-  if (!pdfs_background && !f->stream && nd->pending && nd->decl >= STREAM_AT && off == 0 && f->size == 0
-      && !dev_of (nd)->streaming && !nd->gone && !mtp_needs_zlp (dev_of (nd), nd->decl))
+  if (!pdfs_background && !f->stream && nd->pending && nd->decl >= STREAM_AT && off == 0
+      && (f->size == 0 || f->lazy)    /* nothing written yet (Filer_Action writes the size it created) */
+      && !dev_of (nd)->streaming && !nd->gone
+      && (!mtp_needs_zlp (dev_of (nd), nd->decl) || can_edit (dev_of (nd))))
     {
       if ((e = stream_start (f)))
         return e;

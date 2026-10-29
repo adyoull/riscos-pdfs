@@ -9,7 +9,7 @@
 #include <stdint.h>
 #include "transport.h"
 
-#define PDFS_VERSION "0.12"
+#define PDFS_VERSION "0.13"
 
 /* Filing system number: provisional until allocated by RISC OS Open. */
 #define PDFS_FSNUM 0xFA
@@ -42,7 +42,8 @@ void pdfs_describe (void (*line) (const char *s));
 void pdfs_tick (void);
 void pdfs_finish (void);
 /* Big new files sent in the background, by the filer task (fs.c) */
-extern int pdfs_background;                /* set while the filer task runs */
+extern int pdfs_background;                /* sending in the background now */
+extern int pdfs_background_option;         /* *PDFSBackground on: the filer task does it */
 int pdfs_bg_run (unsigned cs);             /* send for cs centiseconds; 1: more to do */
 void pdfs_bg_finish (void);                /* send the rest now */
 int pdfs_bg_progress (const char *disc);   /* percent, or -1: nothing being sent */

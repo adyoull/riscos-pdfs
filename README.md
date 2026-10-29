@@ -5,7 +5,7 @@ MTP (Media Transfer Protocol). A connected device's storages show up as
 discs, such as `PDFS::Pixel-Internal.$`, and work with the Filer, `*Copy`,
 BASIC's OPENIN/OPENOUT and every program that uses FileSwitch.
 
-Status: **0.12.** USB (the RISC OS 5 USB stack), the icon bar filer and
+Status: **0.13.** USB (the RISC OS 5 USB stack), the icon bar filer and
 filetype extensions are done. It's tested against a simulated device, over
 TCP and through an emulation of USBDriver and DeviceFS; it still has to be
 tried with more real devices (see docs/TESTING-ON-A-PI.md).
@@ -106,39 +106,36 @@ saves screenshots; it measures the longest pause in the desktop during each
 
 Files up to 4 GB (MTP's limit).
 
-- **In the desktop, big new files are sent in the background.** When the
-  Filer copies a file that fits in its memory, it saves it with one
-  OS_File call, and FileSwitch hands the whole file over inside that one
-  call: if PDFS sent it there, the desktop would stop (the pointer moving,
-  nothing else) until the device had it all. So, while the PDFS filer task
-  is running, a new file of 1 MB or more is only kept as it's written, and
-  closing it returns at once. The filer task then sends it a piece at a
-  time between other tasks' turns, and shows Filer_Action's own window
-  while it does ("Copying files - Writing", the file's path, bytes to go,
-  files copied, the progress bar, Abort and Pause), loaded from Filer_Action's
-  resources so it looks and reads as every other copy does. Abort cancels
-  the transfer and removes the part-sent file from the device. Files, and new folders, that come while one is waiting
-  go after it, in order.
-- Meanwhile directory listings come from what PDFS already knows, and the
-  Free window shows the last figures. Anything else that needs the device
-  (reading back a file being sent, deleting, renaming, ejecting) waits for
-  the sending to finish. If a send fails (the device unplugged, say), the
-  filer reports it and the file isn't left on the device half-written.
-- At most 24 files wait at once (each holds its contents); another waits
-  for the first to go.
-- When Filer_Action did the copy, its own window shows the copy first
-  (reading the files); PDFS's window opens when Filer_Action has finished,
-  in the same place (it's the same window design), and carries on with the
-  writing to the device: one window at a time, as if one copy. Quitting the desktop sends what's left first.
-- A file being written is kept in memory up to 4 MB; beyond that in a
-  dynamic area, "PDFS transfer" (Task Manager shows it), while there's the
-  memory (48 MB is always left free), and otherwise in a scrap file in
-  `<Wimp$ScrapDir>.PDFS`. Dynamic areas and scrap files go when the file has
-  been sent or its device goes; scrap files left by a crash are deleted the
-  next time one is needed.
-- Outside the desktop (no filer task), a file of 4 MB or more copied by
-  *Copy is sent to the device as it's written, as 0.05 to 0.07 did, and
-  other files when they're closed.
+- **PDFS writes as other filing systems do.** A new file of 1 MB or more
+  (Filer_Action and *Copy create it with its size, then write it from the
+  start) goes to the device as it's written: each write takes as long as
+  the device takes it, so Filer_Action's own window shows the whole copy,
+  bytes to go counting down as the device gets them, and the desktop runs
+  between its writes (Filer_Action sizes them to keep it going). Abort in
+  that window stops the copy, and the part-sent file isn't left on the
+  device. Smaller files go when they're closed.
+- What's written is kept as well, because FileSwitch doesn't pass the
+  writes quite in order (a 4K buffer it's filling can follow data beyond
+  it): the file goes to the device as far as it has been written without a
+  gap. It's kept in memory up to 4 MB; beyond that in a dynamic area, "PDFS
+  transfer" (Task Manager shows it), while there's the memory (48 MB is
+  always left free), and otherwise in a scrap file in
+  `<Wimp$ScrapDir>.PDFS`. These go when the file is closed or its device
+  goes; scrap files left by a crash are deleted the next time one is needed.
+- While a file is being written, directory listings come from what PDFS
+  already knows; other requests that need the device get "The device is
+  busy receiving a file".
+- As on any filing system, a program that saves a big file in one go waits
+  till it's all there: Filer_Action does that for files that fit in its
+  memory, and while it does, the desktop waits too (a few seconds for tens
+  of megabytes over USB 2).
+- `*PDFSBackground on` changes that: in the desktop, a new file of 1 MB or
+  more is only kept as it's written and its close returns at once; PDFS's
+  filer then sends it a piece at a time between other tasks' turns, in a
+  copy window of its own (Filer_Action's window design, opened where
+  Filer_Action's was once that has gone), with Abort and Pause. Up to 24
+  files wait in turn; anything else that needs the device waits for them;
+  quitting the desktop sends what's left first. Off by default.
 
 ## USB notes
 
