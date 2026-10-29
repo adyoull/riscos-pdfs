@@ -39,7 +39,53 @@ typedef struct
 
 static stream streams[NSTREAM];
 static int sock = -1;
-unsigned usbemu_transfers;
+unsigned usbemu_transfers, usbemu_short;
+static uint32_t container_left;     /* bytes of the current OUT container still to come */
+static uint8_t hdr_bytes[4];
+static unsigned hdr_have;
+
+/* Follow the containers in what goes out; a transfer that isn't a whole
+   number of 512-byte packets ends with a short packet: the device would
+   take it as the end of the container. Count those that come too soon. */
+static void
+check_transfer (const uint8_t *p, unsigned n)
+{
+  unsigned i = 0;
+  while (i < n)
+    {
+      if (container_left == 0)
+        {
+          hdr_bytes[hdr_have++] = p[i++];
+          if (hdr_have == 4)
+            {
+              container_left = (uint32_t) hdr_bytes[0] | (uint32_t) hdr_bytes[1] << 8
+                               | (uint32_t) hdr_bytes[2] << 16 | (uint32_t) hdr_bytes[3] << 24;
+              container_left = container_left > 4 ? container_left - 4 : 0;
+              hdr_have = 0;
+            }
+          continue;
+        }
+      unsigned k = n - i < container_left ? n - i : container_left;
+      i += k;
+      container_left -= k;
+    }
+  if ((n & 511) && (container_left || hdr_have))
+    {
+      usbemu_short++;
+      char v[12];
+      int k = 0;
+      unsigned x = usbemu_short;
+      char t[12];
+      do
+        t[k++] = (char) ('0' + x % 10);
+      while ((x /= 10));
+      for (int j = 0; j < k; j++)
+        v[j] = t[k - 1 - j];
+      v[k] = 0;
+      regs r = {{ (unsigned) "PDFSEmu$ShortPackets", (unsigned) v, (unsigned) k, 0, 0 }};
+      swix_regs (0x24, &r);     /* OS_SetVarVal */
+    }
+}
 
 static void
 log_line (const char *s)
@@ -323,6 +369,7 @@ usbemu_swix (unsigned swi, regs *r)
           if ((s = fake_stream (r->r[2])) && s->output && s->len)
             {
               usbemu_transfers++;
+              check_transfer (s->buf, s->len);
               send_all (s->buf, s->len);
               s->len = 0;
             }

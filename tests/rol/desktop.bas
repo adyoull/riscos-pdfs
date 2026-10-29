@@ -78,7 +78,7 @@ IF f% AND 1 THEN PROClog("ShowFree: "+FNstr(e%+4)) ELSE PROClog("ShowFree ok")
 PROCwait(200)
 OSCLI "TBShot"
 REM unplug (the USB emulator's device handle is &9999)
-SYS "OS_ServiceCall",0,&79,&9999
+SYS "OS_ServiceCall",,&79,&9999,"USB9"
 PROCwait(300)
 n%=0
 FOR i%=0 TO 60

@@ -1,3 +1,4 @@
+Set PDFSEmu$ShortPackets 0
 PDFSMount 127.0.0.1:7015
 Info PDFS::SimPhone-Internal.$.Download.pic/jpg
 CDir PDFS::SimPhone-Internal.$.Books
@@ -20,3 +21,11 @@ Wipe PDFS::SimPhone-Internal.$.Books R~C~V
 Cat PDFS::SimPhone-Internal.$
 Cat PDFS::SimPhone-SD_card.$
 PDFSDevices
+PDFSEject SimPhone-SD_card
+PDFSDevices
+Run TESTDIR.eject
+PDFSMount
+PDFSDevices
+PDFSEject SimPhone-Internal all
+PDFSDevices
+Show PDFSEmu$ShortPackets

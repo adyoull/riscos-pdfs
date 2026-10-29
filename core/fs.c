@@ -47,6 +47,8 @@ typedef struct storage
   char disc[40];
   uint64_t free, capacity;
   int readonly;
+  int ejected;                /* *PDFSEject'ed: hidden until the device is mounted again */
+  unsigned info_at;           /* when free space was last read */
   node root;
 } storage;
 
@@ -941,7 +943,8 @@ find_disc (const char *name, int len)
   for (int d = 0; d < MAX_DEVICES; d++)
     if (devices[d].used)
       for (int s = 0; s < devices[d].nst; s++)
-        if (len < 0 ? 1 : name_eq (devices[d].st[s].disc, name, len))
+        if (!devices[d].st[s].ejected
+            && (len < 0 ? 1 : name_eq (devices[d].st[s].disc, name, len)))
           return &devices[d].st[s];
   return 0;
 }
@@ -2268,7 +2271,8 @@ pdfs_disc_count (void)
   int n = 0;
   for (int d = 0; d < MAX_DEVICES; d++)
     if (devices[d].used)
-      n += devices[d].nst;
+      for (int s = 0; s < devices[d].nst; s++)
+        n += !devices[d].st[s].ejected;
   return n;
 }
 
@@ -2278,7 +2282,7 @@ pdfs_disc_name (int i)
   for (int d = 0; d < MAX_DEVICES; d++)
     if (devices[d].used)
       for (int s = 0; s < devices[d].nst; s++)
-        if (i-- == 0)
+        if (!devices[d].st[s].ejected && i-- == 0)
           return devices[d].st[s].disc;
   return 0;
 }
@@ -2289,11 +2293,89 @@ pdfs_free_space (const char *disc, uint64_t *size, uint64_t *free)
   storage *st = find_disc (disc, (int) strlen (disc));
   if (!st)
     return &err_nodisc;
-  const pd_error *e = storage_info (st);
-  if (e)
-    return e;
+  /* the Free window asks every few seconds: don't ask the device as often */
+  if (!st->info_at || pd_time_cs () - st->info_at > 300)
+    {
+      const pd_error *e = storage_info (st);
+      if (e)
+        return e;
+      st->info_at = pd_time_cs () | 1;
+    }
   *size = st->capacity;
   *free = st->free;
+  return 0;
+}
+
+/* Ejecting. pdfs_eject_info: for disc, the number of files open on it (or
+   on any of its device's storages, all), how many storages its device has
+   mounted, and the device's name. -1 if there's no such disc. */
+int
+pdfs_eject_info (const char *disc, int all, int *storages, const char **model)
+{
+  storage *st = find_disc (disc, (int) strlen (disc));
+  if (!st)
+    return -1;
+  device *dv = st->dev;
+  int n = 0;
+  for (ofile *f = files; f; f = f->next)
+    if (all ? f->n->st->dev == dv : f->n->st == st)
+      n++;
+  if (storages)
+    {
+      *storages = 0;
+      for (int s = 0; s < dv->nst; s++)
+        *storages += !dv->st[s].ejected;
+    }
+  if (model)
+    *model = dv->mtp.model[0] ? dv->mtp.model : "The device";
+  return n;
+}
+
+/* Which device a disc is on (an index), or -1 */
+int
+pdfs_device_of (const char *disc)
+{
+  storage *st = find_disc (disc, (int) strlen (disc));
+  return st ? (int) (st->dev - devices) : -1;
+}
+
+/* Bring back the storages ejected one by one (*PDFSMount) */
+void
+pdfs_uneject (void)
+{
+  for (int d = 0; d < MAX_DEVICES; d++)
+    if (devices[d].used)
+      for (int s = 0; s < devices[d].nst; s++)
+        devices[d].st[s].ejected = 0;
+}
+
+/* Eject a storage (all: every storage of its device). Refused while files
+   are open on it. When the device has none left, its session is closed:
+   then *gone is set and it can be unplugged. */
+const pd_error *
+pdfs_eject (const char *disc, int all, int *gone)
+{
+  static const pd_error err_open = { PDFS_ERRBASE | 0xCE, "Files on it are open: close them, then eject it" };
+  int left;
+  *gone = 0;
+  int busy = pdfs_eject_info (disc, all, &left, 0);
+  if (busy < 0)
+    return &err_nodisc;
+  if (busy > 0)
+    return &err_open;
+  storage *st = find_disc (disc, (int) strlen (disc));
+  device *dv = st->dev;
+  const pd_error *e = flush_pending (0);
+  if (e)
+    return e;
+  if (all || left <= 1)
+    {
+      release (dv);
+      *gone = 1;
+      return 0;
+    }
+  free_tree (&st->root);
+  st->ejected = 1;
   return 0;
 }
 
@@ -2303,7 +2385,7 @@ pdfs_disc_desc (int i)
   for (int d = 0; d < MAX_DEVICES; d++)
     if (devices[d].used)
       for (int s = 0; s < devices[d].nst; s++)
-        if (i-- == 0)
+        if (!devices[d].st[s].ejected && i-- == 0)
           return devices[d].st[s].desc;
   return 0;
 }
@@ -2361,6 +2443,8 @@ pdfs_describe (void (*line) (const char *s))
       for (int s = 0; s < dv->nst; s++)
         {
           storage *st = &dv->st[s];
+          if (st->ejected)
+            continue;
           p = cat (b, "  PDFS::");
           p = cat (p, st->disc);
           p = cat (p, "  \"");

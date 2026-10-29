@@ -291,47 +291,20 @@ open_streams (usbt *u)
 
 /* --- the transport ------------------------------------------------------------------- */
 
+/* Wait until the output buffer is empty and its transfer has finished.
+   0, or a PDT_ error. */
 static int
-usb_write (pd_transport *t, const void *buf, uint32_t len, unsigned timeout_cs)
+out_idle (usbt *u, unsigned timeout_cs)
 {
-  usbt *u = (usbt *) t;
-  const uint8_t *p = buf;
-  unsigned start = now_cs (), used, free;
-  if (t->gone)
-    return PDT_GONE;
-  while (len)
-    {
-      if (buffer_space (u, u->h_out, &used, &free))
-        return t->gone = 1, PDT_GONE;
-      if (free)
-        {
-          unsigned n = free < len ? free : len;
-          int k = gbpb (u->h_out, (void *) p, n, 1);
-          if (k < 0)
-            return PDT_IO;
-          p += k;
-          len -= (uint32_t) k;
-          wake (u, DEVCALL_WAKEUP_TX, u->s_out, 0);
-          start = now_cs ();
-        }
-      else if (now_cs () - start > timeout_cs)
-        return PDT_TIMEOUT;
-    }
-  /* wait until it has all gone */
-  unsigned empty_since = 0;
+  unsigned start = now_cs (), empty_since = 0, used, free;
   for (;;)
     {
-      if (buffer_space (u, u->h_out, &used, &free))
-        return t->gone = 1, PDT_GONE;
+      if (u->t.gone || buffer_space (u, u->h_out, &used, &free))
+        return u->t.gone = 1, PDT_GONE;
       regs ti = {{ DFS_TRANSFER_INFO, (unsigned) u->c.dev, u->s_out, 0, 0 }};
       int status = swix_regs (DeviceFS_CallDevice, &ti) ? 1 : (int) ti.r[3];
       if (status < 0)
-        {
-          /* a stalled pipe: clear it; the transaction fails and is recovered */
-          regs cs = {{ DFS_CLEAR_STALL, (unsigned) u->c.dev, (unsigned) u->h_out }};
-          swix_regs (DeviceFS_CallDevice, &cs);
-          return PDT_IO;
-        }
+        return PDT_IO;          /* a stalled pipe: usb_reset clears it */
       if (used == 0 && status != 0)
         return 0;
       /* the buffer has emptied: don't wait long for a status that may
@@ -343,11 +316,44 @@ usb_write (pd_transport *t, const void *buf, uint32_t len, unsigned timeout_cs)
           else if (now_cs () - empty_since > 50)
             return 0;
         }
-      if (used)
+      else
         wake (u, DEVCALL_WAKEUP_TX, u->s_out, 0);
       if (now_cs () - start > timeout_cs)
         return PDT_TIMEOUT;
     }
+}
+
+/* Send one container. USBDriver sends what's in the stream's buffer as a
+   transfer, and a transfer that isn't a whole number of packets ends with
+   a short packet, which the device takes as the end of the container. So
+   the container goes in pieces that are whole numbers of packets (the last
+   excepted), each into an empty buffer. */
+static int
+usb_write (pd_transport *t, const void *buf, uint32_t len, unsigned timeout_cs)
+{
+  usbt *u = (usbt *) t;
+  const uint8_t *p = buf;
+  unsigned used, free, mps = t->max_packet;
+  int e;
+  while (len)
+    {
+      if ((e = out_idle (u, timeout_cs)))
+        return e;
+      if (buffer_space (u, u->h_out, &used, &free))
+        return t->gone = 1, PDT_GONE;
+      unsigned n = len;
+      if (n > free)
+        n = free & ~(mps - 1);  /* not the end: whole packets */
+      if (!n)
+        return PDT_IO;
+      int k = gbpb (u->h_out, (void *) p, n, 1);
+      if (k != (int) n)
+        return PDT_IO;
+      p += n;
+      len -= n;
+      wake (u, DEVCALL_WAKEUP_TX, u->s_out, 0);
+    }
+  return out_idle (u, timeout_cs);
 }
 
 static int
@@ -359,7 +365,7 @@ usb_read (pd_transport *t, void *buf, uint32_t max, unsigned timeout_cs)
     return PDT_GONE;
   for (;;)
     {
-      if (buffer_space (u, u->h_in, &used, &free))
+      if (t->gone || buffer_space (u, u->h_in, &used, &free))
         return t->gone = 1, PDT_GONE;
       if (used)
         {
@@ -406,14 +412,15 @@ drain (usbt *u, unsigned cs)
 {
   uint8_t junk[512];
   unsigned start = now_cs (), used, free;
+  unsigned want = u->c.mps > 512 ? u->c.mps : 512;   /* whole packets */
   while (now_cs () - start < cs)
     {
-      if (buffer_space (u, u->h_in, &used, &free))
+      if (u->t.gone || buffer_space (u, u->h_in, &used, &free))
         return;
       if (used)
         gbpb (u->h_in, junk, used < sizeof junk ? used : sizeof junk, 0);
-      else
-        wake (u, DEVCALL_WAKEUP_RX, u->s_in, 512);
+      else if (free >= want)
+        wake (u, DEVCALL_WAKEUP_RX, u->s_in, want);
     }
 }
 
@@ -427,21 +434,27 @@ usb_reset (pd_transport *t, uint32_t tid, int level)
   uint8_t cancel[6] = { 0x01, 0x40, (uint8_t) tid, (uint8_t) (tid >> 8),
                         (uint8_t) (tid >> 16), (uint8_t) (tid >> 24) };
   class_request (u, 0x64, cancel, 6, 0);
-  drain (u, 30);
-  if (level < 2)
-    return 0;
-  /* reopen the pipes: the session starts again */
-  regs cs = {{ DFS_CLEAR_STALL, (unsigned) u->c.dev, (unsigned) u->h_in }};
+  /* What a failed write left in the output buffer mustn't go out before the
+     next command: clear any stall and reopen the output stream (level 1),
+     or all the pipes (level 2: the session starts again) */
+  regs cs = {{ DFS_CLEAR_STALL, (unsigned) u->c.dev, (unsigned) u->h_out }};
   swix_regs (DeviceFS_CallDevice, &cs);
-  cs.r[0] = DFS_CLEAR_STALL;
-  cs.r[1] = (unsigned) u->c.dev;
-  cs.r[2] = (unsigned) u->h_out;
-  swix_regs (DeviceFS_CallDevice, &cs);
-  close_streams (u);
-  if (open_streams (u))
+  if (level >= 2)
+    {
+      regs ci = {{ DFS_CLEAR_STALL, (unsigned) u->c.dev, (unsigned) u->h_in }};
+      swix_regs (DeviceFS_CallDevice, &ci);
+      close_streams (u);
+      if (open_streams (u))
+        return t->gone = 1, PDT_GONE;
+      drain (u, 20);
+      return 1;
+    }
+  close_stream (&u->h_out);
+  u->h_out = open_stream (&u->c, u->c.ep_out, "bulk", BULK_BUFFER, 1);
+  if (!u->h_out || handles (u, u->h_out, &u->s_out))
     return t->gone = 1, PDT_GONE;
-  drain (u, 20);
-  return 1;
+  drain (u, 30);
+  return 0;
 }
 
 static void
@@ -475,8 +488,8 @@ usb_is_open (const char *dev)
 const pd_error *
 usb_mount (const usb_iface *c)
 {
-  static const pd_error err_open = { 0x1FAC4, "Can't open the device's USB endpoints (is something else using it?)" };
-  static const pd_error err_full = { 0x1FAC5, "Too many USB devices mounted" };
+  static const pd_error err_open = { 0x1FAE4, "Can't open the device's USB endpoints (is something else using it?)" };
+  static const pd_error err_full = { 0x1FAE5, "Too many USB devices mounted" };
   static const pd_error err_mem = { 0x1FAB8, "Not enough memory" };
   int slot = -1;
   for (int i = 0; i < MAX_OPEN; i++)
@@ -509,18 +522,26 @@ usb_mount (const usb_iface *c)
   return pdfs_mount (&u->t);    /* closes the transport if it fails */
 }
 
-/* Service_DeviceDead: R2 = DeviceFS device handle (0: all) */
+/* Service_DeviceDead for a DeviceFS device ("USB5") */
 void
-usb_device_dead (unsigned devhandle)
+usb_device_dead (const char *name)
 {
   for (int i = 0; i < MAX_OPEN; i++)
-    if (open_list[i] && (!devhandle || open_list[i]->devhandle == devhandle))
-      open_list[i]->t.gone = 1;
+    if (open_list[i])
+      {
+        const char *a = open_list[i]->c.dev, *b = name;
+        while (*a && (*a | 0x20) == (*b | 0x20))
+          a++, b++;
+        if (!*a && *b <= ' ')
+          open_list[i]->t.gone = 1;
+      }
 }
 
 /* The USB system is going (Service_USB 4) */
 void
 usb_dying (void)
 {
-  usb_device_dead (0);
+  for (int i = 0; i < MAX_OPEN; i++)
+    if (open_list[i])
+      open_list[i]->t.gone = 1;
 }

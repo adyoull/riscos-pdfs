@@ -3,7 +3,8 @@
    mounted storage of each portable device.
 
    - SELECT or ADJUST on an icon opens its root directory.
-   - MENU: Open '$', Free, Dismount.
+   - MENU: Open '$', Free, Eject (this storage), Eject all (when the device
+     has more than one): safe to remove or unplug.
    - Files dragged to an icon are copied to that storage's root (Filer_Action);
      a save box dragged to it saves there.
    - Icons follow mounting and dismounting (checked once a second).
@@ -41,18 +42,20 @@ int filer_task;                 /* 0: not running, -1: starting, else the task h
 unsigned filer_sp;              /* top of the task's stack */
 static void *stack;
 
+/* Fixed slots: each icon's indirected text points into its slot, so slots
+   never move while their icon exists */
 typedef struct
 {
-  int handle;
+  int used, handle;
   char disc[40];
   char text[16];
 } baricon;
 
 static baricon icons[MAX_ICONS];
-static int nicons;
-static int menu_icon = -1;      /* the icon whose menu is open */
+static char menu_disc[40];      /* the disc whose menu is open */
+static int poll_errors;
 static unsigned block[64];      /* Wimp_Poll block */
-static unsigned menu[7 + 3 * 6];
+static unsigned menu[7 + 4 * 6];
 
 static const char validation[] = "Spdfs_dev";
 
@@ -102,9 +105,12 @@ report (oserror *e)
 static void
 add_icon (const char *disc, const char *desc)
 {
-  if (nicons >= MAX_ICONS)
+  baricon *b = 0;
+  for (int k = 0; k < MAX_ICONS && !b; k++)
+    if (!icons[k].used)
+      b = &icons[k];
+  if (!b)
     return;
-  baricon *b = &icons[nicons];
   int i = 0;
   for (; disc[i] && i < 39; i++)
     b->disc[i] = disc[i];
@@ -128,7 +134,7 @@ add_icon (const char *disc, const char *desc)
   if (!swix_regs (Wimp_CreateIcon, &r))
     {
       b->handle = (int) r.r[0];
-      nicons++;
+      b->used = 1;
     }
 }
 
@@ -138,11 +144,7 @@ remove_icon (int k)
   unsigned blk[2] = { (unsigned) -2, (unsigned) icons[k].handle };
   regs r = {{ 0, (unsigned) blk }};
   swix_regs (Wimp_DeleteIcon, &r);
-  if (menu_icon == k)
-    menu_icon = -1;
-  for (int i = k; i < nicons - 1; i++)
-    icons[i] = icons[i + 1];
-  nicons--;
+  icons[k].used = 0;
 }
 
 /* Make the icons match the mounted storages. */
@@ -150,13 +152,24 @@ static void
 refresh (void)
 {
   pdfs_tick ();                 /* device events; drops unplugged devices */
+  /* a USB device plugged in: mount it. A phone may take a few seconds to be
+     ready (or reconnects when File transfer is chosen): try a few times */
+  static int attach_tries;
   if (usb_attached)
     {
       usb_attached = 0;
-      oscli ("PDFSMount -auto", 0, 0);
+      attach_tries = 5;
     }
-  for (int k = nicons - 1; k >= 0; k--)
+  if (attach_tries > 0)
     {
+      int before = pdfs_disc_count ();
+      oscli ("PDFSMount -auto", 0, 0);
+      attach_tries = pdfs_disc_count () > before ? 0 : attach_tries - 1;
+    }
+  for (int k = 0; k < MAX_ICONS; k++)
+    {
+      if (!icons[k].used)
+        continue;
       int found = 0;
       const char *d;
       for (int i = 0; (d = pdfs_disc_name (i)); i++)
@@ -173,8 +186,8 @@ refresh (void)
   for (int i = 0; (d = pdfs_disc_name (i)); i++)
     {
       int found = 0;
-      for (int k = 0; k < nicons; k++)
-        if (str_eq (d, icons[k].disc))
+      for (int k = 0; k < MAX_ICONS; k++)
+        if (icons[k].used && str_eq (d, icons[k].disc))
           found = 1;
       if (!found)
         add_icon (d, pdfs_disc_desc (i));
@@ -184,8 +197,8 @@ refresh (void)
 static int
 icon_index (int handle)
 {
-  for (int k = 0; k < nicons; k++)
-    if (icons[k].handle == handle)
+  for (int k = 0; k < MAX_ICONS; k++)
+    if (icons[k].used && icons[k].handle == handle)
       return k;
   return -1;
 }
@@ -194,6 +207,51 @@ static void
 open_root (int k)
 {
   report (oscli ("Filer_OpenDir PDFS::", icons[k].disc, ".$"));
+}
+
+/* --- ejecting -------------------------------------------------------------------------- */
+
+/* Eject one storage, or (all) every storage of its device. Refused while
+   files are open on it. Its windows close and its icons go; when the device
+   has nothing left mounted, its session is closed and it can be unplugged. */
+static void
+eject (int k, int all)
+{
+  char disc[40], label[16], msg[200];
+  const char *model = 0;
+  int left = 0;
+  for (int i = 0; i < 40; i++)
+    disc[i] = icons[k].disc[i];
+  for (int i = 0; i < 16; i++)
+    label[i] = icons[k].text[i];
+  if (pdfs_eject_info (disc, all, &left, &model) < 0)
+    return;
+  char name[48];
+  int i = 0;
+  for (; model && model[i] && i < 47; i++)
+    name[i] = model[i];
+  name[i] = 0;
+  int gone = all || left <= 1;
+  /* the windows: of this storage, or of each of the device's */
+  int dev = pdfs_device_of (disc);
+  for (int j = 0; j < MAX_ICONS; j++)
+    if (icons[j].used && (j == k || (gone && pdfs_device_of (icons[j].disc) == dev)))
+      oscli ("Filer_CloseDir PDFS::", icons[j].disc, ".$");
+  oserror *e = oscli ("PDFSEject ", disc, all ? " all" : 0);
+  refresh ();
+  if (e)
+    {
+      report (e);
+      return;
+    }
+  char *p = msg + 4;
+  if (gone)
+    append (append (p, name), " has been ejected: it's safe to unplug it.");
+  else
+    append (append (append (append (p, "'"), label), "' has been ejected from "), name);
+  *(unsigned *) msg = 0;
+  regs r = {{ (unsigned) msg, 1 | 1 << 8 | 1 << 9, (unsigned) "PDFS Filer" }};   /* OK, information */
+  swix_regs (Wimp_ReportError, &r);
 }
 
 /* --- menu ------------------------------------------------------------------------------- */
@@ -227,18 +285,28 @@ show_menu (int k, int x)
   menu[6] = 0;
   menu_item (&menu[7], 0, "Open '$'");
   menu_item (&menu[13], 0, "Free...");
-  menu_item (&menu[19], 0x80, "Dismount");
-  menu_icon = k;
-  regs r = {{ 0, (unsigned) menu, (unsigned) (x - 64), 96 + 3 * 44 }};
+  /* a device with more than one storage mounted: Eject this one, or all */
+  int left = 1;
+  pdfs_eject_info (icons[k].disc, 0, &left, 0);
+  int items = left > 1 ? 4 : 3;
+  menu_item (&menu[19], items == 3 ? 0x80 : 0, "Eject");
+  if (items == 4)
+    menu_item (&menu[25], 0x80, "Eject all");
+  for (int i = 0; i < 40; i++)
+    menu_disc[i] = icons[k].disc[i];
+  regs r = {{ 0, (unsigned) menu, (unsigned) (x - 64), (unsigned) (96 + items * 44) }};
   swix_regs (Wimp_CreateMenu, &r);
 }
 
 static void
 menu_select (void)
 {
-  int k = menu_icon;
-  if (k < 0 || k >= nicons)
-    return;
+  int k = -1;
+  for (int j = 0; j < MAX_ICONS; j++)
+    if (icons[j].used && str_eq (icons[j].disc, menu_disc))
+      k = j;
+  if (k < 0)
+    return;                     /* its device has gone */
   unsigned ptr[5];
   regs pr = {{ 0, (unsigned) ptr }};
   swix_regs (Wimp_GetPointerInfo, &pr);
@@ -251,15 +319,9 @@ menu_select (void)
       report (oscli ("ShowFree -fs PDFS ", icons[k].disc, 0));
       break;
     case 2:
-      {
-        char disc[40];
-        for (int i = 0; i < 40; i++)
-          disc[i] = icons[k].disc[i];
-        oscli ("Filer_CloseDir PDFS::", disc, ".$");
-        report (oscli ("PDFSDismount ", disc, 0));
-        refresh ();
-        return;                 /* the menu has gone with the icon */
-      }
+    case 3:
+      eject (k, (int) block[0] == 3);
+      return;                   /* the menu has gone with the icon */
     }
   if (ptr[2] & 1)               /* ADJUST: keep the menu open */
     {
@@ -365,6 +427,7 @@ message (int code)
 /* --- the Free module (*ShowFree, and the menu's Free...) ---------------------------------- */
 
 void pd_free_entry (void);      /* header.s */
+uint32_t pd_free_stack[1536];   /* its stack (6K) */
 static void *private_word;
 static int free_registered;
 
@@ -450,8 +513,9 @@ filer_quit (void)
       swix_regs (Wimp_CloseDown, &r);
     }
   filer_task = 0;
-  nicons = 0;
-  menu_icon = -1;
+  for (int k = 0; k < MAX_ICONS; k++)
+    icons[k].used = 0;
+  menu_disc[0] = 0;
   regs x = {{ 0, 0, 0 }};
   swix_regs (OS_Exit, &x);
 }
@@ -470,7 +534,9 @@ filer_main (void)
   filer_task = (int) r.r[1];
   free_register (1);
   oscli ("IconSprites Resources:$.Resources.PDFS.Sprites", 0, 0);
-  nicons = 0;
+  for (int k = 0; k < MAX_ICONS; k++)
+    icons[k].used = 0;
+  poll_errors = 0;
   oscli ("PDFSMount -auto", 0, 0);  /* devices already plugged in */
   refresh ();
   unsigned next = 0;
@@ -485,7 +551,12 @@ filer_main (void)
         }
       regs p = {{ (1 << 4) | (1 << 5) | (1 << 11) | (1 << 12), (unsigned) block, next }};
       if (swix_regs (Wimp_PollIdle, &p))
-        continue;
+        {
+          if (++poll_errors > 10)     /* something is badly wrong: stop */
+            filer_quit ();
+          continue;
+        }
+      poll_errors = 0;
       switch ((int) p.r[0])
         {
         case 6:                                     /* Mouse_Click */
@@ -515,12 +586,13 @@ filer_main (void)
 oserror *
 filer_prepare (void *pw)
 {
+  static const struct { int n; char m[32]; } nomem = { 0x1FAB8, "Not enough memory" };
   private_word = pw;
   if (!stack)
     {
       stack = rma_claim (STACK_SIZE);
       if (!stack)
-        return 0;
+        return (oserror *) &nomem;
     }
   filer_sp = (unsigned) stack + STACK_SIZE;
   return 0;

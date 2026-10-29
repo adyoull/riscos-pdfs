@@ -13,6 +13,8 @@
 #define OS_ReadMonotonicTime    0x42
 #define XReport_Text0           (0x20000 | 0x54C80)
 #define OS_SWINumberFromString  0x39
+#define OS_AddCallBack          0x54
+#define OS_RemoveCallBack       0x5F
 #define Wimp_StartTask          0x400DE
 #define Wimp_ReadSysInfo        0x400F2
 #define ResourceFS_RegisterFiles   0x41B40
@@ -26,6 +28,8 @@
 
 extern char module_start[], fs_info_block[];
 static void *private_word;
+static int callback_set;
+void pd_callback (void);        /* header.s */
 
 
 /* in header.s */
@@ -231,11 +235,11 @@ typedef struct
   char name[40];
 } tcp;
 
-ERROR_BLOCK (err_connect, 0x1FAC0, "Can't connect to the simulated device");
-ERROR_BLOCK (err_syntax, 0x1FAC1, "Give an address as a.b.c.d:port");
+ERROR_BLOCK (err_connect, 0x1FAE0, "Can't connect to the simulated device");
+ERROR_BLOCK (err_syntax, 0x1FAE1, "Give an address as a.b.c.d:port");
 ERROR_BLOCK (err_nomem, 0x1FAB8, "Not enough memory");
-ERROR_BLOCK (err_desktop, 0x1FAC3, "Use *Desktop to start the PDFS filer");
-ERROR_BLOCK (err_ext_syntax, 0x1FAC2, "Syntax: *PDFSExtensions [show|hide]");
+ERROR_BLOCK (err_desktop, 0x1FAE3, "Use *Desktop to start the PDFS filer");
+ERROR_BLOCK (err_ext_syntax, 0x1FAE2, "Syntax: *PDFSExtensions [show|hide]");
 
 static int
 tcp_connect (tcp *c)
@@ -385,10 +389,25 @@ mount_tcp (const char *arg)
 
 /* --- USB ---------------------------------------------------------------------------- */
 
-ERROR_BLOCK (err_nomtp, 0x1FAC6, "No MTP device found (*PDFSUSB lists the USB devices; a phone must be set to File transfer)");
-ERROR_BLOCK (err_nousbdev, 0x1FAC7, "That USB device has no interface with bulk endpoints (see *PDFSUSB)");
+ERROR_BLOCK (err_nomtp, 0x1FAE6, "No MTP device found (*PDFSUSB lists the USB devices; a phone must be set to File transfer)");
+ERROR_BLOCK (err_nousbdev, 0x1FAE7, "That USB device has no interface with bulk endpoints (see *PDFSUSB)");
 
 static int word_is (const char *tail, const char *w);
+
+/* The callback set at initialisation in the desktop: start the filer */
+void
+filer_callback (void)
+{
+  callback_set = 0;
+  regs w = {{ 3 }};
+  if (filer_task || swix_regs (Wimp_ReadSysInfo, &w) || !w.r[0] || filer_prepare (private_word))
+    return;
+  filer_task = -1;
+  regs st = {{ (unsigned) "Desktop_PDFSFiler" }};
+  swix_regs (Wimp_StartTask, &st);
+  if (filer_task == -1)         /* refused (no task running): leave it to *WimpTask */
+    filer_task = 0;
+}
 
 /* "USB5" against a command's word (case-insensitive) */
 static int
@@ -527,18 +546,16 @@ mod_init (const char *tail, int instance, void *pw)
     return e;
   regs rf = {{ (unsigned) resource_files }};
   swix_regs (ResourceFS_RegisterFiles, &rf);
-  /* Loaded by a task in the desktop (*RMLoad in a task window, say): start
-     the filer now. In other contexts the Wimp refuses; then it starts with
-     the desktop (Service_StartWimp) or *WimpTask Desktop_PDFSFiler. */
+  /* Loaded in the desktop: start the filer from a callback, once the module
+     is in the module chain (*Desktop_PDFSFiler enters it by name). Where the
+     Wimp refuses (no task is running then), it starts with the next desktop
+     (Service_StartWimp), or with *WimpTask Desktop_PDFSFiler. */
   regs w = {{ 3 }};
   if (!swix_regs (Wimp_ReadSysInfo, &w) && w.r[0])
     {
-      filer_prepare (private_word);
-      filer_task = -1;
-      regs st = {{ (unsigned) "Desktop_PDFSFiler" }};
-      swix_regs (Wimp_StartTask, &st);
-      if (filer_task == -1)     /* it didn't start: the module isn't linked in yet, say */
-        filer_task = 0;
+      regs cb = {{ (unsigned) pd_callback, (unsigned) pw }};
+      if (!swix_regs (OS_AddCallBack, &cb))
+        callback_set = 1;
     }
   return 0;
 }
@@ -547,6 +564,12 @@ oserror *
 mod_final (int fatal)
 {
   (void) fatal;
+  if (callback_set)
+    {
+      regs cb = {{ (unsigned) pd_callback, (unsigned) private_word }};
+      swix_regs (OS_RemoveCallBack, &cb);
+      callback_set = 0;
+    }
   filer_finalise ();
   regs rf = {{ (unsigned) resource_files }};
   swix_regs (ResourceFS_DeregisterFiles, &rf);
@@ -587,13 +610,14 @@ mod_service (regs *r)
     case 0x27:                      /* Service_Reset */
       filer_task = 0;
       break;
-    case 0x79:                      /* Service_DeviceDead: R2 = device handle */
-      usb_device_dead (r->r[2]);
+    case 0x79:                      /* Service_DeviceDead: R3 = the device's name */
+      if (r->r[3])
+        usb_device_dead ((const char *) r->r[3]);
       break;
     case 0xD2:                      /* Service_USB */
       if (r->r[0] == 0)             /* Attach: the filer mounts it */
         usb_attached = 1;
-      else if (r->r[0] == 4)        /* Dying */
+      else if (r->r[0] == 4 || r->r[0] == 5)   /* the USB system is going */
         usb_dying ();
       break;
     case 0x60:                      /* Service_ResourceFSStarting */
@@ -643,7 +667,11 @@ mod_command (int index, const char *tail, int argc)
             e = mount_usb (0, -1, 1);
           }
         else if (!argc)
-          e = mount_usb (0, -1, 0);
+          {
+            int had = pdfs_disc_count ();
+            pdfs_uneject ();            /* storages ejected on their own come back */
+            e = mount_usb (0, -1, pdfs_disc_count () > had);
+          }
         else if ((tail[0] | 0x20) == 'u' && (tail[1] | 0x20) == 's' && (tail[2] | 0x20) == 'b')
           {
             int iface = -1;
@@ -667,6 +695,37 @@ mod_command (int index, const char *tail, int argc)
               newline ();
             }
         return quiet ? 0 : e;
+      }
+    case 8:                         /* *PDFSEject <disc> [all] */
+      {
+        char disc[40];
+        int k = 0, gone = 0, all = 0;
+        while (*tail == ' ')
+          tail++;
+        if (*tail == ':')
+          tail++;
+        for (; tail[k] > ' ' && tail[k] != '.' && k < 39; k++)
+          disc[k] = tail[k];
+        disc[k] = 0;
+        const char *q = tail + k;
+        while (*q > ' ')
+          q++;
+        all = argc > 1 && word_is (q, "all");
+        const char *model = 0;
+        pdfs_eject_info (disc, all, 0, &model);
+        char name[48];
+        int i = 0;
+        for (; model && model[i] && i < 47; i++)
+          name[i] = model[i];
+        name[i] = 0;
+        oserror *e = (oserror *) pdfs_eject (disc, all, &gone);
+        if (!e)
+          {
+            write0 (gone ? name : disc);
+            write0 (gone ? " has been ejected: it can be unplugged" : " has been ejected");
+            newline ();
+          }
+        return e;
       }
     case 7:                         /* *PDFSUSB */
       if (argc >= 2 && word_is (tail, "control"))
@@ -715,7 +774,9 @@ mod_command (int index, const char *tail, int argc)
         regs w = {{ 3 }};
         if (filer_task > 0 || (filer_task == 0 && (swix_regs (Wimp_ReadSysInfo, &w) || !w.r[0])))
           return ERR (err_desktop);
-        filer_prepare (private_word);
+        oserror *pe = filer_prepare (private_word);
+        if (pe)
+          return pe;
         filer_task = -1;
         regs r = {{ 2, (unsigned) "PDFS", (unsigned) tail }};
         return swix_regs (OS_Module, &r);

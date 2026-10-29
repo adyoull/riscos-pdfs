@@ -26,7 +26,7 @@ extern volatile int usb_attached;
 int usb_scan (usb_iface *out, int max, int all);
 int usb_is_open (const char *dev);
 const pd_error *usb_mount (const usb_iface *c);
-void usb_device_dead (unsigned devhandle);
+void usb_device_dead (const char *name);
 void usb_dying (void);
 
 #endif

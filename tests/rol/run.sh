@@ -51,9 +51,11 @@ w('w/z500,ffd', 500)       # with its 12-byte header, one 512-byte packet: needs
 open(os.path.join(t, 'w/local,fff'), 'w').write('a local text file\n')
 open(os.path.join(t, 'w/ToPhone/ReadMe,fff'), 'w').write('Written on RISC OS\nand copied by the Filer\n')
 PY
-for b in basic1 free desktop; do python3 "$ROOT/tools/bbcbasic.py" tok "$HERE/$b.bas" "$T/w/$b,ffb"; done
+for b in basic1 free desktop eject; do python3 "$ROOT/tools/bbcbasic.py" tok "$HERE/$b.bas" "$T/w/$b,ffb"; done
 mv "$T/w/desktop,ffb" "$T/w/desk,ffb"
 cp "$HERE/cli-test.obey" "$T/w/t,feb"
+# the work directory as RISC OS sees it (IXFS: '/' and '.' swap)
+sed -i "s|TESTDIR|IXFS:\$$(printf '%s' "$T/w" | tr './' '/.')|" "$T/w/t,feb"
 if [ $USBEMU = 1 ]; then
   # mount through the USB transport (a fake USB phone bridged to the simulator);
   # in the desktop the filer mounts it by itself
@@ -81,9 +83,13 @@ if [ $DESKTOP = 0 ]; then
   check '[ ! -e "$T/phone/int/Books" ]' "*Wipe R deletes a tree"
   check 'grep -q "0 errors, 0 recoveries" "$OUT/cli.txt"' "no transport errors"
   check 'cmp -s "$T/w/z500,ffd" "$T/phone/int/Download/z500"' "a 500-byte file (one 512-byte data phase)"
+  check 'grep -q "^SimPhone-SD_card has been ejected$" "$OUT/cli.txt"' "*PDFSEject one storage"
+  check 'grep -q "eject refused: .*Files on it are open" "$OUT/cli.txt"' "eject refused while a file is open"
+  check 'grep -q "^SimPhone has been ejected: it can be unplugged" "$OUT/cli.txt" && grep -q "CloseSession\|op 1003" "$OUT/sim.log"' "*PDFSEject all closes the session"
   check '! grep -q "ZLP needed" "$OUT/sim.log"' "no data phase that would need a zero-length packet"
   if [ $USBEMU = 1 ]; then
     check 'grep -q "USB9 .*18D1:4EE1.*06/01/01" "$OUT/cli.txt" && grep -q "MTP" "$OUT/cli.txt"' "*PDFSUSB lists the phone as MTP"
+    check 'grep -q "PDFSEmu\$ShortPackets : 0" "$OUT/cli.txt"' "no transfer ends with a short packet inside a container"
     check 'grep -q "USB8 .*08/06/50" "$OUT/cli.txt" && grep -q "PDFS test SimPhone (USB USB9)" "$OUT/cli.txt"' "the memory stick is listed but not mounted; the phone is, over USB"
   fi
 else

@@ -31,6 +31,10 @@ const pd_error *pdfs_dismount (const char *disc);   /* disc name, or "" for all 
 int pdfs_disc_count (void);
 const char *pdfs_disc_name (int i);                 /* NULL past the end */
 const char *pdfs_disc_desc (int i);
+int pdfs_eject_info (const char *disc, int all, int *storages, const char **model);
+const pd_error *pdfs_eject (const char *disc, int all, int *gone);
+void pdfs_uneject (void);
+int pdfs_device_of (const char *disc);
 const pd_error *pdfs_free_space (const char *disc, uint64_t *size, uint64_t *free);                 /* the storage's description ("SD card") */
 /* Write a description of the mounted devices, one line at a time. */
 void pdfs_describe (void (*line) (const char *s));

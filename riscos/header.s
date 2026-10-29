@@ -108,16 +108,30 @@ pd_start:
 
 @ The Free module's call for free space (Free_Register): r0-r11 as a
 @ block for free_entry, which returns 1 to set Z (reason 3: same device).
-@ Free calls it with the return address pushed on the stack, not in lr
-@ (Push PC; LDR PC, entry), so it returns with Pull PC.
+@ Free calls it with the return address pushed on its stack, not in lr
+@ (Push PC; LDR PC, entry), and has little stack to spare: so it runs on
+@ a stack of its own (pd_free_stack, in filer.c) and returns with Pull PC.
 	.global	pd_free_entry
 pd_free_entry:
-	stmfd	sp!, {r0-r11}
+	str	sp, 3f				@ the caller's stack
+	ldr	sp, 4f
+5:	add	sp, sp, pc			@ ours
+	stmfd	sp!, {r0-r11, lr}
 	mov	r0, sp
 	bl	free_entry
 	cmp	r0, #1
-	ldmfd	sp!, {r0-r11}
+	ldmfd	sp!, {r0-r11, lr}
+	ldr	sp, 3f
 	ldmfd	sp!, {pc}
+3:	.word	0
+4:	.word	pd_free_stack + 6144 - (5b + 8)
+
+@ Callback (OS_AddCallBack) to start the filer when loaded in the desktop
+	.global	pd_callback
+pd_callback:
+	stmfd	sp!, {r0-r12, lr}
+	bl	filer_callback
+	ldmfd	sp!, {r0-r12, pc}
 
 @ ResourceFS's call to re-register our files (Service_ResourceFSStarting):
 @ void call_resourcefs(void *code, void *ws, const void *files)
@@ -182,6 +196,13 @@ commands:
 	.word	syn_ext - module_start
 	.word	help_ext - module_start
 
+	.asciz	"PDFSEject"
+	.align	2
+	.word	cm_command_8 - module_start
+	.word	0x00020001			@ 1 to 2 parameters
+	.word	syn_eject - module_start
+	.word	help_eject - module_start
+
 	.asciz	"PDFSUSB"
 	.align	2
 	.word	cm_command_7 - module_start
@@ -198,6 +219,8 @@ commands:
 
 	.word	0
 
+help_eject:	.asciz	"*PDFSEject makes a storage safe to remove: it writes what's waiting and stops using it. With all, every storage of that device is ejected and its session is closed, so the device can be unplugged. Refused while files on it are open."
+syn_eject:	.asciz	"Syntax: *PDFSEject <disc> [all]"
 help_usb:	.asciz	"*PDFSUSB lists the connected USB devices' interfaces that have bulk endpoints, and which are MTP. *PDFSUSB control on|off lets PDFS use USB class requests (Cancel) when it recovers from errors: off by default, as some USB drivers do them synchronously."
 syn_usb:	.asciz	"Syntax: *PDFSUSB [control on|off]"
 help_desk:	.asciz	"*Desktop_PDFSFiler starts PDFS's icon bar filer. The desktop starts it; after loading PDFS in the desktop, use *WimpTask Desktop_PDFSFiler."
@@ -226,3 +249,4 @@ syn_log:	.asciz	"Syntax: *PDFSLog [on|off|trace]"
 	CM_COMMAND 5
 	CM_COMMAND 6
 	CM_COMMAND 7
+	CM_COMMAND 8

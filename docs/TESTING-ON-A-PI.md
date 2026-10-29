@@ -50,7 +50,12 @@ class `06/01/01` and `- MTP`. Then:
 - Copy a large file (100 MB+) both ways: note the time.
 - Make a directory, rename a file, delete it.
 - Menu > Free on the icon.
-- Unplug the phone: the icons and windows should go.
+- With an SD card in the phone: Menu > Eject on the SD card icon (only that
+  icon goes), then Menu > Eject all on the other (a box says it can be
+  unplugged). Try Eject while a file on the phone is open in an
+  application: it should be refused.
+- *PDFSMount brings back storages ejected one at a time.
+- Unplug the phone without ejecting: the icons and windows should go.
 
 ## 5. What to send back if something goes wrong
 

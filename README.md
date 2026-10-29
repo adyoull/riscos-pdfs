@@ -42,8 +42,13 @@ Needs riscos-crossdev's toolchain (`RISCOS_TOOLCHAIN`, default
 
 In the desktop, plug the phone in and set it to *File transfer* (Android) or
 unlock it: a drive icon appears on the icon bar for each of its storages
-("Internal", "SD card"). Click it to open it; drag files to it to copy them;
-its menu has Free and Dismount. Unplugging it removes the icons.
+("Internal", "SD card"). Click it to open it; drag files to it to copy them.
+Its menu has Open '$', Free, **Eject** (that storage) and, when the device
+has more than one storage, **Eject all**: each writes what's waiting, closes
+the windows and removes the icons; when nothing of the device is left, its
+session is closed and it says the device can be unplugged. Eject is refused
+while files on it are open. Unplugging without ejecting removes the icons
+too.
 
 Outside the desktop:
 
@@ -54,7 +59,8 @@ Outside the desktop:
 | `*PDFSMount <a.b.c.d>:<port>` | connect to the simulator (testing) |
 | `*PDFSDevices` | mounted devices and storages, with free space |
 | `*PDFSUSB` | connected USB devices' interfaces, and which are MTP |
-| `*PDFSDismount [<disc>]` | disconnect |
+| `*PDFSEject <disc> [all]` | eject a storage, or (all) the whole device, safely |
+| `*PDFSDismount [<disc>]` | disconnect at once |
 | `*PDFSExtensions [show\|hide]` | how names with a type extension are shown |
 | `*PDFSLog [on\|off\|trace]` | the log; trace logs every FileSwitch call (also to Reporter) |
 
