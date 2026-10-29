@@ -87,8 +87,9 @@ static char spill_names[16][300];
 int spill_count;                /* open now (for tests) */
 
 int
-pd_spill_open (void)
+pd_spill_open (uint64_t hint)
 {
+  (void) hint;
   const char *dir = getenv ("PDFS_SPILL_DIR") ? getenv ("PDFS_SPILL_DIR") : "/tmp";
   for (int i = 0; i < 16; i++)
     if (!spill_names[i][0])
@@ -640,6 +641,26 @@ run (int argc, char **argv)
       printf ("disc %s\n", (char *) r2.r[2]);
       return 0;
     }
+  if (!strcmp (cmd, "bgstep"))
+    {
+      /* send a little of what's waiting (as the filer task does on a null event) */
+      int more = pdfs_bg_run (1);
+      printf ("bg: %s\n", more ? "more" : "done");
+      return 0;
+    }
+  if (!strcmp (cmd, "bgprogress") && argc > 1)
+    {
+      printf ("bg: %d%%\n", pdfs_bg_progress (argv[1]));
+      return 0;
+    }
+  if (!strcmp (cmd, "bgdone"))
+    {
+      int steps = 0;
+      while (pdfs_bg_run (1))
+        steps++;
+      printf ("bg: done in %d steps\n", steps + 1);
+      return 0;
+    }
   if (!strcmp (cmd, "sleep") && argc > 1)
     {
       usleep ((useconds_t) (atof (argv[1]) * 1e6));
@@ -670,6 +691,8 @@ main (int argc, char **argv)
     pdfs_set_hide_ext (0);
   if (getenv ("PDFS_TRACE"))
     pdfs_trace = 1;
+  if (getenv ("PDFS_BG"))
+    pdfs_background = 1;       /* as when the filer task is running */
   pd_transport *t = tcp_open (argv[1]);
   if (!t)
     {
@@ -692,7 +715,20 @@ main (int argc, char **argv)
         j++;
       argv[j < argc ? j : argc] = 0;
       run (j - i, argv + i);
+      const pd_error *be = pdfs_bg_error ();
+      if (be)
+        {
+          printf ("BGERROR %s\n", be->errmess);
+          failures++;
+        }
       i = j + 1;
+    }
+  pdfs_bg_finish ();
+  const pd_error *be = pdfs_bg_error ();
+  if (be)
+    {
+      printf ("BGERROR %s\n", be->errmess);
+      failures++;
     }
   pdfs_finish ();
   return failures ? 1 : 0;

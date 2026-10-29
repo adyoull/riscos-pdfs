@@ -231,7 +231,25 @@ pd_filetype_to_ext (int type, char *buf)
 #define OS_Find                 0x0D
 #define OS_File                 0x08
 
-static struct { int handle; char name[16]; } spills[8];
+#define OS_ChangeDynamicArea    0x2A
+#define OS_ReadDynamicArea      0x5C
+#define OS_DynamicArea          0x66
+
+#define MAX_SPILLS      32
+#define DA_STEP         (1u << 20)      /* a dynamic area grows by this much at a time */
+#define DA_RESERVE      (48u << 20)     /* free memory left for everything else */
+
+/* Each is in a dynamic area ("PDFS transfer", while there's the memory),
+   or in a scrap file. A handle is slot + 1. */
+static struct
+{
+  int used;
+  int file;                     /* the scrap file's handle, or 0 */
+  char name[16];                /* its leaf */
+  int da;                       /* the dynamic area's number, or 0 */
+  uint8_t *base;
+  uint32_t cap, max, ext;       /* its size now, its largest, the data's length */
+} spills[MAX_SPILLS];
 static unsigned spill_seq;
 static int spill_dir_ready;
 
@@ -250,8 +268,9 @@ spill_path (char *o, const char *leaf)
   *o = 0;
 }
 
-int
-pd_spill_open (void)
+/* A new empty scrap file for slot i: 0 or -1 */
+static int
+spill_file (int i)
 {
   char path[64];
   if (!spill_dir_ready)
@@ -261,36 +280,120 @@ pd_spill_open (void)
       spill_path (path, 0);
       regs cd = {{ 8, (unsigned) path, 0, 0, 0 }};
       if (swix_regs (OS_File, &cd))
-        return 0;
+        return -1;
       spill_path (path, "*");
       regs w = {{ 27, (unsigned) path, 0, 2 }};
       swix_regs (OS_FSControl, &w);
       spill_dir_ready = 1;
     }
-  for (int i = 0; i < 8; i++)
-    if (!spills[i].handle)
+  char leaf[16] = "S", *q = leaf + 1;
+  unsigned v = ++spill_seq;
+  char t[12];
+  int k = 0;
+  do
+    t[k++] = (char) ('0' + v % 10);
+  while ((v /= 10));
+  while (k)
+    *q++ = t[--k];
+  *q = 0;
+  spill_path (path, leaf);
+  regs c = {{ 11, (unsigned) path, 0xFFD, 0, 0, 0 }};    /* create, empty */
+  if (swix_regs (OS_File, &c))
+    return -1;
+  regs o = {{ 0xCF, (unsigned) path }};                     /* open for update */
+  if (swix_regs (OS_Find, &o) || !o.r[0])
+    return -1;
+  spills[i].file = (int) o.r[0];
+  for (int j = 0; j < 16; j++)
+    spills[i].name[j] = leaf[j];
+  return 0;
+}
+
+static void
+da_free (int i)
+{
+  if (spills[i].da)
+    {
+      regs r = {{ 1, (unsigned) spills[i].da }};
+      swix_regs (OS_DynamicArea, &r);
+    }
+  spills[i].da = 0;
+  spills[i].base = 0;
+  spills[i].cap = 0;
+}
+
+/* Make the dynamic area hold need bytes; else move the data to a scrap
+   file. 0 or -1. */
+static int
+da_need (int i, uint64_t need)
+{
+  if (!spills[i].da)
+    return 0;
+  if (need <= spills[i].cap)
+    return 0;
+  if (need <= spills[i].max)
+    {
+      uint32_t want = (uint32_t) ((need + DA_STEP - 1) & ~(uint64_t) (DA_STEP - 1));
+      if (want > spills[i].max)
+        want = spills[i].max;
+      regs f = {{ 6 }};                           /* the free pool */
+      int room = swix_regs (OS_ReadDynamicArea, &f) || f.r[1] >= want - spills[i].cap + DA_RESERVE;
+      regs g = {{ (unsigned) spills[i].da, want - spills[i].cap }};
+      if (room && !swix_regs (OS_ChangeDynamicArea, &g))
+        {
+          regs q = {{ (unsigned) spills[i].da }};
+          if (!swix_regs (OS_ReadDynamicArea, &q))
+            spills[i].cap = q.r[1];
+          if (spills[i].cap >= need)
+            return 0;
+        }
+    }
+  /* no more memory: a scrap file */
+  if (spill_file (i) < 0)
+    return -1;
+  if (spills[i].ext)
+    {
+      regs w = {{ 1, (unsigned) spills[i].file, (unsigned) spills[i].base, spills[i].ext, 0 }};
+      if (swix_regs (OS_GBPB, &w) || w.r[3])
+        return -1;
+    }
+  da_free (i);
+  return 0;
+}
+
+int
+pd_spill_open (uint64_t hint)
+{
+  for (int i = 0; i < MAX_SPILLS; i++)
+    if (!spills[i].used)
       {
-        char leaf[16] = "S", *q = leaf + 1;
-        unsigned v = ++spill_seq;
-        char t[12];
-        int k = 0;
-        do
-          t[k++] = (char) ('0' + v % 10);
-        while ((v /= 10));
-        while (k)
-          *q++ = t[--k];
-        *q = 0;
-        spill_path (path, leaf);
-        regs c = {{ 11, (unsigned) path, 0xFFD, 0, 0, 0 }};    /* create, empty */
-        if (swix_regs (OS_File, &c))
-          return 0;
-        regs o = {{ 0xCF, (unsigned) path }};                     /* open for update */
-        if (swix_regs (OS_Find, &o) || !o.r[0])
-          return 0;
-        spills[i].handle = (int) o.r[0];
-        for (int j = 0; j < 16; j++)
-          spills[i].name[j] = leaf[j];
-        return spills[i].handle;
+        spills[i].used = 1;
+        spills[i].file = 0;
+        spills[i].da = 0;
+        spills[i].ext = 0;
+        spills[i].cap = 0;
+        /* memory, if there's the room for it all */
+        regs f = {{ 6 }};
+        if (hint && hint < (1u << 30) && !swix_regs (OS_ReadDynamicArea, &f)
+            && f.r[1] >= hint + DA_RESERVE)
+          {
+            uint32_t max = (uint32_t) ((hint + DA_STEP + DA_STEP - 1) & ~(uint64_t) (DA_STEP - 1));
+            regs c = {{ 0, (unsigned) -1, 0, (unsigned) -1, 0x80, max, 0, 0,
+                        (unsigned) "PDFS transfer" }};
+            if (!swix_regs (OS_DynamicArea, &c))
+              {
+                spills[i].da = (int) c.r[1];
+                spills[i].base = (uint8_t *) c.r[3];
+                spills[i].max = max;
+                return i + 1;
+              }
+          }
+        if (spill_file (i) < 0)
+          {
+            spills[i].used = 0;
+            return 0;
+          }
+        return i + 1;
       }
   return 0;
 }
@@ -298,7 +401,17 @@ pd_spill_open (void)
 int
 pd_spill_read (int h, uint64_t off, void *buf, uint32_t len)
 {
-  regs r = {{ 3, (unsigned) h, (unsigned) buf, len, (unsigned) off }};
+  int i = h - 1;
+  if (spills[i].da)
+    {
+      if (off >= spills[i].ext)
+        return 0;
+      if (off + len > spills[i].ext)
+        len = (uint32_t) (spills[i].ext - off);
+      memcpy (buf, spills[i].base + off, len);
+      return (int) len;
+    }
+  regs r = {{ 3, (unsigned) spills[i].file, (unsigned) buf, len, (unsigned) off }};
   if (swix_regs (OS_GBPB, &r))
     return -1;
   return (int) (len - r.r[3]);
@@ -307,31 +420,57 @@ pd_spill_read (int h, uint64_t off, void *buf, uint32_t len)
 int
 pd_spill_write (int h, uint64_t off, const void *buf, uint32_t len)
 {
-  regs r = {{ 1, (unsigned) h, (unsigned) buf, len, (unsigned) off }};
+  int i = h - 1;
+  if (spills[i].da && da_need (i, off + len) < 0)
+    return -1;
+  if (spills[i].da)
+    {
+      if (off > spills[i].ext)
+        memset (spills[i].base + spills[i].ext, 0, (size_t) (off - spills[i].ext));
+      memcpy (spills[i].base + off, buf, len);
+      if (off + len > spills[i].ext)
+        spills[i].ext = (uint32_t) (off + len);
+      return 0;
+    }
+  regs r = {{ 1, (unsigned) spills[i].file, (unsigned) buf, len, (unsigned) off }};
   return swix_regs (OS_GBPB, &r) || r.r[3] ? -1 : 0;
 }
 
 int
 pd_spill_setext (int h, uint64_t ext)
 {
-  regs r = {{ 3, (unsigned) h, (unsigned) ext }};
+  int i = h - 1;
+  if (spills[i].da && da_need (i, ext) < 0)
+    return -1;
+  if (spills[i].da)
+    {
+      if (ext > spills[i].ext)
+        memset (spills[i].base + spills[i].ext, 0, (size_t) (ext - spills[i].ext));
+      spills[i].ext = (uint32_t) ext;
+      return 0;
+    }
+  regs r = {{ 3, (unsigned) spills[i].file, (unsigned) ext }};
   return swix_regs (OS_Args, &r) ? -1 : 0;
 }
 
 void
 pd_spill_close (int h)
 {
-  regs c = {{ 0, (unsigned) h }};
-  swix_regs (OS_Find, &c);
-  for (int i = 0; i < 8; i++)
-    if (spills[i].handle == h)
-      {
-        char path[64];
-        spill_path (path, spills[i].name);
-        regs d = {{ 6, (unsigned) path }};                        /* delete */
-        swix_regs (OS_File, &d);
-        spills[i].handle = 0;
-      }
+  int i = h - 1;
+  if (i < 0 || i >= MAX_SPILLS || !spills[i].used)
+    return;
+  da_free (i);
+  if (spills[i].file)
+    {
+      regs c = {{ 0, (unsigned) spills[i].file }};
+      swix_regs (OS_Find, &c);
+      char path[64];
+      spill_path (path, spills[i].name);
+      regs d = {{ 6, (unsigned) path }};                        /* delete */
+      swix_regs (OS_File, &d);
+    }
+  spills[i].file = 0;
+  spills[i].used = 0;
 }
 
 /* --- TCP transport (testing with sim/mtpsim.py) ----------------------------------------- */

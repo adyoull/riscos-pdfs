@@ -5,7 +5,7 @@ MTP (Media Transfer Protocol). A connected device's storages show up as
 discs, such as `PDFS::Pixel-Internal.$`, and work with the Filer, `*Copy`,
 BASIC's OPENIN/OPENOUT and every program that uses FileSwitch.
 
-Status: **0.07.** USB (the RISC OS 5 USB stack), the icon bar filer and
+Status: **0.08.** USB (the RISC OS 5 USB stack), the icon bar filer and
 filetype extensions are done. It's tested against a simulated device, over
 TCP and through an emulation of USBDriver and DeviceFS; it still has to be
 tried with a real phone (see docs/TESTING-ON-A-PI.md).
@@ -83,7 +83,9 @@ zero-length packet (`--zlp-strict 512`).
 The CLI test covers *Cat/*Ex/*Info, *CDir, *Copy both ways and between
 storages, *Rename, BASIC OPENOUT/OPENUP/append, *Wipe, and free space.
 The desktop test opens Filer windows on the phone, copies a folder to it
-and a photo back with Filer_Action, and saves screenshots.
+and a photo back with Filer_Action, saves 12 MB with one OS_File call, and
+saves screenshots; it measures the longest pause in the desktop during each
+(`PDFS_SIM_RATE=3000` makes the simulated phone take 3 MB/s).
 
 ## Names and types
 
@@ -103,17 +105,32 @@ and a photo back with Filer_Action, and saves screenshots.
 
 Files up to 4 GB (MTP's limit).
 
-- Copied by the Filer (Filer_Action) or *Copy, a file of 4 MB or more is
-  sent to the device as it's written: these create the file with its size
-  and write it in order, so PDFS starts the transfer at the first write and
-  passes each block on. The desktop keeps going between blocks, and no
-  scrap file is needed. While that's going on, other requests that need the
-  device get "The device is busy receiving a file"; directory listings come
-  from what PDFS already knows.
-- Otherwise a file being written is kept in memory up to 4 MB, and beyond
-  that in a scrap file in `<Wimp$ScrapDir>.PDFS`, and sent when it's closed.
-  Scrap files are deleted when the file is closed or its device goes; any
-  left by a crash are deleted the next time one is needed.
+- **In the desktop, big new files are sent in the background.** When the
+  Filer copies a file that fits in its memory, it saves it with one
+  OS_File call, and FileSwitch hands the whole file over inside that one
+  call: if PDFS sent it there, the desktop would stop (the pointer moving,
+  nothing else) until the phone had it all. So, while the PDFS filer task
+  is running, a new file of 1 MB or more is only kept as it's written, and
+  closing it returns at once. The filer task then sends it a piece at a
+  time between other tasks' turns, and the device's icon shows how far it
+  has got (`42%`). Files, and new folders, that come while one is waiting
+  go after it, in order.
+- Meanwhile directory listings come from what PDFS already knows, and the
+  Free window shows the last figures. Anything else that needs the device
+  (reading back a file being sent, deleting, renaming, ejecting) waits for
+  the sending to finish. If a send fails (the phone unplugged, say), the
+  filer reports it and the file isn't left on the phone half-written.
+- At most four big files wait at once (each holds its contents); a fifth
+  waits for the first to go. Quitting the desktop sends what's left first.
+- A file being written is kept in memory up to 4 MB; beyond that in a
+  dynamic area, "PDFS transfer" (Task Manager shows it), while there's the
+  memory (48 MB is always left free), and otherwise in a scrap file in
+  `<Wimp$ScrapDir>.PDFS`. Dynamic areas and scrap files go when the file has
+  been sent or its device goes; scrap files left by a crash are deleted the
+  next time one is needed.
+- Outside the desktop (no filer task), a file of 4 MB or more copied by
+  *Copy is sent to the device as it's written, as 0.05 to 0.07 did, and
+  other files when they're closed.
 
 ## USB notes
 

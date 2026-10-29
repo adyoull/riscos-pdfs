@@ -33,6 +33,8 @@ done
 # them and the simulator fails any container that would
 OLDUSB=${OLDUSB:-0}
 [ $USBEMU = 1 ] && [ $OLDUSB = 1 ] && SIMFLAGS="--zlp-strict 512"
+# PDFS_SIM_RATE=KB/s: a device that takes files in that slowly
+SIMFLAGS="$SIMFLAGS ${PDFS_SIM_RATE:+--rate $PDFS_SIM_RATE}"
 OUT=$ROOT/out/rol
 mkdir -p "$OUT"
 T=$(mktemp -d /tmp/pdfs-rol.XXXXXX)
@@ -92,12 +94,13 @@ if [ $DESKTOP = 0 ]; then
   check 'grep -q "pic/jpg .*&C85 .* 3  bytes" "$OUT/cli.txt"' "*Info: type from the extension"
   check 'cmp -s "$T/w/back" "$T/w/rand,ffd"' "*Copy to the phone and back: same contents"
   check 'grep -q "^length 39" "$OUT/cli.txt"' "OPENOUT, OPENUP and append"
+  check 'grep -q "^grown ok" "$OUT/cli.txt"' "a 12MB file written with no size given (memory, then a scrap file)"
   check '[ -f "$T/phone/sd/OnCard.txt" ]' "*Copy between storages; a Text file gets .txt"
   check '[ ! -e "$T/phone/int/Books" ]' "*Wipe R deletes a tree"
   check 'grep -q "0 errors, 0 recoveries" "$OUT/cli.txt"' "no transport errors"
   check 'cmp -s "$T/w/z500,ffd" "$T/phone/int/Download/z500"' "a 500-byte file (one 512-byte data phase)"
-  check 'cmp -s "$T/w/big6,ffd" "$T/phone/int/Download/big6"' "a 6MB file (through a scrap file)"
-  check '[ -d "$T/w/scrap/PDFS" ] && [ -z "$(ls -A "$T/w/scrap/PDFS")" ]' "the scrap file is deleted"
+  check 'cmp -s "$T/w/big6,ffd" "$T/phone/int/Download/big6"' "a 6MB file (through memory or a scrap file)"
+  check '[ ! -d "$T/w/scrap/PDFS" ] || [ -z "$(ls -A "$T/w/scrap/PDFS")" ]' "no scrap file left (big files are kept in memory when there's room)"
   check 'grep -q "^SimPhone-SD_card has been ejected$" "$OUT/cli.txt"' "*PDFSEject one storage"
   check 'grep -q "eject refused: .*Files on it are open" "$OUT/cli.txt"' "eject refused while a file is open"
   check 'grep -q "^SimPhone has been ejected: it can be unplugged" "$OUT/cli.txt" && grep -q "CloseSession\|op 1003" "$OUT/sim.log"' "*PDFSEject all closes the session"
@@ -122,7 +125,12 @@ else
   check 'cmp -s "$T/w/local,fff" "$T/phone/sd/local.txt"' "a file dropped on the SD card's icon is copied there"
   check 'grep -q "ShowFree ok" "$T/w/results"' "*ShowFree (the icon menu's Free) works"
   check 'grep -q "big file on phone: type 1 length 6291459" "$T/w/results" && cmp -s "$T/w/big6,ffd" "$T/phone/int/Download/big6"' "a 6MB file copied through a scrap file"
-  check 'grep -q "scrap directory type 2, files left: 0" "$T/w/results"' "no scrap files left"
+  check 'grep -q "save12 on phone: type 1 length 12582912" "$T/w/results" && python3 -c "
+import struct,sys
+d=open(sys.argv[1],\"rb\").read()
+sys.exit(not (len(d)==12582912 and all(struct.unpack_from(\"<I\",d,i)[0]==i for i in range(0,len(d)-4,4096))))" "$T/phone/int/Download/save12"' "a 12MB OS_File save"
+  grep -h "OS_File save of 12MB\|while it was sent" "$T/w/results" || true
+  check 'grep -q "scrap directory type [02], files left: 0" "$T/w/results"' "no scrap files left"
   if [ $USBEMU = 1 ]; then
     check 'grep -q "icons after unplug: 0" "$T/w/results"' "unplugging the phone removes its icons"
   fi

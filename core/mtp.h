@@ -83,6 +83,7 @@
 /* Negative results from mtp_transaction: transport errors (transport.h)
    and these. */
 #define MTP_EBUSY    (-12)        /* a streamed transaction is open */
+#define MTP_EAGAIN   (-13)        /* no response yet (mtp_stream_result) */
 #define MTP_EPROTO   (-10)        /* the device sent something malformed */
 #define MTP_ENOMEM   (-11)
 #define MTP_ETOOBIG  (-12)        /* more data than the caller's buffer */
@@ -108,11 +109,15 @@ typedef struct
   mtp_fill_fn fill;             /* data out from a callback (mtp_transaction_fill) */
   /* A data phase being sent a piece at a time (mtp_stream_*) */
   int streaming;
+  int awaiting;                 /* all sent: its response is still to be read */
   uint8_t *sbuf;
   uint32_t slen, stid;
   uint64_t sleft;               /* bytes of the container still to come */
   uint16_t sop;
   void *fill_ctx;
+  /* Called when a transaction is wanted while one is being streamed: may
+     finish the stream (PDFS's background sends) */
+  void (*busy_wait) (void *d);
 } mtp_dev;
 
 /* Data received in a transaction. If buf is set, data goes there (up to cap
@@ -147,10 +152,14 @@ int mtp_transaction_fill (mtp_dev *d, uint16_t op, const uint32_t *params, int n
    written): begin sends the operation and the data container's header
    (total bytes to follow); put sends data as it comes; end reads the
    response, sending zeros first for anything still owed. While one is
-   open, other transactions fail with MTP_EBUSY. */
+   open, other transactions call busy_wait (if set) and fail with
+   MTP_EBUSY if it's still open. */
 int mtp_stream_begin (mtp_dev *d, uint16_t op, const uint32_t *params, int nparams, uint32_t total);
 int mtp_stream_put (mtp_dev *d, const void *data, uint32_t len);
 int mtp_stream_end (mtp_dev *d, uint32_t *rparams);
+/* end in two halves, so the response can be waited for a bit at a time */
+int mtp_stream_close (mtp_dev *d);
+int mtp_stream_result (mtp_dev *d, uint32_t *rparams, int wait_cs);
 
 /* Recover after a failed transfer (called by mtp_transaction itself). */
 int mtp_recover (mtp_dev *d, int level);

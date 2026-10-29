@@ -32,6 +32,8 @@
 #define Wimp_StartTask          0x400DE
 #define Wimp_ReportError        0x400DF
 #define Wimp_PollIdle           0x400E1
+#define Wimp_Poll               0x400C7
+#define Wimp_SetIconState       0x400CD
 #define Wimp_SendMessage        0x400E7
 #define Free_Register           0x444C0
 #define Free_DeRegister         0x444C1
@@ -49,7 +51,8 @@ typedef struct
 {
   int used, handle;
   char disc[40];
-  char text[16];
+  char text[16];                /* shown: the label, or how far a send has got */
+  char label[16];               /* the storage's description */
 } baricon;
 
 static baricon icons[MAX_ICONS];
@@ -117,8 +120,8 @@ add_icon (const char *disc, const char *desc)
     b->disc[i] = disc[i];
   b->disc[i] = 0;
   for (i = 0; desc[i] && i < 12; i++)
-    b->text[i] = desc[i];
-  b->text[i] = 0;
+    b->text[i] = b->label[i] = desc[i];
+  b->text[i] = b->label[i] = 0;
   int w = i * 16 > 68 ? i * 16 : 68;
   unsigned blk[9];
   blk[0] = (unsigned) -5;                       /* left side, by priority */
@@ -210,6 +213,61 @@ open_root (int k)
   report (oscli ("Filer_OpenDir PDFS::", icons[k].disc, ".$"));
 }
 
+/* --- files being sent in the background ------------------------------------------------
+   PDFS returns from closing a big new file at once and sends it from here,
+   a piece at a time on null events, so the desktop keeps going. Meanwhile
+   the device's icon shows how far it has got ("42%"). */
+
+static int sending;
+
+static void
+show_progress (void)
+{
+  for (int k = 0; k < MAX_ICONS; k++)
+    {
+      if (!icons[k].used)
+        continue;
+      char t[16];
+      int p = pdfs_bg_progress (icons[k].disc);
+      if (p < 0)
+        for (int i = 0; i < 16; i++)
+          t[i] = icons[k].label[i];
+      else
+        {
+          int i = 0;
+          if (p >= 10)
+            t[i++] = (char) ('0' + p / 10);
+          t[i++] = (char) ('0' + p % 10);
+          t[i++] = '%';
+          t[i] = 0;
+        }
+      if (str_eq (t, icons[k].text))
+        continue;
+      for (int i = 0; i < 16; i++)
+        icons[k].text[i] = t[i];
+      unsigned blk[4] = { (unsigned) -2, (unsigned) icons[k].handle, 0, 0 };
+      regs r = {{ 0, (unsigned) blk }};
+      swix_regs (Wimp_SetIconState, &r);
+    }
+}
+
+static void
+send_some (void)
+{
+  sending = pdfs_bg_run (10);
+  static unsigned shown;
+  regs t = {{ 0 }};
+  swix_regs (0x42, &t);                             /* OS_ReadMonotonicTime */
+  if (!sending || (int) (t.r[0] - shown) >= 0)
+    {
+      show_progress ();
+      shown = t.r[0] + 25;
+    }
+  const pd_error *e = pdfs_bg_error ();
+  if (e)
+    report ((oserror *) e);
+}
+
 /* --- ejecting -------------------------------------------------------------------------- */
 
 /* Eject one storage, or (all) every storage of its device. Refused while
@@ -224,7 +282,7 @@ eject (int k, int all)
   for (int i = 0; i < 40; i++)
     disc[i] = icons[k].disc[i];
   for (int i = 0; i < 16; i++)
-    label[i] = icons[k].text[i];
+    label[i] = icons[k].label[i];
   if (pdfs_eject_info (disc, all, &left, &model) < 0)
     return;
   char name[48];
@@ -238,7 +296,11 @@ eject (int k, int all)
   for (int j = 0; j < MAX_ICONS; j++)
     if (icons[j].used && (j == k || (gone && pdfs_device_of (icons[j].disc) == dev)))
       oscli ("Filer_CloseDir PDFS::", icons[j].disc, ".$");
+  /* files still being sent go first: that can take a while */
+  regs h = {{ 0 }};
+  swix_regs (0x406C0, &h);                       /* Hourglass_On */
   oserror *e = oscli ("PDFSEject ", disc, all ? " all" : 0);
+  swix_regs (0x406C1, &h);                       /* Hourglass_Off */
   refresh ();
   if (e)
     {
@@ -507,6 +569,8 @@ free_register (int on)
 void
 filer_quit (void)
 {
+  pdfs_bg_finish ();            /* files still to send: now */
+  pdfs_background = 0;
   free_register (0);
   if (filer_task > 0)
     {
@@ -533,6 +597,8 @@ filer_main (void)
       swix_regs (OS_Exit, &x);
     }
   filer_task = (int) r.r[1];
+  pdfs_background = 1;
+  sending = 0;
   free_register (1);
   oscli ("IconSprites Resources:$.Resources.PDFS.Sprites", 0, 0);
   for (int k = 0; k < MAX_ICONS; k++)
@@ -550,8 +616,9 @@ filer_main (void)
           refresh ();
           next = t.r[0] + 100;
         }
+      /* sending: null events as often as they come; else once a second */
       regs p = {{ (1 << 4) | (1 << 5) | (1 << 11) | (1 << 12), (unsigned) block, next }};
-      if (swix_regs (Wimp_PollIdle, &p))
+      if (swix_regs (sending ? Wimp_Poll : Wimp_PollIdle, &p))
         {
           if (++poll_errors > 10)     /* something is badly wrong: stop */
             filer_quit ();
@@ -560,6 +627,9 @@ filer_main (void)
       poll_errors = 0;
       switch ((int) p.r[0])
         {
+        case 0:                                     /* Null_Reason_Code */
+          send_some ();
+          break;
         case 6:                                     /* Mouse_Click */
           if ((int) block[3] == -2)
             {

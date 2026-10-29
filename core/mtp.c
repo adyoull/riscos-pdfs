@@ -24,6 +24,7 @@ mtp_finish (mtp_dev *d)
   pd_free (d->sbuf);
   d->sbuf = 0;
   d->streaming = 0;
+  d->awaiting = 0;
   if (d->tr && d->tr->close)
     d->tr->close (d->tr);
   d->tr = 0;
@@ -397,6 +398,8 @@ int
 mtp_transaction (mtp_dev *d, uint16_t op, const uint32_t *params, int nparams,
                  const void *out, uint32_t outlen, mtp_data *in, uint32_t *rparams)
 {
+  if (d->streaming && d->busy_wait)
+    d->busy_wait (d);
   if (d->streaming)
     return MTP_EBUSY;
   if (d->broken)
@@ -534,6 +537,8 @@ mtp_transaction_fill (mtp_dev *d, uint16_t op, const uint32_t *params, int npara
                       uint32_t outlen, mtp_fill_fn fill, void *ctx, uint32_t *rparams)
 {
   static uint8_t mark[16];      /* "there is data": the callback gives it */
+  if (d->streaming && d->busy_wait)
+    d->busy_wait (d);           /* first: it may use fill itself */
   d->fill = fill;
   d->fill_ctx = ctx;
   int rc = mtp_transaction (d, op, params, nparams, mark + 12, outlen, 0, rparams);
@@ -561,6 +566,7 @@ stream_flush (mtp_dev *d, int last)
 static void
 stream_failed (mtp_dev *d)
 {
+  d->awaiting = 0;
   pd_free (d->sbuf);
   d->sbuf = 0;
   d->streaming = 0;
@@ -571,6 +577,8 @@ stream_failed (mtp_dev *d)
 int
 mtp_stream_begin (mtp_dev *d, uint16_t op, const uint32_t *params, int nparams, uint32_t total)
 {
+  if (d->streaming && d->busy_wait)
+    d->busy_wait (d);
   if (d->streaming)
     return MTP_EBUSY;
   if (d->broken && mtp_recover (d, 1) < 0 && mtp_recover (d, 2) < 0)
@@ -641,11 +649,15 @@ mtp_stream_put (mtp_dev *d, const void *data, uint32_t len)
   return 0;
 }
 
+/* The data phase's end: send what's owed (zeros) and the rest. The response
+   is read by mtp_stream_result; till then other transactions wait. */
 int
-mtp_stream_end (mtp_dev *d, uint32_t *rparams)
+mtp_stream_close (mtp_dev *d)
 {
   if (!d->streaming)
     return PDT_IO;
+  if (d->awaiting)
+    return 0;
   int e = 0;
   while (d->sleft && e >= 0)    /* owed: zeros (the caller deals with the result) */
     {
@@ -657,18 +669,44 @@ mtp_stream_end (mtp_dev *d, uint32_t *rparams)
   e = stream_flush (d, 1);
   pd_free (d->sbuf);
   d->sbuf = 0;
-  d->streaming = 0;
   if (e < 0)
     {
+      d->streaming = 0;
       d->errors++;
       d->broken = 1;
       return e;
     }
-  /* the device may take a while to finish writing a big file */
+  d->awaiting = 1;
+  return 0;
+}
+
+/* Its response: MTP_EAGAIN if it hasn't come within wait_cs (the device may
+   take a while to finish writing a big file); wait_cs = -1: up to a minute. */
+int
+mtp_stream_result (mtp_dev *d, uint32_t *rparams, int wait_cs)
+{
+  if (!d->streaming || !d->awaiting)
+    return PDT_IO;
+  if (wait_cs >= 0 && d->stage_pos >= d->stage_len)
+    {
+      d->stage_pos = d->stage_len = 0;
+      int got = d->tr->read (d->tr, d->stage, d->stage_size, (unsigned) wait_cs);
+      if (got == PDT_TIMEOUT || got == 0)
+        return MTP_EAGAIN;
+      if (got < 0)
+        {
+          d->streaming = d->awaiting = 0;
+          d->errors++;
+          d->broken = 1;
+          return got;
+        }
+      d->stage_len = (uint32_t) got;
+    }
+  d->streaming = d->awaiting = 0;
   unsigned t = d->timeout_cs;
   if (d->timeout_cs < 6000)
     d->timeout_cs = 6000;
-  e = read_response (d, d->sop, d->stid, 0, rparams);
+  int e = read_response (d, d->sop, d->stid, 0, rparams);
   d->timeout_cs = t;
   if (e < 0)
     {
@@ -676,4 +714,13 @@ mtp_stream_end (mtp_dev *d, uint32_t *rparams)
       d->broken = 1;
     }
   return e;
+}
+
+int
+mtp_stream_end (mtp_dev *d, uint32_t *rparams)
+{
+  int e = mtp_stream_close (d);
+  if (e < 0)
+    return e;
+  return mtp_stream_result (d, rparams, -1);
 }

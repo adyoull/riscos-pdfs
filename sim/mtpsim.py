@@ -415,10 +415,12 @@ class Device:
     def recv_exact(self, s, n):
         b = b""
         while len(b) < n:
-            c = s.recv(n - len(b))
+            c = s.recv(min(n - len(b), 65536))
             if not c:
                 raise EOFError
             b += c
+            if self.args.rate:              # a slow device: KB per second
+                time.sleep(len(c) / (self.args.rate * 1024))
         return b
 
     def recv_container(self, s):
@@ -488,6 +490,7 @@ def main():
     ap.add_argument("--no-rename", action="store_true")
     ap.add_argument("--zlp-strict", type=int, default=0, metavar="N")
     ap.add_argument("--delay-ms", type=int, default=0)
+    ap.add_argument("--rate", type=int, default=0, metavar="KB/S", help="receive this fast")
     ap.add_argument("--stall-op", type=lambda x: int(x, 0))
     ap.add_argument("--once", action="store_true")
     ap.add_argument("-v", "--verbose", action="store_true")

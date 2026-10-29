@@ -16,6 +16,7 @@ unsigned pdfs_timeout_cs = 1000;
 #define READAHEAD     65536
 #define MAX_WRITE     0xFFFFFFF0u   /* largest file (MTP sizes are 32 bits) */
 #define SPILL_AT      (4u << 20)    /* bigger files being written go to a scrap file */
+#define STREAM_AT     SPILL_AT      /* files this big or bigger are streamed (no filer task) */
 #define HEADROOM      12            /* bytes before out-data for the container header */
 
 /* --- types -------------------------------------------------------------------- */
@@ -27,6 +28,7 @@ struct node
   struct storage *st;
   uint32_t handle;            /* 0 = storage root, or a file not yet sent to the device */
   uint8_t isdir, listed, gone, pending;
+  uint8_t sending;            /* closed, being sent in the background */
   int refs;                   /* open files using it */
   unsigned listed_at;
   unsigned seen;              /* mark of the last listing that included it */
@@ -73,6 +75,7 @@ struct ofile
   uint8_t *wbuf;              /* whole file for writing (HEADROOM bytes before data) */
   uint32_t wcap;
   int spill;                  /* or, when it's big, a scrap file (pd_spill_open) */
+  int lazy;                   /* created big: no storage yet (it may be streamed) */
   /* Or sent to the device as it's written (a big file created with its
      size, written in order: Filer_Action, *Copy): stream 1 while sending,
      2 once it has gone wrong (out of order); sent = bytes sent so far;
@@ -95,6 +98,7 @@ static void f_free (ofile *f);
 static device devices[MAX_DEVICES];
 static ofile *files;
 static node *pending_create;   /* created by FSEntry_File 7, not yet sent */
+int pdfs_background;            /* the filer task sends big files in the background */
 
 /* --- errors -------------------------------------------------------------------- */
 
@@ -129,6 +133,7 @@ static pd_error err_device;    /* a response code from the device, with its numb
 
 static const char hexd[] = "0123456789ABCDEF";
 static char *cat_num (char *o, uint64_t v);
+static char *cat (char *o, const char *s);
 
 static const pd_error *
 rc_error (int rc)
@@ -950,10 +955,12 @@ apply:
 static const pd_error *
 ensure_listed (node *dir)
 {
+  if (dir->pending)
+    return 0;                   /* a new directory, still to be made on the device */
   if (dir->listed && pd_time_cs () - dir->listed_at < pdfs_dir_ttl_cs)
     return 0;
-  if (dir->st->dev->mtp.streaming)      /* busy receiving a file: what we know */
-    return dir->listed ? 0 : &err_busy;
+  if (dir->st->dev->mtp.streaming && dir->listed)   /* busy receiving a file: what we know */
+    return 0;
   return list_dir (dir);
 }
 
@@ -1059,6 +1066,22 @@ resolve (const char *path, node **found, node **dir, const char **leaf, int *lea
       cur = c;
       p = q + 1;
     }
+}
+
+static void drain (device *dv);
+
+/* resolve, but first wait for the object to finish being sent if it's
+   being sent in the background (it can't be changed meanwhile) */
+static const pd_error *
+resolve_idle (const char *path, node **found, node **dir, const char **leaf, int *leaflen)
+{
+  const pd_error *e = resolve (path, found, dir, leaf, leaflen);
+  if (!e && *found && (*found)->sending)
+    {
+      drain ((*found)->st->dev);
+      e = resolve (path, found, dir, leaf, leaflen);
+    }
+  return e;
 }
 
 /* --- device operations -------------------------------------------------------------- */
@@ -1353,9 +1376,9 @@ grow (ofile *f, uint64_t need)
    scrap file once it passes SPILL_AT ---------------------------------------- */
 
 static const pd_error *
-f_spill (ofile *f)
+f_spill (ofile *f, uint64_t len)
 {
-  int h = pd_spill_open ();
+  int h = pd_spill_open (len);
   if (!h)
     return &err_noscrap;
   if (f->size && pd_spill_write (h, 0, f->wbuf + HEADROOM, (uint32_t) f->size) < 0)
@@ -1375,9 +1398,14 @@ static const pd_error *
 f_setsize (ofile *f, uint64_t len)
 {
   const pd_error *e;
+  if (f->lazy)
+    {
+      f->lazy = 0;              /* it's all zeros: as if empty, then made len long */
+      f->size = 0;
+    }
   if (len > MAX_WRITE)
     return &err_toobig;
-  if (!f->spill && len > SPILL_AT && (e = f_spill (f)))
+  if (!f->spill && len > SPILL_AT && (e = f_spill (f, len)))
     return e;
   if (f->spill)
     {
@@ -1399,6 +1427,8 @@ static const pd_error *
 f_write (ofile *f, uint64_t off, const void *src, uint32_t n)
 {
   const pd_error *e;
+  if (f->lazy && (e = f_setsize (f, f->size)))
+    return e;
   if (off + n > f->size && (e = f_setsize (f, off + n)))
     return e;
   if (f->spill)
@@ -1532,7 +1562,7 @@ fs_open (pd_regs *r)
   const char *leaf;
   int leaflen;
   int reason = (int) r->r[0];
-  const pd_error *e = resolve ((const char *) r->r[1], &n, &dir, &leaf, &leaflen);
+  const pd_error *e = resolve_idle ((const char *) r->r[1], &n, &dir, &leaf, &leaflen);
   if (e)
     return e;
   if (!n && reason != 1)
@@ -1581,7 +1611,14 @@ fs_open (pd_regs *r)
     {
       f->loaded = 1;
       f->dirty = 1;
-      if (f->size && (e = grow (f, f->size)))
+      uint64_t want = f->size;
+      f->size = 0;
+      if (want > STREAM_AT && !pdfs_background)
+        {
+          f->size = want;       /* storage when it's first written, unless streamed */
+          f->lazy = 1;
+        }
+      else if (want && (e = f_setsize (f, want)))
         {
           n->refs--;
           pd_free (f);
@@ -1603,7 +1640,6 @@ fs_open (pd_regs *r)
    File 7), open it, and write it in order. Sending it as it comes, not all
    at the close, keeps the desktop going; and it needs no scrap file. */
 
-#define STREAM_AT   SPILL_AT      /* files this big or bigger are streamed */
 #define TAIL        65536         /* the last bytes written, kept */
 
 static const pd_error *
@@ -1749,6 +1785,401 @@ stream_finish (ofile *f)
   return 0;
 }
 
+/* --- sending big files in the background -----------------------------------------------
+   Filer_Action saves a file that fits in its memory with one OS_File Save,
+   which FileSwitch passes on as one PutBytes and a close inside the one SWI:
+   sending it there would hold up the whole desktop until the device had it
+   all. So when the filer task is running (pdfs_background), a new file of
+   BG_AT bytes or more is kept as it's written (in memory, or a scrap file:
+   pd_spill_*), and closing it returns at once; the filer task sends it a
+   piece at a time (pdfs_bg_run) on null events. Anything else that needs
+   the device meanwhile waits for it (drain, from mtp's busy_wait), except
+   listings, which give what's known. */
+
+#define BG_AT     (1u << 20)
+#define BG_PIECE  65536
+#define BG_QUEUE  4              /* files waiting at most; more: wait for the first */
+
+typedef struct job job;
+struct job
+{
+  job *next;
+  ofile *f;                     /* the closed file: its contents (0: a directory) */
+  node *n;
+  device *dv;
+  int closing;                  /* all sent: waiting for the device's answer */
+  unsigned wait_from;
+  uint32_t sendlen;             /* bytes in the SendObject (the last may go by an edit) */
+  uint64_t sent;
+  int started;
+  uint8_t *buf;
+};
+
+static job *jobs;
+static int in_job;
+static pd_error bg_err;
+static int bg_err_set;
+
+static void
+bg_failed (node *n, const pd_error *e)
+{
+  char *p = bg_err.errmess;
+  p = cat (p, "PDFS couldn't send '");
+  for (int i = 0; n->ro_name && n->ro_name[i] && p < bg_err.errmess + 120; i++)
+    *p++ = n->ro_name[i];
+  p = cat (p, "' to the device: ");
+  for (int i = 0; e->errmess[i] && p < bg_err.errmess + sizeof bg_err.errmess - 1; i++)
+    *p++ = e->errmess[i];
+  *p = 0;
+  bg_err.errnum = e->errnum;
+  bg_err_set = 1;
+  pd_log (bg_err.errmess);
+}
+
+static void
+job_free (job *j)
+{
+  ofile *f = j->f;
+  node *n = j->n;
+  n->sending = 0;
+  if (f)
+    {
+      f_free (f);
+      pd_free (f->rbuf);
+      pd_free (f);
+    }
+  pd_free (j->buf);
+  pd_free (j);
+  n->decl = 0;
+  if (--n->refs == 0 && n->gone)
+    drop_node (n);
+}
+
+/* Send some of a job, till the time 'until' (or all of it, until = 0).
+   Returns 1 when it's finished (sent, or failed and reported). */
+static int
+job_step (job *j, unsigned until)
+{
+  ofile *f = j->f;
+  node *n = j->n;
+  mtp_dev *m = dev_of (n);
+  const pd_error *e = 0;
+  uint32_t rp[5];
+  int rc;
+  if (n->gone || !n->parent)
+    return 1;
+  in_job = 1;
+  if (!f)
+    {
+      if (n->parent->pending)
+        e = &err_notfound;        /* its parent couldn't be made */
+      else
+        e = send_object (n, 0);   /* a directory */
+      in_job = 0;
+      if (e)
+        {
+          bg_failed (n, e);
+          if (n->refs == 1)
+            drop_node (n);
+        }
+      return 1;
+    }
+  if (!j->started)
+    {
+      uint32_t len = (uint32_t) f->size;
+      j->sendlen = len > 1 && mtp_needs_zlp (m, len) && can_edit (m) ? len - 1 : len;
+      j->started = 1;
+      n->mtime = pd_unix_time ();
+      if (n->parent->pending)
+        {
+          e = &err_notfound;      /* its directory couldn't be made */
+          goto done;
+        }
+      if (mtp_needs_zlp (m, j->sendlen) || !(j->buf = pd_alloc (BG_PIECE)))
+        {
+          e = send_object (n, f);         /* the way that needs no streaming */
+          goto done;
+        }
+      if ((e = send_info (n, j->sendlen)))
+        goto failed;
+      rc = mtp_stream_begin (m, OP_SendObject, 0, 0, j->sendlen);
+      if (rc < 0)
+        {
+          e = rc_error (rc);
+          goto failed;
+        }
+    }
+  while (j->sent < j->sendlen)
+    {
+      uint32_t k = j->sendlen - j->sent > BG_PIECE ? BG_PIECE : (uint32_t) (j->sendlen - j->sent);
+      if (f_read (f, j->sent, j->buf, k) < 0)
+        {
+          e = &err_scrapio;
+          goto failed;
+        }
+      if ((rc = mtp_stream_put (m, j->buf, k)) < 0)
+        {
+          e = rc_error (rc);
+          goto failed;
+        }
+      j->sent += k;
+      if (until && (int) (pd_time_cs () - until) >= 0)
+        break;
+    }
+  if (j->sent < j->sendlen)
+    {
+      in_job = 0;
+      return 0;
+    }
+  if (!j->closing)
+    {
+      if ((rc = mtp_stream_close (m)) < 0)
+        {
+          e = rc_error (rc);
+          goto failed;
+        }
+      j->closing = 1;
+      j->wait_from = pd_time_cs ();
+    }
+  /* the device's answer: it may take a while to finish writing the file */
+  rc = mtp_stream_result (m, rp, until ? 0 : -1);
+  if (rc == MTP_EAGAIN)
+    {
+      if (pd_time_cs () - j->wait_from < 6000)
+        {
+          in_job = 0;
+          return 0;
+        }
+      rc = mtp_stream_result (m, rp, -1);
+    }
+  if (rc != RC_OK)
+    {
+      e = rc_error (rc);
+      goto failed;
+    }
+  if (j->sendlen < f->size)
+    {
+      /* the last byte, by an edit (no zero-length packet needed) */
+      uint32_t h = n->handle;
+      rc = mtp_transaction (m, OP_BeginEditObject, &h, 1, 0, 0, 0, 0);
+      if (rc == RC_OK)
+        {
+          rc = send_partial (m, h, j->sendlen, f, j->sendlen, (uint32_t) f->size - j->sendlen);
+          int rc2 = mtp_transaction (m, OP_EndEditObject, &h, 1, 0, 0, 0, 0);
+          if (rc == RC_OK)
+            rc = rc2;
+        }
+      if (rc != RC_OK)
+        {
+          e = rc_error (rc);
+          goto failed;
+        }
+    }
+  n->size = f->size;
+  f->dirty = 0;
+  in_job = 0;
+  return 1;
+
+failed:
+  if (m->streaming)
+    mtp_stream_end (m, rp);       /* the rest as zeros; then it's deleted */
+  if (n->parent && n->parent->pending)
+    e = &err_notfound;            /* its directory couldn't be made */
+  if (n->handle && !m->tr->gone)
+    delete_object (n);
+  n->handle = 0;
+  n->pending = 1;
+done:
+  in_job = 0;
+  if (e)
+    {
+      bg_failed (n, e);
+      if (n->pending && n->refs == 1)
+        drop_node (n);            /* not there: don't show it */
+    }
+  else
+    n->size = f->size;
+  return 1;
+}
+
+/* Finish every job for this device now */
+static void
+drain (device *dv)
+{
+  if (in_job)
+    return;
+  job **pp = &jobs;
+  while (*pp)
+    {
+      job *j = *pp;
+      if (j->dv != dv)
+        {
+          pp = &j->next;
+          continue;
+        }
+      job_step (j, 0);
+      *pp = j->next;
+      job_free (j);
+    }
+}
+
+static void
+busy_wait (void *md)
+{
+  for (int d = 0; d < MAX_DEVICES; d++)
+    if (devices[d].used && &devices[d].mtp == md)
+      drain (&devices[d]);
+}
+
+/* Drop the device's jobs (it has gone) */
+static void
+bg_abort (device *dv)
+{
+  job **pp = &jobs;
+  while (*pp)
+    {
+      job *j = *pp;
+      if (j->dv != dv)
+        {
+          pp = &j->next;
+          continue;
+        }
+      if (j->n->ro_name)
+        bg_failed (j->n, &err_gone);
+      *pp = j->next;
+      job_free (j);
+    }
+}
+
+static int
+bg_busy (device *dv)
+{
+  for (job *k = jobs; k; k = k->next)
+    if (k->dv == dv)
+      return 1;
+  return 0;
+}
+
+static int
+bg_queue (node *n, ofile *f)
+{
+  int queued = 0;
+  for (job *k = jobs; k; k = k->next)
+    queued += k->f != 0;
+  while (f && queued >= BG_QUEUE && jobs)
+    {
+      /* enough waiting (each holds its file in memory): send the first */
+      job *k = jobs;
+      jobs = k->next;
+      job_step (k, 0);
+      queued -= k->f != 0;
+      job_free (k);
+    }
+  job *j = pd_alloc (sizeof *j);
+  if (!j)
+    return 0;
+  j->f = f;
+  j->n = n;
+  j->dv = n->st->dev;
+  n->sending = 1;
+  job **pp = &jobs;
+  while (*pp)
+    pp = &(*pp)->next;
+  *pp = j;
+  return 1;
+}
+
+/* At the close: send the file in the background? (a big one; or any, while
+   others are waiting to go to the same device, to keep them in order).
+   Then the job has f, and the node's reference. */
+static int
+bg_take (ofile *f)
+{
+  node *n = f->n;
+  if (!pdfs_background || !f->writable || !f->dirty || !n->pending || n->isdir || n->gone
+      || f->size > MAX_WRITE || f->stream)
+    return 0;
+  if (f->size < BG_AT && !bg_busy (n->st->dev))
+    return 0;
+  if (!bg_queue (n, f))
+    return 0;
+  n->size = f->size;
+  return 1;
+}
+
+/* A new directory while files are waiting to go: made in its turn */
+static int
+bg_mkdir (node *n)
+{
+  if (!pdfs_background || !bg_busy (n->st->dev) || !bg_queue (n, 0))
+    return 0;
+  n->refs++;
+  return 1;
+}
+
+/* For the filer task: send for up to cs centiseconds. Returns 1 while there
+   are files still to send. */
+int
+pdfs_bg_run (unsigned cs)
+{
+  unsigned until = (pd_time_cs () + cs) | 1;
+  while (jobs)
+    {
+      job *j = jobs;
+      if (!job_step (j, until))
+        return 1;
+      jobs = j->next;
+      job_free (j);
+      if ((int) (pd_time_cs () - until) >= 0)
+        break;
+    }
+  return jobs != 0;
+}
+
+/* Send everything still waiting (the filer task is stopping) */
+void
+pdfs_bg_finish (void)
+{
+  for (int d = 0; d < MAX_DEVICES; d++)
+    if (devices[d].used)
+      drain (&devices[d]);
+}
+
+/* How far the sends to a storage have got (percent), or -1 if there are none */
+int
+pdfs_bg_progress (const char *disc)
+{
+  storage *st = find_disc (disc, (int) strlen (disc));
+  uint64_t total = 0, done = 0;
+  int any = 0;
+  if (!st)
+    return -1;
+  for (job *j = jobs; j; j = j->next)
+    if (j->n->st == st)
+      {
+        any = 1;
+        if (j->f)
+          {
+            total += j->f->size;
+            done += j->sent;
+          }
+      }
+  if (!any)
+    return -1;
+  int pc = total ? (int) (done * 100 / total) : 0;
+  return pc > 99 ? 99 : pc;
+}
+
+/* A background send that failed (once; 0 if none) */
+const pd_error *
+pdfs_bg_error (void)
+{
+  if (!bg_err_set)
+    return 0;
+  bg_err_set = 0;
+  return &bg_err;
+}
+
 static const pd_error *
 fs_getbytes (pd_regs *r)
 {
@@ -1831,7 +2262,7 @@ fs_putbytes (pd_regs *r)
   if (!f)
     return &err_badhandle;
   node *nd = f->n;
-  if (!f->stream && nd->pending && nd->decl >= STREAM_AT && off == 0 && f->size == 0
+  if (!pdfs_background && !f->stream && nd->pending && nd->decl >= STREAM_AT && off == 0 && f->size == 0
       && !dev_of (nd)->streaming && !nd->gone && !mtp_needs_zlp (dev_of (nd), nd->decl))
     {
       if ((e = stream_start (f)))
@@ -1929,11 +2360,16 @@ fs_close (pd_regs *r)
     e = stream_finish (f);      /* first: the device can do nothing else till then */
   if (!e && (load & 0xFFF00000u) == 0xFFF00000u && f->writable && !n->isdir && !n->gone)
     set_type (n, (int) ((load >> 8) & 0xFFF));
-  if (!e && f->dirty && !n->gone)
-    e = commit (f);
   ofile **pp = &files;
   while (*pp != f)
     pp = &(*pp)->next;
+  if (!e && bg_take (f))
+    {
+      *pp = f->next;            /* the job has it now, and the node's ref */
+      return 0;
+    }
+  if (!e && f->dirty && !n->gone)
+    e = commit (f);
   *pp = f->next;
   f_free (f);                   /* and its scrap file */
   pd_free (f->rbuf);
@@ -1972,9 +2408,12 @@ fs_file (pd_regs *r)
   int reason = (int) r->r[0];
   const pd_error *e;
 
-  if (reason != 5)
+  /* reading or writing an object's info (Filer_Action sets a new file's
+     type before opening it) leaves a file just created waiting to be opened */
+  if (reason > 5)
     flush_pending (0);
-  e = resolve ((const char *) r->r[1], &n, &dir, &leaf, &leaflen);
+  /* reading or setting its info needs no waiting for a background send */
+  e = (reason >= 6 ? resolve_idle : resolve) ((const char *) r->r[1], &n, &dir, &leaf, &leaflen);
   if (e)
     {
       if (reason == 5 && (e == &err_notfound || e == &err_notdir))
@@ -2081,6 +2520,12 @@ fs_file (pd_regs *r)
         derive_names (n);
         n->pending = 1;
         n->mtime = pd_unix_time ();
+        if (bg_mkdir (n))
+          {
+            n->listed = 1;      /* new and empty */
+            n->listed_at = pd_time_cs ();
+            return 0;
+          }
         e = send_object (n, 0);
         if (e)
           drop_node (n);
@@ -2163,9 +2608,9 @@ fs_rename (pd_regs *r)
   const char *aleaf, *bleaf;
   int alen, blen;
   const pd_error *e;
-  if ((e = resolve ((const char *) r->r[1], &a, &adir, &aleaf, &alen)))
+  if ((e = resolve_idle ((const char *) r->r[1], &a, &adir, &aleaf, &alen)))
     return e;
-  if ((e = resolve ((const char *) r->r[2], &b, &bdir, &bleaf, &blen)))
+  if ((e = resolve_idle ((const char *) r->r[2], &b, &bdir, &bleaf, &blen)))
     return e;
   r->r[1] = 1;                  /* "bad rename" unless we manage it */
   if (!a || !a->parent || !bdir || a->st != bdir->st)
@@ -2513,6 +2958,7 @@ pdfs_mount (pd_transport *tr)
       return &err_nomem;
     }
   dv->mtp.timeout_cs = pdfs_timeout_cs;
+  dv->mtp.busy_wait = busy_wait;
   int rc = mtp_open (&dv->mtp);
   if (rc < 0)
     {
@@ -2561,6 +3007,7 @@ pdfs_mount (pd_transport *tr)
 static void
 release (device *dv)
 {
+  bg_abort (dv);
   /* Close files on it (FileSwitch's handles go stale: reads will error) */
   ofile **pp = &files;
   while (*pp)
@@ -2607,6 +3054,7 @@ pdfs_dismount (const char *disc)
       if (match)
         {
           flush_pending (0);
+          drain (dv);
           release (dv);
           any = 1;
         }
@@ -2643,7 +3091,10 @@ pdfs_free_space (const char *disc, uint64_t *size, uint64_t *free)
   if (!st)
     return &err_nodisc;
   /* the Free window asks every few seconds: don't ask the device as often */
-  if (!st->info_at || pd_time_cs () - st->info_at > 300)
+  int busy = st->dev->mtp.streaming;
+  for (job *j = jobs; j; j = j->next)
+    busy |= j->dv == st->dev;
+  if (!st->info_at || (!busy && pd_time_cs () - st->info_at > 300))
     {
       const pd_error *e = storage_info (st);
       if (e)
@@ -2714,6 +3165,7 @@ pdfs_eject (const char *disc, int all, int *gone)
     return &err_open;
   storage *st = find_disc (disc, (int) strlen (disc));
   device *dv = st->dev;
+  drain (dv);                   /* files still being sent go first */
   const pd_error *e = flush_pending (0);
   if (e)
     return e;

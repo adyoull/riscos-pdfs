@@ -9,7 +9,7 @@
 #include <stdint.h>
 #include "transport.h"
 
-#define PDFS_VERSION "0.07"
+#define PDFS_VERSION "0.08"
 
 /* Filing system number: provisional until allocated by RISC OS Open. */
 #define PDFS_FSNUM 0xFA
@@ -41,6 +41,12 @@ void pdfs_describe (void (*line) (const char *s));
 /* Called now and then (from a callback or ticker on RISC OS): poll events. */
 void pdfs_tick (void);
 void pdfs_finish (void);
+/* Big new files sent in the background, by the filer task (fs.c) */
+extern int pdfs_background;                /* set while the filer task runs */
+int pdfs_bg_run (unsigned cs);             /* send for cs centiseconds; 1: more to do */
+void pdfs_bg_finish (void);                /* send the rest now */
+int pdfs_bg_progress (const char *disc);   /* percent, or -1: nothing being sent */
+const pd_error *pdfs_bg_error (void);      /* a send that failed, once */
 
 /* Settings */
 extern unsigned pdfs_dir_ttl_cs;          /* how long a directory listing stays fresh */

@@ -313,6 +313,69 @@ def big():
             shutil.rmtree(scrap, ignore_errors=True)
 
 
+def background():
+    print("== big new files sent in the background (the filer task running)")
+    for flags in ([], ["--no-partial64", "--no-edit"], ["--zlp-strict", "512"]):
+        s = Sim(*flags)
+        scrap = tempfile.mkdtemp(prefix="pdfs-scrap-")
+        env = {"PDFS_SPILL_DIR": scrap, "PDFS_BG": "1"}
+        if "--zlp-strict" in flags:
+            env["PDFS_NO_ZLP"] = "512"
+        try:
+            # one OS_File Save's worth (open, one write, close): the close
+            # returns before anything is sent; then it goes a bit at a time
+            for size in (3 * 1048576 + 5, 512 * 12000 - 12, 9 * 1048576 + 1):
+                data = random.randbytes(size)
+                src = tmpfile(data)
+                name = "bg%d" % size
+                r = s.run(["save", src, D + ".Download." + name + "/bin", "FFD"],
+                          ["bgprogress", "SimPhone-Internal"],
+                          ["bgstep"], ["bgdone"], ["bgprogress", "SimPhone-Internal"], env=env)
+                p = local(s, "Download", name + ".bin")
+                ok(r.returncode == 0 and "bg: 0%\n" in r.stdout and "bg: -1%" in r.stdout
+                   and open(p, "rb").read() == data,
+                   "a %d-byte file sent in the background %s" % (size, flags))
+                os.unlink(src)
+            # sent while other things are asked for: a listing gives what's
+            # known; reading it back waits for it to finish
+            data = random.randbytes(6 * 1048576 + 3)
+            src, back = tmpfile(data), tmpfile(b"")
+            r = s.run(["facopy", src, D + ".Download.fa", "C85"], ["bgstep"],
+                      ["ls", D + ".Download"], ["get", D + ".Download.fa", back], env=env)
+            ok(r.returncode == 0 and open(back, "rb").read() == data
+               and open(local(s, "Download", "fa.jpg"), "rb").read() == data,
+               "read back while being sent: waits for it %s" % flags)
+            # another file on the device while one is being sent
+            r = s.run(["save", src, D + ".Download.one", "FFD"], ["bgstep"],
+                      ["mkdir", D + ".Download.newdir"], ["save", src, D + ".Download.newdir.two", "FFD"],
+                      ["rm", D + ".Download.one"], env=env)
+            ok(r.returncode == 0 and not os.path.exists(local(s, "Download", "one"))
+               and open(local(s, "Download", "newdir", "two"), "rb").read() == data,
+               "other operations while sending %s" % flags)
+            # folders made, and small files saved, while a big one is waiting:
+            # they go in their turn, in order
+            small = tmpfile(b"small file")
+            r = s.run(["save", src, D + ".Download.b1", "FFD"], ["mkdir", D + ".Download.nd"],
+                      ["mkdir", D + ".Download.nd.sub"], ["save", small, D + ".Download.nd.sub.s", "FFD"],
+                      ["ls", D + ".Download.nd"], ["bgprogress", "SimPhone-Internal"], ["bgdone"],
+                      ["ls", D + ".Download.nd.sub"], env=env)
+            ok(r.returncode == 0 and "bg: 0%" in r.stdout
+               and open(local(s, "Download", "b1"), "rb").read() == data
+               and open(local(s, "Download", "nd", "sub", "s"), "rb").read() == b"small file",
+               "folders and small files queued behind a big one %s" % flags)
+            os.unlink(small)
+            # many queued at once
+            r = s.run(*[["save", src, D + ".Download.q%d" % k, "FFD"] for k in range(6)], env=env)
+            ok(r.returncode == 0 and all(open(local(s, "Download", "q%d" % k), "rb").read() == data
+                                         for k in range(6)), "six files queued %s" % flags)
+            os.unlink(src)
+            os.unlink(back)
+            ok(os.listdir(scrap) == [], "scrap files deleted %s" % flags)
+        finally:
+            s.stop()
+            shutil.rmtree(scrap, ignore_errors=True)
+
+
 def main():
     random.seed(1)
     if not os.path.exists(HOST):
@@ -325,6 +388,7 @@ def main():
     recovery()
     zlp()
     big()
+    background()
     print("%d passed, %d failed" % (passed, failed))
     sys.exit(1 if failed else 0)
 

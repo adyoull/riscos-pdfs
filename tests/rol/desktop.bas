@@ -87,6 +87,22 @@ REPEAT
 UNTIL c%<0 OR (f% AND 1)
 SYS "XOS_File",17,"<Wimp$ScrapDir>.PDFS" TO t%
 PROClog("scrap directory type "+STR$t%+", files left: "+STR$n%)
+REM one OS_File Save of 12MB, as Filer_Action does for a file that fits its
+REM memory: the save returns at once, and the desktop keeps going while it's sent
+DIM big% 12*1048576
+FOR i%=0 TO 12*1048576-4 STEP 4096:big%!i%=i%:NEXT
+SYS "OS_ReadMonotonicTime" TO t0%
+SYS "XOS_File",10,"PDFS::SimPhone-Internal.$.Download.save12",&FFD,,big%,big%+12*1048576 TO e%;f%
+SYS "OS_ReadMonotonicTime" TO t1%
+IF f% AND 1 THEN PROClog("save12: "+FNstr(e%+4))
+PROClog("OS_File save of 12MB took "+STR$(t1%-t0%)+"cs")
+maxgap%=0
+PROCwait(150)
+OSCLI "TBShot"
+PROCwait(500)
+PROClog("longest pause in the desktop while it was sent: "+STR$maxgap%+"cs")
+SYS "XOS_File",17,"PDFS::SimPhone-Internal.$.Download.save12" TO t%,,,,len%
+PROClog("save12 on phone: type "+STR$t%+" length "+STR$len%)
 REM the icon menu's Free entry
 SYS "XOS_CLI","ShowFree -fs PDFS SimPhone-Internal" TO e%;f%
 IF f% AND 1 THEN PROClog("ShowFree: "+FNstr(e%+4)) ELSE PROClog("ShowFree ok")
