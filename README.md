@@ -12,6 +12,12 @@ too, over TCP and through an emulation of USBDriver and DeviceFS. Reports
 from other devices (tablets, cameras, media players) and machines are
 welcome: see docs/TESTING-ON-A-PI.md.
 
+> **Use at your own risk.** PDFS is a beta. It's provided as it is, without
+> warranty of any kind, and without liability for any loss or damage,
+> including lost data, as the Apache License 2.0 says (sections 7 and 8).
+> Only use it with devices whose data you have backed up, and keep copies
+> of anything you copy to or from a device until you've checked it.
+
 Licence: Apache 2.0 (see LICENSE). What it was written from (specifications,
 RISC OS documentation and sources read): docs/REFERENCES.md.
 

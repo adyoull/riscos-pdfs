@@ -4,6 +4,8 @@
 
 The first public release: a beta. It works with an Android phone on a
 Raspberry Pi running RISC OS 5; other devices and machines still need trying.
+Use it at your own risk, with devices whose data you have backed up: it
+comes without warranty or liability (see the README and LICENSE).
 
 - MTP devices (phones, tablets, media players, cameras) on USB appear as
   discs, `PDFS::<Model>-<Storage>.$`, with a drive icon on the icon bar for
