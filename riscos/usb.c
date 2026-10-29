@@ -1,46 +1,33 @@
 /* usb.c: PDFS's USB transport, through the RISC OS 5 USB stack (USBDriver)
-   and DeviceFS, as RISC OS Open documents it: USBDriver's Doc/USB (the USB
-   API, version 0.95) and h/USBDevFS, checked against its c/usbmodule.
+   and DeviceFS.
 
-   Finding devices: Service_USB 1 (Service_USB_Connected) gives a list of
-   USBServiceAnswer blocks, each a link word and a USBServiceCall: length,
-   offset to the descriptors, DeviceFS name ("USB5"), bus, address, speed,
-   then the device descriptor and the configuration's descriptors. The
-   caller frees each block (OS_Module 7). An MTP interface is class 6 (still
-   image), subclass 1, protocol 1 with a bulk IN, a bulk OUT and an
-   interrupt IN endpoint. Others (vendor-specific ones on older Androids)
-   can be named with *PDFSMount USB<n>.
+   Finding devices: Service_USB 1 lists the connected devices, each record
+   holding its device and configuration descriptors. An MTP interface is
+   class 6 (still image), subclass 1, protocol 1 with a bulk IN, a bulk OUT
+   and an interrupt IN endpoint. Others (vendor-specific ones on older
+   Androids) can be named with *PDFSMount USB<n>.
 
-   Talking to one: each endpoint is a DeviceFS stream, opened with special
-   fields separated by semicolons:
+   Talking to one: each endpoint is a DeviceFS stream,
      devices#interface<i>;alternate<a>;endpoint<e>;bulk;nopad;size<n>:USB<n>
-   (nopad: received data isn't padded to the length asked for).
-   - Input: DeviceFS_CallDevice reason 3 (WakeUpRX), R2 = USBDriver's stream
-     handle (Return Handles 2, &80000007, R5), R3 = the length wanted: that
-     starts a bulk IN transfer into the stream's buffer, which is read only
-     as far as it has data (Check Buffer Space, &80000002), so nothing
-     blocks inside DeviceFS. (USBDriver returns R3 = the buffer's size and
-     R4 = its free space: c/usbmodule get_buffer_space.)
-   - Output: USBDriver sends what's in the stream's buffer as one transfer
-     when woken (reason 2, WakeUpTX; c/usbmodule start_write). So each piece
-     is written into an empty buffer, a whole number of packets except a
-     container's last; Transfer Info (&80000006) says when it's done.
-   - Zero-length packets: MTP needs one after a container that's a whole
-     number of packets. The stream's 'short' flag (USBDriver 0.49+, Get/Set
-     Options &80000008, bit 1; USBD_FORCE_SHORT_XFER) sends one after such a
-     transfer: it's set for a container's last piece only. With an older
-     USBDriver the transport says no_zlp and the MTP layer avoids those
-     transfers instead (core/mtp.h).
-   - Interrupt IN (events): USBDriver keeps reading it by itself.
-   - Unplugging: DeviceFS issues Service_DeviceDead with the device's name.
+   (fields separated by semicolons). Input: DeviceFS_CallDevice WakeUpRX asks
+   USBDriver for a bulk IN transfer; the data lands in the stream's buffer
+   and is read only as far as it's there (BufferSpace), so nothing blocks
+   inside DeviceFS. Output: written as far as the buffer has room, then
+   WakeUpTX; done when the buffer is empty and the transfer has finished.
 
-   Not used: USB control requests (&80000000). USBDriver does them
-   synchronously (c/usbmodule: usbd_do_request; Doc/USB: R6 options other
-   than 0 aren't available on RISC OS 5). The MTP class requests (Cancel,
-   Get Device Status) are only for recovery, which here drains and reopens
-   the pipes instead; *PDFSUSB control on allows Cancel for testing.
+   Not used: USB control requests. USBDriver 1.31 does them synchronously
+   and they have frozen machines (see RISC OS Technologies' Bluetooth
+   findings). The MTP class requests (Cancel, Get Device Status) are only
+   for recovery, which here drains and reopens the pipes instead; *PDFSUSB
+   control on turns them on for testing.
 
-   Copyright 2026 Andrew Youll. Licensed under the Apache License, Version 2.0. */
+   The DeviceFS stream can't end a transfer that's a whole number of packets
+   with a zero-length packet, so the transport says no_zlp and the MTP layer
+   avoids such transfers (core/mtp.h).
+
+   Copyright 2026 Andrew Youll. Licensed under the Apache License, Version 2.0.
+   Interface details learnt from RISC OS Technologies' Bluetooth-RISCOS32
+   (BSD-2-Clause) port/c/native_usb and docs/USB-TRANSPORT.md. */
 #include "cmodule.h"
 #include "../core/pdfs.h"
 #include "../core/plat.h"
@@ -62,9 +49,6 @@ oserror *usbemu_swix (unsigned swi, regs *r);
 #define DFS_CLEAR_STALL         0x80000005u
 #define DFS_TRANSFER_INFO       0x80000006u
 #define DFS_GET_HANDLES2        0x80000007u
-#define DFS_GETSET_OPTIONS      0x80000008u
-#define OPT_SHORT               2u          /* Get/Set Options: the 'short' flag */
-#define USBDriver_Version       0x54A45
 #define DEVCALL_WAKEUP_TX       2u
 #define DEVCALL_WAKEUP_RX       3u
 
@@ -73,11 +57,6 @@ oserror *usbemu_swix (unsigned swi, regs *r);
 #define MAX_OPEN                4
 
 int usb_control_requests;       /* *PDFSUSB control on */
-/* Off by default: the ways of writing proven on a Pi (0.03). *PDFSUSB short
-   on: zero-length packets with the 'short' flag; *PDFSUSB pipeline on: add
-   to the buffer while a transfer is going */
-int usb_use_short;
-int usb_pipeline;
 volatile int usb_attached;      /* Service_USB Attach seen: the filer mounts */
 
 typedef struct usbt
@@ -87,7 +66,6 @@ typedef struct usbt
   int h_in, h_out, h_int;       /* FileSwitch handles of the streams */
   unsigned s_in, s_out;         /* USBDriver's stream handles (GetHandles2 R5) */
   unsigned devhandle;           /* DeviceFS device handle (R6), for DeviceDead */
-  int short_on;                 /* the output stream's 'short' flag as last set */
   char name[48];
 } usbt;
 
@@ -308,7 +286,6 @@ open_streams (usbt *u)
       close_streams (u);
       return -1;
     }
-  u->short_on = 0;              /* new streams: 'short' off */
   return 0;
 }
 
@@ -346,98 +323,37 @@ out_idle (usbt *u, unsigned timeout_cs)
     }
 }
 
-/* Set or clear the output stream's 'short' flag (Get/Set Options: R3 = EOR
-   mask, R4 = AND mask). Only while no transfer is active: callers wait. */
-static int
-set_short (usbt *u, int on)
-{
-  if (u->short_on == on)
-    return 0;
-  regs r = {{ DFS_GETSET_OPTIONS, (unsigned) u->c.dev, u->s_out,
-              on ? OPT_SHORT : 0, ~OPT_SHORT }};
-  if (swix_regs (DeviceFS_CallDevice, &r))
-    return -1;
-  u->short_on = on;
-  return 0;
-}
-
-/* Send (part of) a container. USBDriver starts a transfer with whatever
-   is in the stream's buffer, and when it ends starts another with what has
-   arrived meanwhile (c/usbmodule write_cb). A transfer that isn't a whole
-   number of packets ends with a short packet, which ends the container for
-   the device: so everything goes in whole packets but a container's last
-   piece. The 'short' flag can be changed only while no transfer is active:
-   that's the only time this waits for the buffer to empty, and at the end
-   of a container. */
+/* Send one container. USBDriver sends what's in the stream's buffer as a
+   transfer, and a transfer that isn't a whole number of packets ends with
+   a short packet, which the device takes as the end of the container. So
+   the container goes in pieces that are whole numbers of packets (the last
+   excepted), each into an empty buffer. */
 static int
 usb_write (pd_transport *t, const void *buf, uint32_t len, unsigned timeout_cs)
 {
   usbt *u = (usbt *) t;
   const uint8_t *p = buf;
   unsigned used, free, mps = t->max_packet;
-  unsigned start = now_cs ();
   int e;
-  if (!usb_pipeline)
-    {
-      /* each piece into an empty buffer (as 0.03 did) */
-      while (len)
-        {
-          if ((e = out_idle (u, timeout_cs)))
-            return e;
-          if (t->gone || buffer_space (u, u->h_out, &used, &free))
-            return t->gone = 1, PDT_GONE;
-          unsigned n = len <= free ? len : free & ~(mps - 1);
-          if (!n)
-            return PDT_IO;
-          if (!t->no_zlp && set_short (u, n == len && !t->more))
-            return PDT_IO;
-          int k = gbpb (u->h_out, (void *) p, n, 1);
-          if (k != (int) n)
-            return PDT_IO;
-          p += n;
-          len -= n;
-          wake (u, DEVCALL_WAKEUP_TX, u->s_out, 0);
-        }
-      return out_idle (u, timeout_cs);
-    }
   while (len)
     {
-      int last = !t->more;          /* this call ends the container */
-      if (!t->no_zlp && u->short_on != last && len <= BULK_BUFFER)
-        {
-          /* the container's last piece: 'short' on (after a whole number
-             of packets a zero-length packet follows); else off */
-          if ((e = out_idle (u, timeout_cs)) || set_short (u, last))
-            return e ? e : PDT_IO;
-        }
-      if (t->gone || buffer_space (u, u->h_out, &used, &free))
+      if ((e = out_idle (u, timeout_cs)))
+        return e;
+      if (buffer_space (u, u->h_out, &used, &free))
         return t->gone = 1, PDT_GONE;
-      unsigned n = len <= free ? len : free & ~(mps - 1);
-      if (n < len && !t->no_zlp && u->short_on)
-        n = 0;                      /* not the last piece: wait to clear 'short' */
+      unsigned n = len;
+      if (n > free)
+        n = free & ~(mps - 1);  /* not the end: whole packets */
       if (!n)
-        {
-          if (!t->no_zlp && u->short_on && len > free)
-            {
-              if ((e = out_idle (u, timeout_cs)) || set_short (u, 0))
-                return e ? e : PDT_IO;
-            }
-          else
-            wake (u, DEVCALL_WAKEUP_TX, u->s_out, 0);
-          if (now_cs () - start > timeout_cs)
-            return PDT_TIMEOUT;
-          continue;
-        }
+        return PDT_IO;
       int k = gbpb (u->h_out, (void *) p, n, 1);
       if (k != (int) n)
         return PDT_IO;
       p += n;
       len -= n;
       wake (u, DEVCALL_WAKEUP_TX, u->s_out, 0);
-      start = now_cs ();
     }
-  /* the end of a container: wait till it has gone */
-  return t->more ? 0 : out_idle (u, timeout_cs);
+  return out_idle (u, timeout_cs);
 }
 
 static int
@@ -537,7 +453,6 @@ usb_reset (pd_transport *t, uint32_t tid, int level)
   u->h_out = open_stream (&u->c, u->c.ep_out, "bulk", BULK_BUFFER, 1);
   if (!u->h_out || handles (u, u->h_out, &u->s_out))
     return t->gone = 1, PDT_GONE;
-  u->short_on = 0;
   drain (u, 30);
   return 0;
 }
@@ -597,11 +512,7 @@ usb_mount (const usb_iface *c)
   u->t.reset = usb_reset;
   u->t.close = usb_close;
   u->t.max_packet = c->mps_out ? c->mps_out : 512;
-  /* zero-length packets need the 'short' flag: USBDriver 0.49 and later */
-  regs v = {{ 0 }};
-  u->short_on = -1;
-  u->t.no_zlp = !usb_use_short || swix_regs (USBDriver_Version, &v) || v.r[0] < 49
-                || set_short (u, 0);
+  u->t.no_zlp = 1;
   char *o = put_str (u->name, "USB ");
   put_str (o, c->dev);
   u->t.name = u->name;

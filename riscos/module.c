@@ -349,7 +349,7 @@ ERROR_BLOCK (err_connect, 0x1FAE0, "Can't connect to the simulated device");
 ERROR_BLOCK (err_syntax, 0x1FAE1, "Give an address as a.b.c.d:port");
 ERROR_BLOCK (err_nomem, 0x1FAB8, "Not enough memory");
 ERROR_BLOCK (err_desktop, 0x1FAE3, "Use *Desktop to start the PDFS filer");
-ERROR_BLOCK (err_usb_syntax, 0x1FAE8, "Syntax: *PDFSUSB [control|short|pipeline on|off]");
+ERROR_BLOCK (err_usb_syntax, 0x1FAE8, "Syntax: *PDFSUSB [control on|off]");
 ERROR_BLOCK (err_ext_syntax, 0x1FAE2, "Syntax: *PDFSExtensions [show|hide]");
 
 static int
@@ -509,6 +509,8 @@ static int word_is (const char *tail, const char *w);
 static int
 word_is_prefix (const char *tail, const char *w)
 {
+  while (*tail == ' ')
+    tail++;
   for (; *w; w++, tail++)
     if ((*tail | 0x20) != *w)
       return 0;
@@ -849,30 +851,22 @@ mod_command (int index, const char *tail, int argc)
           }
         return e;
       }
-    case 7:                         /* *PDFSUSB [control|short|pipeline on|off] */
-      if (argc >= 2)
+    case 7:                         /* *PDFSUSB [control on|off] */
+      if (argc >= 2 && word_is_prefix (tail, "control"))
         {
           const char *q = tail;
           while (*q == ' ')
             q++;
-          int *opt = word_is_prefix (q, "control") ? &usb_control_requests
-                     : word_is_prefix (q, "short") ? &usb_use_short
-                     : word_is_prefix (q, "pipeline") ? &usb_pipeline : 0;
           while (*q > ' ')
             q++;
-          if (!opt || !(word_is (q, "on") || word_is (q, "off")))
+          if (!(word_is (q, "on") || word_is (q, "off")))
             return ERR (err_usb_syntax);
-          *opt = word_is (q, "on");
+          usb_control_requests = word_is (q, "on");
           return 0;
         }
+      if (argc)
+        return ERR (err_usb_syntax);
       list_usb ();
-      write0 ("Zero-length packets: ");
-      write0 (usb_use_short ? "the 'short' flag (when the USBDriver has it)" : "avoided (as 0.03)");
-      write0 (". Writes: ");
-      write0 (usb_pipeline ? "pipelined" : "into an empty buffer (as 0.03)");
-      write0 (". Control requests: ");
-      write0 (usb_control_requests ? "on" : "off");
-      newline ();
       return 0;
     case 2:                         /* *PDFSDismount */
       {

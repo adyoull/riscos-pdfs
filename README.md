@@ -5,7 +5,7 @@ MTP (Media Transfer Protocol). A connected device's storages show up as
 discs, such as `PDFS::Pixel-Internal.$`, and work with the Filer, `*Copy`,
 BASIC's OPENIN/OPENOUT and every program that uses FileSwitch.
 
-Status: **0.06.** USB (the RISC OS 5 USB stack), the icon bar filer and
+Status: **0.07.** USB (the RISC OS 5 USB stack), the icon bar filer and
 filetype extensions are done. It's tested against a simulated device, over
 TCP and through an emulation of USBDriver and DeviceFS; it still has to be
 tried with a real phone (see docs/TESTING-ON-A-PI.md).
@@ -58,7 +58,7 @@ Outside the desktop:
 | `*PDFSMount USB<n> [<interface>]` | mount that USB device (for ones that don't say they're MTP) |
 | `*PDFSMount <a.b.c.d>:<port>` | connect to the simulator (testing) |
 | `*PDFSDevices` | mounted devices and storages, with free space |
-| `*PDFSUSB [control\|short\|pipeline on\|off]` | connected USB devices' interfaces, which are MTP, and how PDFS uses USB (switches for testing) |
+| `*PDFSUSB [control on\|off]` | connected USB devices' interfaces, and which are MTP |
 | `*PDFSEject <disc> [all]` | eject a storage, or (all) the whole device, safely |
 | `*PDFSDismount [<disc>]` | disconnect at once |
 | `*PDFSExtensions [show\|hide]` | how names with a type extension are shown |
@@ -117,31 +117,24 @@ Files up to 4 GB (MTP's limit).
 
 ## USB notes
 
-Written to RISC OS Open's USB API: USBDriver's `Doc/USB` (0.95) and
-`h/USBDevFS`, checked against its `c/usbmodule` (from ROOL's source archive,
-src-iyo-dev.5.31).
+The USB transport (riscos/usb.c) is the one from 0.03, which works on a
+Raspberry Pi with an Android phone. Its use of DeviceFS follows RISC OS
+Technologies' Bluetooth-RISCOS32 (BSD-2-Clause) findings:
 
-- Devices come from Service_USB 1 (USBServiceAnswer/USBServiceCall blocks).
-  Endpoints are DeviceFS streams with special fields
-  `interface;alternate;endpoint;bulk;nopad;size`.
-- Reads: WakeUpRX with the length wanted, then only what Check Buffer Space
-  says is there, so nothing blocks inside DeviceFS. (USBDriver returns R3 =
-  the buffer's size, R4 = free, as `get_buffer_space` does.)
-- Writes: USBDriver sends what's in the buffer as one transfer, so each piece
-  goes into an empty buffer, in whole packets but for a container's last.
-- MTP needs a zero-length packet after a container that's a whole number of
-  packets. By default PDFS avoids such containers (as 0.03 did, which works
-  on a Pi): datasets get a padding byte and such a file goes as all but its
-  last byte followed by an edit that adds it. `*PDFSUSB short on` uses the
-  stream's `short` flag instead (USBDriver 0.49+, Get/Set Options, set for a
-  container's last piece only). Both are written to ROOL's documentation,
-  but only the default has been tried on real hardware.
-- Writes go into an empty buffer, one piece at a time (as 0.03).
-  `*PDFSUSB pipeline on` adds to the buffer while a transfer is going
-  (USBDriver's write_cb starts the next transfer itself): faster, untried on
-  real hardware.
-- Control requests aren't used: USBDriver does them synchronously.
+- Devices come from Service_USB 1; endpoints are DeviceFS streams
+  `devices#interface;alternate;endpoint;bulk;nopad;size`.
+- Reads: WakeUpRX, then only what BufferSpace says is there, so nothing
+  blocks inside DeviceFS.
+- Writes: each piece into an empty buffer, then WakeUpTX; done when the
+  buffer is empty and the transfer has finished.
+- No zero-length packets: datasets get a padding byte, and a file whose
+  data would be a whole number of packets goes as all but its last byte
+  followed by an edit that adds it.
+- Control requests aren't used (some USB drivers do them synchronously);
   `*PDFSUSB control on` allows MTP's Cancel request for testing.
+
+(0.04-0.06 tried USBDriver's 'short' flag and pipelined writes, written to
+ROOL's documentation; on the Pi they didn't work, so they were taken out.)
 
 ## Not done yet
 

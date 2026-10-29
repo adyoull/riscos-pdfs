@@ -26,7 +26,6 @@ for a in "$@"; do
                MOD=$ROOT/out/PDFS-usbemu,ffa
                [ -f "$MOD" ] || { echo "make out/PDFS-usbemu,ffa first" >&2; exit 1; } ;;
     --old-usbdriver) OLDUSB=1 ;;
-    --usb-new) USBNEW=1 ;;    # *PDFSUSB short on, pipeline on
   esac
 done
 # USB through the emulator: zero-length packets are real (the 'short'
@@ -72,7 +71,6 @@ if [ $USBEMU = 1 ]; then
   # in the desktop the filer mounts it by itself
   sed -i 's/^PDFSMount 127.0.0.1:7015$/PDFSUSB\nPDFSMount/' "$T/w/t,feb"
   [ $OLDUSB = 1 ] && sed -i '1i Set PDFSEmu$OldDriver 1' "$T/w/t,feb"
-  [ "${USBNEW:-0}" = 1 ] && sed -i 's/^PDFSUSB$/PDFSUSB short on\nPDFSUSB pipeline on\nPDFSUSB/' "$T/w/t,feb"
   sed -i '1i Set PDFSEmu$MissingZLP 0' "$T/w/t,feb"
   echo "Show PDFSEmu\$MissingZLP" >> "$T/w/t,feb"
   python3 - "$T/w/desk,ffb" <<'PY'
