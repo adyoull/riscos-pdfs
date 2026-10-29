@@ -19,7 +19,7 @@ typedef struct
   uint8_t mtp;                  /* usable and class 6/1/1 (still image, PTP/MTP) */
 } usb_iface;
 
-extern int usb_control_requests;
+extern int usb_control_requests, usb_use_short, usb_pipeline;
 extern volatile int usb_attached;
 
 /* Connected devices' interfaces: MTP ones, or all of them. */

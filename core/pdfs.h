@@ -9,7 +9,7 @@
 #include <stdint.h>
 #include "transport.h"
 
-#define PDFS_VERSION "0.05"
+#define PDFS_VERSION "0.06"
 
 /* Filing system number: provisional until allocated by RISC OS Open. */
 #define PDFS_FSNUM 0xFA

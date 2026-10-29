@@ -27,7 +27,7 @@ module_start:
 	.word	flags - module_start
 
 title:	.asciz	"PDFS"
-help:	.asciz	"PDFS\t\t0.05 (29 Oct 2026)"
+help:	.asciz	"PDFS\t\t0.06 (29 Oct 2026)"
 	.align	2
 flags:	.word	1				@ 32-bit compatible
 
@@ -221,8 +221,8 @@ commands:
 
 help_eject:	.asciz	"*PDFSEject makes a storage safe to remove: it writes what's waiting and stops using it. With all, every storage of that device is ejected and its session is closed, so the device can be unplugged. Refused while files on it are open."
 syn_eject:	.asciz	"Syntax: *PDFSEject <disc> [all]"
-help_usb:	.asciz	"*PDFSUSB lists the connected USB devices' interfaces that have bulk endpoints, and which are MTP. *PDFSUSB control on|off lets PDFS use USB class requests (Cancel) when it recovers from errors: off by default, as some USB drivers do them synchronously."
-syn_usb:	.asciz	"Syntax: *PDFSUSB [control on|off]"
+help_usb:	.asciz	"*PDFSUSB lists the connected USB devices' interfaces that have bulk endpoints, and which are MTP, and how PDFS uses USB. For testing: control on lets PDFS use USB class requests (Cancel) when it recovers from errors; short on sends zero-length packets with USBDriver's short flag (from the next mount); pipeline on adds to USBDriver's buffer while a transfer is going. All off by default."
+syn_usb:	.asciz	"Syntax: *PDFSUSB [control|short|pipeline on|off]"
 help_desk:	.asciz	"*Desktop_PDFSFiler starts PDFS's icon bar filer. The desktop starts it; after loading PDFS in the desktop, use *WimpTask Desktop_PDFSFiler."
 syn_desk:	.asciz	"Syntax: *Desktop_PDFSFiler"
 help_ext:	.asciz	"*PDFSExtensions sets how names with a filetype extension are shown: hide (the default) shows Letter.txt as Letter, a Text file; show shows it as Letter/txt. Files saved from RISC OS always get the extension for their type, or ,xxx if it has none."

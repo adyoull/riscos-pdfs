@@ -73,6 +73,11 @@ oserror *usbemu_swix (unsigned swi, regs *r);
 #define MAX_OPEN                4
 
 int usb_control_requests;       /* *PDFSUSB control on */
+/* Off by default: the ways of writing proven on a Pi (0.03). *PDFSUSB short
+   on: zero-length packets with the 'short' flag; *PDFSUSB pipeline on: add
+   to the buffer while a transfer is going */
+int usb_use_short;
+int usb_pipeline;
 volatile int usb_attached;      /* Service_USB Attach seen: the filer mounts */
 
 typedef struct usbt
@@ -372,6 +377,29 @@ usb_write (pd_transport *t, const void *buf, uint32_t len, unsigned timeout_cs)
   unsigned used, free, mps = t->max_packet;
   unsigned start = now_cs ();
   int e;
+  if (!usb_pipeline)
+    {
+      /* each piece into an empty buffer (as 0.03 did) */
+      while (len)
+        {
+          if ((e = out_idle (u, timeout_cs)))
+            return e;
+          if (t->gone || buffer_space (u, u->h_out, &used, &free))
+            return t->gone = 1, PDT_GONE;
+          unsigned n = len <= free ? len : free & ~(mps - 1);
+          if (!n)
+            return PDT_IO;
+          if (!t->no_zlp && set_short (u, n == len && !t->more))
+            return PDT_IO;
+          int k = gbpb (u->h_out, (void *) p, n, 1);
+          if (k != (int) n)
+            return PDT_IO;
+          p += n;
+          len -= n;
+          wake (u, DEVCALL_WAKEUP_TX, u->s_out, 0);
+        }
+      return out_idle (u, timeout_cs);
+    }
   while (len)
     {
       int last = !t->more;          /* this call ends the container */
@@ -572,7 +600,8 @@ usb_mount (const usb_iface *c)
   /* zero-length packets need the 'short' flag: USBDriver 0.49 and later */
   regs v = {{ 0 }};
   u->short_on = -1;
-  u->t.no_zlp = swix_regs (USBDriver_Version, &v) || v.r[0] < 49 || set_short (u, 0);
+  u->t.no_zlp = !usb_use_short || swix_regs (USBDriver_Version, &v) || v.r[0] < 49
+                || set_short (u, 0);
   char *o = put_str (u->name, "USB ");
   put_str (o, c->dev);
   u->t.name = u->name;
