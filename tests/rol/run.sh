@@ -59,7 +59,7 @@ if [ $DESKTOP = 0 ]; then
   check 'grep -q "pic/jpg .*&C85 .* 3  bytes" "$OUT/cli.txt"' "*Info: type from the extension"
   check 'cmp -s "$T/w/back" "$T/w/rand,ffd"' "*Copy to the phone and back: same contents"
   check 'grep -q "^length 39" "$OUT/cli.txt"' "OPENOUT, OPENUP and append"
-  check '[ -f "$T/phone/sd/OnCard" ]' "*Copy between storages"
+  check '[ -f "$T/phone/sd/OnCard.txt" ]' "*Copy between storages; a Text file gets .txt"
   check '[ ! -e "$T/phone/int/Books" ]' "*Wipe R deletes a tree"
   check 'grep -q "0 errors, 0 recoveries" "$OUT/cli.txt"' "no transport errors"
 else

@@ -6,7 +6,7 @@ different device behaviours and check the results in the simulator's folders.
 
 Copyright 2026 Andrew Youll. Licensed under the Apache License, Version 2.0.
 """
-import os, random, shutil, signal, subprocess, sys, tempfile, time
+import os, random, re, shutil, signal, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -121,7 +121,8 @@ def suite(flags):
 
         # listing, types, info
         r = s.run(["ls", D + ".Download"])
-        ok("over/txt" in r.stdout and "FFF" in r.stdout, "ls shows translated name + type")
+        ok(re.search(r"F over +\d+  FFF", r.stdout) and "over/txt" not in r.stdout,
+           "ls shows the name without its known extension, and the type")
         r = s.run(["info", D + ".Download.over/txt"])
         ok("type 1" in r.stdout and "length %d" % (len(long) + len(tail)) in r.stdout, "info")
         r = s.run(["info", D + ".Download.nothing"])
@@ -136,11 +137,16 @@ def suite(flags):
         ok("not empty" in r.stdout, "deleting a non-empty directory is refused")
 
         # rename in place, then move to another directory, then delete
-        r = s.run(["mv", D + ".Books.SF.Astounding/epub", D + ".Books.SF.Astounding_1950/epub"])
-        ok(r.returncode == 0 and os.path.isfile(local(s, "Books", "SF", "Astounding_1950.epub")),
-           "rename")
-        r = s.run(["mv", D + ".Books.SF.Astounding_1950/epub", D + ".Download.A/epub"])
-        ok(r.returncode == 0 and os.path.isfile(local(s, "Download", "A.epub")), "move")
+        if "--no-rename" in flags:
+            r = s.run(["mv", D + ".Books.SF.Astounding/epub", D + ".Books.SF.X/epub"], expect=1)
+            ok("bad rename" in r.stdout, "no renaming: bad rename (FileSwitch copies instead)")
+            shutil.move(local(s, "Books", "SF", "Astounding.epub"), local(s, "Download", "A.epub"))
+        else:
+            r = s.run(["mv", D + ".Books.SF.Astounding/epub", D + ".Books.SF.Astounding_1950/epub"])
+            ok(r.returncode == 0 and os.path.isfile(local(s, "Books", "SF", "Astounding_1950.epub")),
+               "rename")
+            r = s.run(["mv", D + ".Books.SF.Astounding_1950/epub", D + ".Download.A/epub"])
+            ok(r.returncode == 0 and os.path.isfile(local(s, "Download", "A.epub")), "move")
         r = s.run(["rm", D + ".Download.A/epub"], ["rm", D + ".Books.SF"], ["rm", D + ".Books"])
         ok(r.returncode == 0 and not os.path.exists(local(s, "Books"))
            and not os.path.exists(local(s, "Download", "A.epub")), "delete file and directories")
@@ -149,7 +155,7 @@ def suite(flags):
         os.makedirs(local(s, "Astounding SF"))
         open(local(s, "Astounding SF", "Café #1.txt"), "w").write("é")
         r = s.run(["ls", D + ".Astounding\xa0SF"])
-        ok(r.returncode == 0 and "Caf\xe9\xa0_1/txt" in r.stdout,
+        ok(r.returncode == 0 and "Caf\xe9\xa0_1 " in r.stdout,
            "names with spaces, accents and # are listed")
         src4 = tmpfile(b"new")
         r = s.run(["save", src4, D + ".Astounding\xa0SF.R\xe9sum\xe9/txt", "FFF"])
@@ -159,7 +165,39 @@ def suite(flags):
         # changes made on the device appear (directory cache expires)
         open(local(s, "Download", "added-on-phone.txt"), "w").write("hi")
         r = s.run(["ls", D + ".Download"], ["sleep", "5.2"], ["ls", D + ".Download"])
-        ok(r.stdout.count("added-on-phone/txt") >= 1, "a file added on the device appears")
+        ok(r.stdout.count("added-on-phone ") >= 1, "a file added on the device appears")
+
+        # filetypes as extensions on the device
+        rename_ok = "--no-rename" not in flags
+        r = s.run(["save", src4, D + ".Letter", "FFF"], ["save", src4, D + ".Prog", "FFB"],
+                  ["save", src4, D + ".Photo/jpg", "C85"], ["save", src4, D + ".Plain", "FFD"])
+        ok(r.returncode == 0 and os.path.isfile(local(s, "Letter.txt")), "Text saved as Letter.txt")
+        ok(os.path.isfile(local(s, "Prog,ffb")), "a type with no extension saved as ,xxx")
+        ok(os.path.isfile(local(s, "Photo.jpg")) and os.path.isfile(local(s, "Plain")),
+           "names that already have the extension, and Data, are kept")
+        r = s.run(["ls", D], ["info", D + ".Prog"], ["info", D + ".Letter/txt"], ["info", D + ".Photo/jpg"])
+        ok(re.search(r"F Letter +\d+  FFF", r.stdout) and re.search(r"F Prog +\d+  FFB", r.stdout)
+           and re.search(r"F Photo +\d+  C85", r.stdout), "listed without suffixes, with their types")
+        ok(r.stdout.count("type 1 load FFFFFB") == 1 and r.stdout.count("type 1 load FFFFFF") == 1
+           and r.stdout.count("type 1 load FFFC85") == 1, "found by either name")
+        r = s.run(["mv", D + ".Letter", D + ".Memo"], expect=0 if rename_ok else 1)
+        ok(os.path.isfile(local(s, "Memo.txt")) == rename_ok, "a rename keeps the extension")
+        r = s.run(["settype", D + ".Prog", "FFF"], ["ls", D])
+        if rename_ok:
+            ok(os.path.isfile(local(s, "Prog.txt")) and re.search(r"F Prog +\d+  FFF", r.stdout),
+               "setting the type changes the extension")
+        else:
+            ok(re.search(r"F Prog +\d+  FFF", r.stdout), "setting the type without renaming: remembered")
+        os.makedirs(local(s, "Clash"))
+        for n in ("a.txt", "a.jpg", "b.txt", "b", "c.txt"):
+            open(local(s, "Clash", n), "w").write(n)
+        os.makedirs(local(s, "com.example.app"))
+        r = s.run(["ls", D + ".Clash"], ["ls", D])
+        ok(all(x in r.stdout for x in ("a/txt ", "a/jpg ", "b/txt ", "F b ", "F c "))
+           and "com/example/app" in r.stdout, "names that would clash keep their extensions")
+        r = s.run(["ls", D], env={"PDFS_SHOW_EXT": "1"})
+        ok("Photo/jpg" in r.stdout and ("Prog/txt" in r.stdout if rename_ok else "Prog,ffb" in r.stdout),
+           "*PDFSExtensions show lists whole names")
 
         # the second storage
         r = s.run(["save", src4, "SimPhone-SD_card.$.onsd/txt", "FFF"])
@@ -178,7 +216,7 @@ def recovery():
         r = s.run(["ls", D + ".Download"], ["ls", D + ".Download"],
                   env={"PDFS_TIMEOUT_CS": "150"}, expect=None)
         ok("stopped responding" in r.stdout, "a stall is reported as an error")
-        ok("a/txt" in r.stdout, "after recovery the next listing works")
+        ok("F a " in r.stdout, "after recovery the next listing works")
         r = s.run(["discs"])
         ok(r.returncode == 0, "device still usable")
     finally:
@@ -193,6 +231,7 @@ def main():
     suite(["--no-proplist"])
     suite(["--no-partial64", "--no-edit"])
     suite(["--no-proplist", "--no-partial64", "--no-edit", "--delay-ms", "2"])
+    suite(["--no-rename"])
     recovery()
     print("%d passed, %d failed" % (passed, failed))
     sys.exit(1 if failed else 0)

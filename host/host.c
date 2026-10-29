@@ -382,6 +382,13 @@ do_save (const char *local, const char *path, int type, int how)
   if (how == 2)
     start = (uint32_t) o.r[3];
   write_stream (o.r[1], (uint32_t) o.r[2], data, len, start);
+  if (how != 0)
+    {
+      /* as FileSwitch does: keep the type the file has (Args 9), new date */
+      pd_regs le = { { 9, o.r[1] } };
+      if (!check (call (PD_ARGS, &le), "readloadexec"))
+        load = (uint32_t) le.r[2];
+    }
   pd_regs c = { { 0, o.r[1], load, 0 } };
   check (call (PD_CLOSE, &c), "close");
   free (data);
@@ -441,6 +448,13 @@ run (int argc, char **argv)
         }
       return 0;
     }
+  if (!strcmp (cmd, "settype") && argc > 2)
+    {
+      char p[1024];
+      fspath (p, argv[1]);
+      pd_regs r = { { 2, (pd_reg) p, 0xFFF00000u | (pd_reg) strtol (argv[2], 0, 16) << 8 } };
+      return check (call (PD_FILE, &r), "settype");
+    }
   if (!strcmp (cmd, "free") && argc > 1)
     {
       char p[1024];
@@ -491,6 +505,8 @@ main (int argc, char **argv)
     }
   if (getenv ("PDFS_TIMEOUT_CS"))
     pdfs_timeout_cs = (unsigned) atoi (getenv ("PDFS_TIMEOUT_CS"));
+  if (getenv ("PDFS_SHOW_EXT"))
+    pdfs_set_hide_ext (0);
   if (getenv ("PDFS_TRACE"))
     pdfs_trace = 1;
   pd_transport *t = tcp_open (argv[1]);

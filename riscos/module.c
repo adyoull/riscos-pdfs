@@ -183,6 +183,22 @@ pd_ext_to_filetype (const char *ext)
 int
 pd_filetype_to_ext (int type, char *buf)
 {
+  if (mimemap_translate)
+    {
+      char ext[64];
+      regs r = {{ 0, (unsigned) type, 3, (unsigned) ext }};
+      ext[0] = 0;
+      if (!swix_regs (mimemap_translate, &r) && ext[0] > ' ')
+        {
+          int i = 0;
+          for (; i < 15 && ext[i] > ' '; i++)
+            buf[i] = ext[i];
+          buf[i] = 0;
+          /* MimeMap gives a type for this extension back? Then use it */
+          if (pd_ext_to_filetype (buf) == type)
+            return 1;
+        }
+    }
   for (int i = 0; fallback[i].ext[0]; i++)
     if (fallback[i].type == type)
       {
@@ -206,6 +222,7 @@ typedef struct
 ERROR_BLOCK (err_connect, 0x1FAC0, "Can't connect to the simulated device");
 ERROR_BLOCK (err_syntax, 0x1FAC1, "Give an address as a.b.c.d:port");
 ERROR_BLOCK (err_nomem, 0x1FAB8, "Not enough memory");
+ERROR_BLOCK (err_ext_syntax, 0x1FAC2, "Syntax: *PDFSExtensions [show|hide]");
 
 static int
 tcp_connect (tcp *c)
@@ -457,6 +474,20 @@ mod_command (int index, const char *tail, int argc)
       }
     case 3:                         /* *PDFSDevices */
       pdfs_describe (line);
+      return 0;
+    case 5:                         /* *PDFSExtensions */
+      if (argc && word_is (tail, "show"))
+        pdfs_set_hide_ext (0);
+      else if (argc && word_is (tail, "hide"))
+        pdfs_set_hide_ext (1);
+      else if (argc)
+        return ERR (err_ext_syntax);
+      else
+        {
+          write0 (pdfs_hide_ext ? "Known extensions are hidden (Letter.txt is shown as Letter)"
+                                : "Names are shown whole (Letter.txt is shown as Letter/txt)");
+          newline ();
+        }
       return 0;
     case 4:                         /* *PDFSLog */
       if (argc && word_is (tail, "on"))

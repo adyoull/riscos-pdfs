@@ -13,6 +13,7 @@ Options for testing PDFS's behaviour:
     --no-proplist     don't support GetObjectPropList (forces the fallback)
     --no-partial64    don't support Android's GetPartialObject64
     --no-edit         don't support Android's edit operations
+    --no-rename       don't support SetObjectPropValue (renaming)
     --delay-ms N      sleep N ms before each response (a slow device)
     --stall-op CODE   never answer the first command with this code
                       (tests time-outs and recovery)
@@ -98,6 +99,8 @@ class Device:
             self.ops.discard(OP["GetObjectPropList"])
         if args.no_partial64:
             self.ops.discard(OP["GetPartialObject64"])
+        if args.no_rename:
+            self.ops.discard(OP["SetObjectPropValue"])
         if args.no_edit:
             for k in ("SendPartialObject", "TruncateObject", "BeginEditObject", "EndEditObject"):
                 self.ops.discard(OP[k])
@@ -471,6 +474,7 @@ def main():
     ap.add_argument("--no-proplist", action="store_true")
     ap.add_argument("--no-partial64", action="store_true")
     ap.add_argument("--no-edit", action="store_true")
+    ap.add_argument("--no-rename", action="store_true")
     ap.add_argument("--delay-ms", type=int, default=0)
     ap.add_argument("--stall-op", type=lambda x: int(x, 0))
     ap.add_argument("--once", action="store_true")

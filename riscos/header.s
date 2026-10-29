@@ -126,8 +126,17 @@ commands:
 	.word	syn_log - module_start
 	.word	help_log - module_start
 
+	.asciz	"PDFSExtensions"
+	.align	2
+	.word	cm_command_5 - module_start
+	.word	0x00010000			@ 0 to 1 parameters
+	.word	syn_ext - module_start
+	.word	help_ext - module_start
+
 	.word	0
 
+help_ext:	.asciz	"*PDFSExtensions sets how names with a filetype extension are shown: hide (the default) shows Letter.txt as Letter, a Text file; show shows it as Letter/txt. Files saved from RISC OS always get the extension for their type, or ,xxx if it has none."
+syn_ext:	.asciz	"Syntax: *PDFSExtensions [show|hide]"
 help_pdfs:	.asciz	"*PDFS selects the Portable Device Filing System as the current filing system."
 syn_pdfs:	.asciz	"Syntax: *PDFS"
 help_mount:	.asciz	"*PDFSMount connects to a simulated portable device over TCP (for testing)."
@@ -147,3 +156,4 @@ syn_log:	.asciz	"Syntax: *PDFSLog [on|off|trace]"
 	CM_COMMAND 2
 	CM_COMMAND 3
 	CM_COMMAND 4
+	CM_COMMAND 5

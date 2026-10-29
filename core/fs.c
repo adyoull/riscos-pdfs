@@ -7,6 +7,7 @@
 #include "plat.h"
 
 unsigned pdfs_dir_ttl_cs = 500;
+int pdfs_hide_ext = 1;
 unsigned pdfs_timeout_cs = 1000;
 
 #define MAX_DEVICES   4
@@ -31,8 +32,11 @@ struct node
   uint64_t size;
   uint32_t mtime;             /* unix seconds */
   int filetype;               /* -1: from the name */
+  int name_type;              /* type the name's suffix gives, or -1 */
   char *mtp_name;             /* UTF-8 */
-  char *ro_name;              /* the machine's alphabet, RISC OS form */
+  char *ro_name;              /* the machine's alphabet, RISC OS form, as shown */
+  char *ro_full;              /* the whole name in RISC OS form (with the suffix) */
+  char sfx[18];               /* type suffix of mtp_name (".txt", ",ffb") or "" */
 };
 
 typedef struct storage
@@ -329,17 +333,7 @@ node_filetype (node *n)
 {
   if (n->filetype >= 0)
     return n->filetype;
-  const char *dot = 0;
-  for (const char *p = n->mtp_name; *p; p++)
-    if (*p == '.')
-      dot = p;
-  if (dot && dot != n->mtp_name && dot[1] && strlen (dot + 1) <= 8)
-    {
-      int t = pd_ext_to_filetype (dot + 1);
-      if (t >= 0)
-        return t;
-    }
-  return 0xFFD;
+  return n->name_type >= 0 ? n->name_type : 0xFFD;
 }
 
 static void
@@ -366,6 +360,7 @@ free_tree (node *n)
           free_tree (c);
           pd_free (c->mtp_name);
           pd_free (c->ro_name);
+          pd_free (c->ro_full);
           if (pending_create == c)
             pending_create = 0;
           pd_free (c);
@@ -406,7 +401,130 @@ drop_node (node *n)
     pending_create = 0;
   pd_free (n->mtp_name);
   pd_free (n->ro_name);
+  pd_free (n->ro_full);
   pd_free (n);
+}
+
+/* --- names and filetypes ------------------------------------------------------------
+   A file's type is kept in its name on the device, as other systems expect:
+   a known extension ("Letter.txt": MimeMap), or RISC OS's ",xxx" for types
+   with none ("Prog,ffb"). RISC OS sees the name without that suffix
+   ("Letter", Text), unless two names in a directory would then be the same
+   or *PDFSExtensions show is set; the name with the suffix ("Letter/txt")
+   finds the file too. */
+
+static int
+hexval (int c)
+{
+  c = lc (c);
+  return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
+}
+
+/* The type suffix of a device name: sets sfx (the suffix with its '.' or ',')
+   and returns the type, or -1 with sfx "" if there is none. */
+static int
+name_suffix (const char *name, char *sfx)
+{
+  int n = (int) strlen (name);
+  sfx[0] = 0;
+  if (n > 4 && name[n - 4] == ',')
+    {
+      int a = hexval (name[n - 3]), b = hexval (name[n - 2]), c = hexval (name[n - 1]);
+      if (a >= 0 && b >= 0 && c >= 0)
+        {
+          str_copy (sfx, name + n - 4, 5);
+          return a << 8 | b << 4 | c;
+        }
+    }
+  int dot = -1;
+  for (int i = 0; i < n; i++)
+    if (name[i] == '.')
+      dot = i;
+  if (dot > 0 && n - dot - 1 >= 1 && n - dot - 1 <= 8)
+    {
+      int t = pd_ext_to_filetype (name + dot + 1);
+      if (t >= 0)
+        {
+          str_copy (sfx, name + dot, 10);
+          return t;
+        }
+    }
+  return -1;
+}
+
+/* Work out ro_name, ro_full, sfx and name_type from mtp_name. */
+static int
+derive_names (node *n)
+{
+  char *full = to_riscos_name (n->mtp_name), *shown;
+  if (!full)
+    return -1;
+  n->name_type = n->isdir ? -1 : name_suffix (n->mtp_name, n->sfx);
+  if (n->isdir)
+    n->sfx[0] = 0;
+  if (pdfs_hide_ext && n->sfx[0])
+    shown = str_dup (full, (int) (strlen (full) - strlen (n->sfx)));
+  else
+    shown = str_dup (full, -1);
+  if (!shown)
+    {
+      pd_free (full);
+      return -1;
+    }
+  pd_free (n->ro_name);
+  pd_free (n->ro_full);
+  n->ro_name = shown;
+  n->ro_full = full;
+  return 0;
+}
+
+/* Two files whose names are the same without their suffixes ("a.txt" and
+   "a.jpg"), or one that matches another name ("a.txt" and "a"): show those
+   with their suffixes. */
+static void
+fix_clashes (node *dir)
+{
+  if (!pdfs_hide_ext)
+    return;
+  int count = 0;
+  for (node *c = dir->child; c; c = c->next)
+    count++;
+  if (count < 2)
+    return;
+  unsigned size = 1;
+  while (size < (unsigned) count * 2)
+    size <<= 1;
+  node **tab = pd_alloc (size * sizeof *tab);
+  if (!tab)
+    return;
+  for (node *c = dir->child; c; c = c->next)
+    {
+      unsigned h = 5381;
+      for (const char *p = c->ro_name; *p; p++)
+        h = h * 33 + (unsigned) lc (*p);
+      for (h &= size - 1; tab[h]; h = (h + 1) & (size - 1))
+        {
+          node *d = tab[h];
+          if (name_eq (d->ro_name, c->ro_name, (int) strlen (c->ro_name)))
+            {
+              node *show[2] = { c, d };
+              for (int i = 0; i < 2; i++)
+                if (show[i]->sfx[0] && strlen (show[i]->ro_name) != strlen (show[i]->ro_full))
+                  {
+                    char *f = str_dup (show[i]->ro_full, -1);
+                    if (f)
+                      {
+                        pd_free (show[i]->ro_name);
+                        show[i]->ro_name = f;
+                      }
+                  }
+              break;
+            }
+        }
+      if (!tab[h])
+        tab[h] = c;
+    }
+  pd_free (tab);
 }
 
 static node *
@@ -415,16 +533,16 @@ new_node (node *parent, const char *mtp_name)
   node *n = pd_alloc (sizeof *n);
   if (!n)
     return 0;
+  n->filetype = -1;
   n->mtp_name = str_dup (mtp_name, -1);
-  n->ro_name = to_riscos_name (mtp_name);
-  if (!n->mtp_name || !n->ro_name)
+  if (!n->mtp_name || derive_names (n))
     {
       pd_free (n->mtp_name);
       pd_free (n->ro_name);
+      pd_free (n->ro_full);
       pd_free (n);
       return 0;
     }
-  n->filetype = -1;
   n->st = parent->st;
   n->parent = parent;
   n->next = parent->child;
@@ -435,18 +553,95 @@ new_node (node *parent, const char *mtp_name)
 static int
 set_name (node *n, const char *mtp_name)
 {
-  char *a = str_dup (mtp_name, -1), *b = to_riscos_name (mtp_name);
-  if (!a || !b)
+  char *a = str_dup (mtp_name, -1);
+  if (!a)
+    return -1;
+  char *old = n->mtp_name;
+  n->mtp_name = a;
+  if (derive_names (n))
     {
+      n->mtp_name = old;
       pd_free (a);
-      pd_free (b);
       return -1;
     }
-  pd_free (n->mtp_name);
-  pd_free (n->ro_name);
-  n->mtp_name = a;
-  n->ro_name = b;
+  pd_free (old);
+  if (n->parent)
+    fix_clashes (n->parent);
   return 0;
+}
+
+/* The device name for a new file or a renamed one: the RISC OS leaf, plus
+   the suffix for its type unless the leaf already gives that type.
+   keep_sfx: the suffix a renamed file had, to keep if the type is the same. */
+static char *
+add_type_suffix (char *dn, int isdir, int type, const char *keep_sfx)
+{
+  if (!dn || isdir || type < 0)
+    return dn;
+  char sfx[18], add[18];
+  int own = name_suffix (dn, sfx);
+  if (own == type || (type == 0xFFD && own < 0))
+    return dn;
+  add[0] = 0;
+  if (keep_sfx && keep_sfx[0])
+    {
+      /* keep ".jpeg" rather than switch to ".jpg" when the type is the same */
+      char t[20], x[18];
+      t[0] = 'x';
+      str_copy (t + 1, keep_sfx, sizeof t - 1);
+      if (name_suffix (t, x) == type)
+        str_copy (add, keep_sfx, sizeof add);
+    }
+  if (!add[0] && type != 0xFFD)
+    {
+      char ext[16];
+      if (pd_filetype_to_ext (type, ext) && strlen (ext) <= 8)
+        {
+          add[0] = '.';
+          str_copy (add + 1, ext, sizeof add - 1);
+        }
+      else
+        {
+          add[0] = ',';
+          add[1] = "0123456789abcdef"[(type >> 8) & 15];
+          add[2] = "0123456789abcdef"[(type >> 4) & 15];
+          add[3] = "0123456789abcdef"[type & 15];
+          add[4] = 0;
+        }
+    }
+  if (!add[0])
+    return dn;
+  int a = (int) strlen (dn), b = (int) strlen (add);
+  char *o = pd_alloc ((size_t) (a + b + 1));
+  if (o)
+    {
+      memcpy (o, dn, (size_t) a);
+      memcpy (o + a, add, (size_t) b + 1);
+    }
+  pd_free (dn);
+  return o;
+}
+
+static void
+rederive (node *dir)
+{
+  for (node *c = dir->child; c; c = c->next)
+    {
+      derive_names (c);
+      if (c->child)
+        rederive (c);
+    }
+  fix_clashes (dir);
+}
+
+void
+pdfs_set_hide_ext (int on)
+{
+  pdfs_hide_ext = on != 0;
+  for (int d = 0; d < MAX_DEVICES; d++)
+    if (devices[d].used)
+      for (int s = 0; s < devices[d].nst; s++)
+        rederive (&devices[d].st[s].root);
 }
 
 /* --- listing directories ------------------------------------------------------------- */
@@ -475,9 +670,13 @@ apply_entry (node *dir, entry *e, uint32_t mark)
         return;
       n->handle = e->handle;
     }
-  else if (!name_eq (n->mtp_name, e->name, (int) strlen (e->name)) || strlen (n->mtp_name) != strlen (e->name))
+  else if (!exact_eq (n->mtp_name, e->name, (int) strlen (e->name)))
     set_name (n, e->name);
-  n->isdir = e->format == FMT_Association;
+  if (n->isdir != (e->format == FMT_Association))
+    {
+      n->isdir = e->format == FMT_Association;
+      derive_names (n);
+    }
   n->size = e->size;
   n->mtime = e->mtime;
   n->seen = mark;
@@ -694,6 +893,11 @@ apply:
     for (int i = 0; i < ne; i++)
       apply_entry (dir, &es[i], mark);
     pd_free (es);
+    /* names shown with their suffixes because of a clash: check again */
+    for (node *c = dir->child; c; c = c->next)
+      if (c->sfx[0] && strlen (c->ro_name) == strlen (c->ro_full))
+        derive_names (c);
+    fix_clashes (dir);
     /* Children not seen have gone (except files we're still creating) */
     node *c = dir->child;
     while (c)
@@ -801,6 +1005,10 @@ resolve (const char *path, node **found, node **dir, const char **leaf, int *lea
       for (c = cur->child; c; c = c->next)
         if (name_eq (c->ro_name, p, len))
           break;
+      if (!c)                 /* "Letter/txt" for "Letter" */
+        for (c = cur->child; c; c = c->next)
+          if (c->sfx[0] && name_eq (c->ro_full, p, len))
+            break;
       if (!*q)
         {
           *found = c;
@@ -835,6 +1043,24 @@ send_object (node *n, uint8_t *data, uint32_t len)
   node *dir = n->parent;
   if (!dir)
     return &err_notfound;
+  if (!n->isdir)
+    {
+      /* a new file: its name gets the suffix for its type ("Letter.txt") */
+      char *dn = add_type_suffix (str_dup (n->mtp_name, -1), 0, node_filetype (n), 0);
+      if (!dn)
+        return &err_nomem;
+      if (!exact_eq (n->mtp_name, dn, (int) strlen (dn)))
+        {
+          int t = node_filetype (n);
+          if (set_name (n, dn))
+            {
+              pd_free (dn);
+              return &err_nomem;
+            }
+          n->filetype = t == n->name_type ? -1 : t;
+        }
+      pd_free (dn);
+    }
   memset (p, 0, 52);
   put32 (p, n->st->id);
   put16 (p + 4, n->isdir ? FMT_Association : FMT_Undefined);
@@ -870,6 +1096,47 @@ delete_object (node *n)
   if (rc == RC_InvalidObjectHandle)
     rc = RC_OK;               /* already gone */
   return rc_error (rc);
+}
+
+/* Rename an object on the device (dn: the new device name). */
+static const pd_error *
+rename_object (node *n, const char *dn)
+{
+  mtp_dev *m = dev_of (n);
+  if (!mtp_supports (m, OP_SetObjectPropValue))
+    return &err_unsupported;
+  uint8_t buf[HEADROOM + 1 + 2 * 256];
+  if (strlen (dn) > 250)
+    return &err_badname;
+  int k = mtp_put_string (buf + HEADROOM, dn);
+  uint32_t p[2] = { n->handle, PROP_ObjectFileName };
+  int rc = mtp_transaction (m, OP_SetObjectPropValue, p, 2, buf + HEADROOM, (uint32_t) k, 0, 0);
+  if (rc != RC_OK)
+    return rc_error (rc);
+  return set_name (n, dn) ? &err_nomem : 0;
+}
+
+/* Set a file's type: on the device that means a new suffix on its name
+   ("Letter.txt" to "Letter.jpg"). If the device can't rename it, the type
+   is only remembered here. */
+static void
+set_type (node *n, int t)
+{
+  if (n->isdir || t == node_filetype (n))
+    return;
+  if (!n->pending && n->handle && !n->st->readonly)
+    {
+      int base = (int) (strlen (n->mtp_name) - strlen (n->sfx));
+      char *dn = add_type_suffix (str_dup (n->mtp_name, base), 0, t, 0);
+      if (dn && !rename_object (n, dn))
+        {
+          pd_free (dn);
+          n->filetype = t == n->name_type ? -1 : t;
+          return;
+        }
+      pd_free (dn);
+    }
+  n->filetype = t == n->name_type ? -1 : t;
 }
 
 /* Write a buffered file back to the device. */
@@ -1273,12 +1540,8 @@ fs_close (pd_regs *r)
     return &err_badhandle;
   node *n = f->n;
   uint32_t load = (uint32_t) r->r[2];
-  if ((load & 0xFFF00000u) == 0xFFF00000u && f->writable && !n->isdir)
-    {
-      int t = (int) ((load >> 8) & 0xFFF);
-      if (t != node_filetype (n))
-        n->filetype = t;
-    }
+  if ((load & 0xFFF00000u) == 0xFFF00000u && f->writable && !n->isdir && !n->gone)
+    set_type (n, (int) ((load >> 8) & 0xFFF));
   if (f->dirty && !n->gone)
     e = commit (f);
   ofile **pp = &files;
@@ -1345,10 +1608,7 @@ fs_file (pd_regs *r)
         {
           uint32_t load = (uint32_t) r->r[2];
           if ((load & 0xFFF00000u) == 0xFFF00000u && !n->isdir)
-            {
-              int t = (int) ((load >> 8) & 0xFFF);
-              n->filetype = t == node_filetype (n) ? n->filetype : t;
-            }
+            set_type (n, (int) ((load >> 8) & 0xFFF));
         }
       return 0;                 /* dates and attributes: the device keeps its own */
 
@@ -1428,6 +1688,7 @@ fs_file (pd_regs *r)
         if (!n)
           return &err_nomem;
         n->isdir = 1;
+        derive_names (n);
         n->pending = 1;
         n->mtime = pd_unix_time ();
         e = send_object (n, 0, 0);
@@ -1546,20 +1807,21 @@ fs_rename (pd_regs *r)
     {
       if (!mtp_supports (m, OP_SetObjectPropValue))
         return 0;
-      char *dn = to_device_name (bleaf, blen);
+      /* "Letter" (Letter.txt) renamed "Memo" is Memo.txt on the device */
+      char *dn = add_type_suffix (to_device_name (bleaf, blen), a->isdir,
+                                  a->sfx[0] ? node_filetype (a) : -1, a->sfx);
       if (!dn)
         return &err_nomem;
-      uint8_t buf[HEADROOM + 1 + 2 * 256];
-      int k = mtp_put_string (buf + HEADROOM, dn);
-      uint32_t p[2] = { a->handle, PROP_ObjectFileName };
-      int rc = mtp_transaction (m, OP_SetObjectPropValue, p, 2, buf + HEADROOM, (uint32_t) k, 0, 0);
-      if (rc != RC_OK)
+      if (!exact_eq (a->mtp_name, dn, (int) strlen (dn)))
         {
-          pd_free (dn);
-          return rc_error (rc);
+          int t = node_filetype (a);
+          e = rename_object (a, dn);
+          if (!e)
+            a->filetype = t == a->name_type ? -1 : t;
         }
-      set_name (a, dn);
       pd_free (dn);
+      if (e)
+        return e;
     }
   r->r[1] = 0;
   return 0;

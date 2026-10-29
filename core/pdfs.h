@@ -40,6 +40,8 @@ void pdfs_finish (void);
 extern unsigned pdfs_dir_ttl_cs;          /* how long a directory listing stays fresh */
 extern unsigned pdfs_timeout_cs;          /* per-transfer time-out */
 extern int pdfs_trace;                     /* log every FileSwitch call (*PDFSLog trace) */
+extern int pdfs_hide_ext;                  /* show "Letter.txt" as "Letter" (*PDFSExtensions) */
+void pdfs_set_hide_ext (int on);
 
 /* Error helpers */
 #define PDFS_ERRBASE (0x10000 | (PDFS_FSNUM << 8))
