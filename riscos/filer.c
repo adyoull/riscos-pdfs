@@ -11,7 +11,9 @@
 
    The task is started by Service_StartWimp (*Desktop_PDFSFiler) or, when the
    module is loaded in the desktop, from a callback. It runs in USR mode on a
-   stack in the RMA (filer_sp, set by filer_prepare).
+   stack inside the module (pd_task_stack: pd_start in header.s sets sp).
+   Double-clicking the module (*RMRun) enters it too: in the desktop that
+   starts the filer if it isn't running; otherwise it just returns.
 
    Copyright 2026 Andrew Youll. Licensed under the Apache License, Version 2.0. */
 #include "cmodule.h"
@@ -39,8 +41,7 @@
 #define ICON_PRIORITY           0x30000000      /* right of the discs; each next icon one lower */
 
 int filer_task;                 /* 0: not running, -1: starting, else the task handle */
-unsigned filer_sp;              /* top of the task's stack */
-static void *stack;
+uint32_t pd_task_stack[STACK_SIZE / 4];   /* the task's stack (pd_start) */
 
 /* Fixed slots: each icon's indirected text points into its slot, so slots
    never move while their icon exists */
@@ -582,20 +583,29 @@ filer_main (void)
     }
 }
 
-/* Get the stack ready before the task is entered. */
+/* Remember the private word (for Free_Register) */
 oserror *
 filer_prepare (void *pw)
 {
-  static const struct { int n; char m[32]; } nomem = { 0x1FAB8, "Not enough memory" };
   private_word = pw;
-  if (!stack)
-    {
-      stack = rma_claim (STACK_SIZE);
-      if (!stack)
-        return (oserror *) &nomem;
-    }
-  filer_sp = (unsigned) stack + STACK_SIZE;
   return 0;
+}
+
+/* The module's start code (pd_start), on the task's stack: entered by
+   *Desktop_PDFSFiler (filer_task -1), or by *RMRun when the module is
+   double-clicked. */
+void
+filer_entry (void)
+{
+  regs w = {{ 3 }};
+  if (filer_task == -1
+      || (filer_task == 0 && !swix_regs (0x400F2, &w) && w.r[0]))   /* Wimp_ReadSysInfo 3 */
+    {
+      filer_task = -1;
+      filer_main ();
+    }
+  regs x = {{ 0, 0, 0 }};
+  swix_regs (OS_Exit, &x);
 }
 
 void
@@ -608,7 +618,4 @@ filer_finalise (void)
       swix_regs (Wimp_CloseDown, &r);
     }
   filer_task = 0;
-  if (stack)
-    rma_free (stack);
-  stack = 0;
 }

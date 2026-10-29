@@ -53,7 +53,9 @@ open(os.path.join(t, 'w/ToPhone/ReadMe,fff'), 'w').write('Written on RISC OS\nan
 PY
 for b in basic1 free desktop eject; do python3 "$ROOT/tools/bbcbasic.py" tok "$HERE/$b.bas" "$T/w/$b,ffb"; done
 mv "$T/w/desktop,ffb" "$T/w/desk,ffb"
-cp "$HERE/cli-test.obey" "$T/w/t,feb"
+# PDFS is loaded as a double-click does: *RMRun (its start code runs too)
+cp "$MOD" "$T/w/PDFS,ffa"
+{ echo "RMRun TESTDIR.PDFS"; cat "$HERE/cli-test.obey"; } > "$T/w/t,feb"
 # the work directory as RISC OS sees it (IXFS: '/' and '.' swap)
 sed -i "s|TESTDIR|IXFS:\$$(printf '%s' "$T/w" | tr './' '/.')|" "$T/w/t,feb"
 if [ $USBEMU = 1 ]; then
@@ -74,7 +76,7 @@ sleep 1
 kill -0 $SIM 2>/dev/null || { echo "the simulator did not start (port 7015 in use?): see $OUT/sim.log" >&2; exit 1; }
 
 if [ $DESKTOP = 0 ]; then
-  "$TB/bin/rol-run" -t 200 -m "$MOD" -C "$T/w" -c 'Obey t' > "$OUT/cli.txt" 2>&1 || true
+  "$TB/bin/rol-run" -t 200 -C "$T/w" -c 'Obey t' > "$OUT/cli.txt" 2>&1 || true
   cat "$OUT/cli.txt"
   check 'grep -q "pic/jpg .*&C85 .* 3  bytes" "$OUT/cli.txt"' "*Info: type from the extension"
   check 'cmp -s "$T/w/back" "$T/w/rand,ffd"' "*Copy to the phone and back: same contents"
@@ -94,7 +96,7 @@ if [ $DESKTOP = 0 ]; then
   fi
 else
   : "${ROL_HARDDISC:?set ROL_HARDDISC to a HardDisc4 (desktop mode)}"
-  ROL_HARDDISC=$ROL_HARDDISC "$TB/bin/rol-run" ${ROL_VERBOSE:+-v} -t 90 -w 45 -s "$OUT/desktop.png" -m "$MOD" -C "$T/w" -c 'Run desk' || true
+  ROL_HARDDISC=$ROL_HARDDISC "$TB/bin/rol-run" ${ROL_VERBOSE:+-v} -t 90 -w 45 -s "$OUT/desktop.png" -C "$T/w" -c 'Run desk' || true
   cat "$T/w/results"
   check 'cmp -s "$T/w/ToPhone/Archive,ffd" "$T/phone/int/Documents/ToPhone/Archive"' "Filer_Action copies a folder to the phone"
   check 'cmp -s "$T/w/IMG_20261029_0910.jpg" "$T/phone/int/DCIM/Camera/IMG_20261029_0910.jpg"' "Filer_Action copies a photo back"

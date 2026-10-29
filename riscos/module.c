@@ -544,6 +544,7 @@ mod_init (const char *tail, int instance, void *pw)
   oserror *e = add_fs ();
   if (e)
     return e;
+  filer_prepare (pw);
   regs rf = {{ (unsigned) resource_files }};
   swix_regs (ResourceFS_RegisterFiles, &rf);
   /* Loaded in the desktop: start the filer from a callback, once the module

@@ -27,7 +27,7 @@ module_start:
 	.word	flags - module_start
 
 title:	.asciz	"PDFS"
-help:	.asciz	"PDFS\t\t0.02 (29 Oct 2026)"
+help:	.asciz	"PDFS\t\t0.03 (29 Oct 2026)"
 	.align	2
 flags:	.word	1				@ 32-bit compatible
 
@@ -96,15 +96,15 @@ pd_service:
 	movne	pc, lr
 	b	cm_service
 
-@ Module start code: the filer task, entered in USR mode by
-@ *Desktop_PDFSFiler. Runs on its own stack in the RMA.
+@ Module start code, entered in USR mode by *Desktop_PDFSFiler or by
+@ *RMRun (double-clicking the module): no stack is given, so it sets its
+@ own (pd_task_stack in filer.c) before any C.
 pd_start:
-	ldr	r1, 2f
-1:	add	r1, r1, pc
-	ldr	sp, [r1]
-	bl	filer_main
-	swi	0x11				@ OS_Exit (filer_main doesn't return)
-2:	.word	filer_sp - (1b + 8)
+	ldr	sp, 2f
+1:	add	sp, sp, pc
+	bl	filer_entry
+	swi	0x11				@ OS_Exit (filer_entry doesn't return)
+2:	.word	pd_task_stack + 16384 - (1b + 8)
 
 @ The Free module's call for free space (Free_Register): r0-r11 as a
 @ block for free_entry, which returns 1 to set Z (reason 3: same device).

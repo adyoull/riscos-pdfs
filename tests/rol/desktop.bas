@@ -8,8 +8,9 @@ here$=FNstr(n%)
 log%=OPENOUT(here$+".results")
 PROClog("Work directory "+here$)
 REM OSCLI "PDFSLog trace"
-REM the test bed loads modules before any task exists: start the filer as !Run would
-SYS "XWimp_StartTask","Desktop_PDFSFiler"
+REM load PDFS as double-clicking it does (*RMRun): its filer starts
+SYS "Wimp_StartTask","Run "+here$+".PDFS"
+PROCwait(100)
 OSCLI "PDFSMount 127.0.0.1:7015"
 OSCLI "Filer_OpenDir PDFS::SimPhone-Internal.$ 60 1100 900 320"
 PROCwait(250)
