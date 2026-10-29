@@ -218,11 +218,12 @@ open_stream (const usb_iface *c, int ep, const char *type, unsigned size, int ou
 static void
 close_stream (int *h)
 {
-  if (*h)
+  int handle = *h;
+  *h = 0;                       /* first: a service call may close it meanwhile */
+  if (handle)
     {
-      regs r = {{ 0, (unsigned) *h }};
+      regs r = {{ 0, (unsigned) handle }};
       swix_regs (OS_Find, &r);
-      *h = 0;
     }
 }
 
@@ -230,6 +231,8 @@ close_stream (int *h)
 static int
 buffer_space (usbt *u, int h, unsigned *used, unsigned *free)
 {
+  if (!h)
+    return -1;                  /* closed: the device has gone */
   regs r = {{ DFS_BUFFER_SPACE, (unsigned) u->c.dev, (unsigned) h, 0, 0 }};
   if (swix_regs (DeviceFS_CallDevice, &r) || r.r[4] > r.r[3])
     return -1;
@@ -241,6 +244,8 @@ buffer_space (usbt *u, int h, unsigned *used, unsigned *free)
 static void
 wake (usbt *u, unsigned call, unsigned stream, unsigned bytes)
 {
+  if (!stream || u->t.gone)
+    return;
   regs r = {{ call, (unsigned) u->c.dev, stream, bytes }};
   swix_regs (DeviceFS_CallDevice, &r);
 }
@@ -259,6 +264,8 @@ handles (usbt *u, int h, unsigned *stream)
 static int
 gbpb (int h, void *buf, unsigned len, int write)
 {
+  if (!h)
+    return -1;
   regs r = {{ write ? 2u : 4u, (unsigned) h, (unsigned) buf, len }};
   if (swix_regs (OS_GBPB, &r) || r.r[3] > len)
     return -1;
@@ -533,7 +540,14 @@ usb_device_dead (const char *name)
         while (*a && (*a | 0x20) == (*b | 0x20))
           a++, b++;
         if (!*a && *b <= ' ')
-          open_list[i]->t.gone = 1;
+          {
+            /* Its streams are closed now, as SCSISoftUSB closes its pipes on
+               Service_DeviceDead: left open, FileSwitch handles on a device
+               DeviceFS has forgotten fail later ("Device not found" from
+               *ShutDown) or worse */
+            open_list[i]->t.gone = 1;
+            close_streams (open_list[i]);
+          }
       }
 }
 
@@ -543,5 +557,8 @@ usb_dying (void)
 {
   for (int i = 0; i < MAX_OPEN; i++)
     if (open_list[i])
-      open_list[i]->t.gone = 1;
+      {
+        open_list[i]->t.gone = 1;
+        close_streams (open_list[i]);
+      }
 }

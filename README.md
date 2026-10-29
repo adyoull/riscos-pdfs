@@ -5,7 +5,7 @@ MTP (Media Transfer Protocol). A connected device's storages show up as
 discs, such as `PDFS::Pixel-Internal.$`, and work with the Filer, `*Copy`,
 BASIC's OPENIN/OPENOUT and every program that uses FileSwitch.
 
-Status: **0.09.** USB (the RISC OS 5 USB stack), the icon bar filer and
+Status: **0.10.** USB (the RISC OS 5 USB stack), the icon bar filer and
 filetype extensions are done. It's tested against a simulated device, over
 TCP and through an emulation of USBDriver and DeviceFS; it still has to be
 tried with more real devices (see docs/TESTING-ON-A-PI.md).

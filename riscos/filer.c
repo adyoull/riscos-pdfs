@@ -663,6 +663,7 @@ filer_entry (void)
 void
 filer_finalise (void)
 {
+  sendwin_finish ();            /* its MessageTrans file: MessageTrans mustn't keep it */
   free_register (0);
   if (filer_task > 0)
     {
