@@ -5,7 +5,7 @@ MTP (Media Transfer Protocol). A connected device's storages show up as
 discs, such as `PDFS::Pixel-Internal.$`, and work with the Filer, `*Copy`,
 BASIC's OPENIN/OPENOUT and every program that uses FileSwitch.
 
-Status: **0.04.** USB (the RISC OS 5 USB stack), the icon bar filer and
+Status: **0.05.** USB (the RISC OS 5 USB stack), the icon bar filer and
 filetype extensions are done. It's tested against a simulated device, over
 TCP and through an emulation of USBDriver and DeviceFS; it still has to be
 tried with a real phone (see docs/TESTING-ON-A-PI.md).
@@ -101,11 +101,19 @@ and a photo back with Filer_Action, and saves screenshots.
 
 ## Big files
 
-Files up to 4 GB (MTP's limit). A file being written is kept in memory up
-to 4 MB; beyond that PDFS keeps it in a scrap file in
-`<Wimp$ScrapDir>.PDFS` and sends it to the device in 64 KB pieces when
-it's closed. Scrap files are deleted when the file is closed or its device
-goes; any left by a crash are deleted the next time one is needed.
+Files up to 4 GB (MTP's limit).
+
+- Copied by the Filer (Filer_Action) or *Copy, a file of 4 MB or more is
+  sent to the device as it's written: these create the file with its size
+  and write it in order, so PDFS starts the transfer at the first write and
+  passes each block on. The desktop keeps going between blocks, and no
+  scrap file is needed. While that's going on, other requests that need the
+  device get "The device is busy receiving a file"; directory listings come
+  from what PDFS already knows.
+- Otherwise a file being written is kept in memory up to 4 MB, and beyond
+  that in a scrap file in `<Wimp$ScrapDir>.PDFS`, and sent when it's closed.
+  Scrap files are deleted when the file is closed or its device goes; any
+  left by a crash are deleted the next time one is needed.
 
 ## USB notes
 

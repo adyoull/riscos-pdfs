@@ -82,6 +82,7 @@
 
 /* Negative results from mtp_transaction: transport errors (transport.h)
    and these. */
+#define MTP_EBUSY    (-12)        /* a streamed transaction is open */
 #define MTP_EPROTO   (-10)        /* the device sent something malformed */
 #define MTP_ENOMEM   (-11)
 #define MTP_ETOOBIG  (-12)        /* more data than the caller's buffer */
@@ -105,6 +106,12 @@ typedef struct
   /* statistics */
   uint32_t transactions, errors, recoveries;
   mtp_fill_fn fill;             /* data out from a callback (mtp_transaction_fill) */
+  /* A data phase being sent a piece at a time (mtp_stream_*) */
+  int streaming;
+  uint8_t *sbuf;
+  uint32_t slen, stid;
+  uint64_t sleft;               /* bytes of the container still to come */
+  uint16_t sop;
   void *fill_ctx;
 } mtp_dev;
 
@@ -135,6 +142,15 @@ int mtp_transaction (mtp_dev *d, uint16_t op, const uint32_t *params, int nparam
    hold in memory. Returns as mtp_transaction does. */
 int mtp_transaction_fill (mtp_dev *d, uint16_t op, const uint32_t *params, int nparams,
                           uint32_t outlen, mtp_fill_fn fill, void *ctx, uint32_t *rparams);
+
+/* A transaction whose data is sent as it becomes available (a file being
+   written): begin sends the operation and the data container's header
+   (total bytes to follow); put sends data as it comes; end reads the
+   response, sending zeros first for anything still owed. While one is
+   open, other transactions fail with MTP_EBUSY. */
+int mtp_stream_begin (mtp_dev *d, uint16_t op, const uint32_t *params, int nparams, uint32_t total);
+int mtp_stream_put (mtp_dev *d, const void *data, uint32_t len);
+int mtp_stream_end (mtp_dev *d, uint32_t *rparams);
 
 /* Recover after a failed transfer (called by mtp_transaction itself). */
 int mtp_recover (mtp_dev *d, int level);

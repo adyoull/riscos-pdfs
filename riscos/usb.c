@@ -356,41 +356,60 @@ set_short (usbt *u, int on)
   return 0;
 }
 
-/* Send one container. USBDriver sends what's in the stream's buffer as a
-   transfer, and a transfer that isn't a whole number of packets ends with
-   a short packet, which the device takes as the end of the container. So
-   the container goes in pieces that are whole numbers of packets (the last
-   excepted), each into an empty buffer. */
+/* Send (part of) a container. USBDriver starts a transfer with whatever
+   is in the stream's buffer, and when it ends starts another with what has
+   arrived meanwhile (c/usbmodule write_cb). A transfer that isn't a whole
+   number of packets ends with a short packet, which ends the container for
+   the device: so everything goes in whole packets but a container's last
+   piece. The 'short' flag can be changed only while no transfer is active:
+   that's the only time this waits for the buffer to empty, and at the end
+   of a container. */
 static int
 usb_write (pd_transport *t, const void *buf, uint32_t len, unsigned timeout_cs)
 {
   usbt *u = (usbt *) t;
   const uint8_t *p = buf;
   unsigned used, free, mps = t->max_packet;
+  unsigned start = now_cs ();
   int e;
   while (len)
     {
-      if ((e = out_idle (u, timeout_cs)))
-        return e;
-      if (buffer_space (u, u->h_out, &used, &free))
+      int last = !t->more;          /* this call ends the container */
+      if (!t->no_zlp && u->short_on != last && len <= BULK_BUFFER)
+        {
+          /* the container's last piece: 'short' on (after a whole number
+             of packets a zero-length packet follows); else off */
+          if ((e = out_idle (u, timeout_cs)) || set_short (u, last))
+            return e ? e : PDT_IO;
+        }
+      if (t->gone || buffer_space (u, u->h_out, &used, &free))
         return t->gone = 1, PDT_GONE;
-      unsigned n = len;
-      if (n > free)
-        n = free & ~(mps - 1);  /* not the end: whole packets */
+      unsigned n = len <= free ? len : free & ~(mps - 1);
+      if (n < len && !t->no_zlp && u->short_on)
+        n = 0;                      /* not the last piece: wait to clear 'short' */
       if (!n)
-        return PDT_IO;
-      /* the 'short' flag on for a container's last piece only: a zero-length
-         packet follows it if it's a whole number of packets */
-      if (!t->no_zlp && set_short (u, n == len && !t->more))
-        return PDT_IO;
+        {
+          if (!t->no_zlp && u->short_on && len > free)
+            {
+              if ((e = out_idle (u, timeout_cs)) || set_short (u, 0))
+                return e ? e : PDT_IO;
+            }
+          else
+            wake (u, DEVCALL_WAKEUP_TX, u->s_out, 0);
+          if (now_cs () - start > timeout_cs)
+            return PDT_TIMEOUT;
+          continue;
+        }
       int k = gbpb (u->h_out, (void *) p, n, 1);
       if (k != (int) n)
         return PDT_IO;
       p += n;
       len -= n;
       wake (u, DEVCALL_WAKEUP_TX, u->s_out, 0);
+      start = now_cs ();
     }
-  return out_idle (u, timeout_cs);
+  /* the end of a container: wait till it has gone */
+  return t->more ? 0 : out_idle (u, timeout_cs);
 }
 
 static int

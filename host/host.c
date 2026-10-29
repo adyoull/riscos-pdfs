@@ -458,6 +458,101 @@ do_save (const char *local, const char *path, int type, int how)
   return 0;
 }
 
+/* Copy a file as Filer_Action does: create it with its size and a "dead"
+   load address, open it for update, set its extent to 0, write it in
+   blocks (chunk bytes at a time) in order, close it, then set its type. */
+static int
+do_facopy (const char *local, const char *path, int type, uint32_t chunk)
+{
+  char p[1024];
+  fspath (p, path);
+  uint32_t len;
+  uint8_t *data = slurp (local, &len);
+  pd_regs c = { { 7, (pd_reg) p, 0xDEADDEAD, 0xDEADDEAD, 0, len } };
+  if (check (call (PD_FILE, &c), "create"))
+    return -1;
+  pd_regs o = { { 2, (pd_reg) p, 0, 103 } };
+  if (check (call (PD_OPEN, &o), "open"))
+    return -1;
+  pd_reg h = o.r[1];
+  uint32_t bs = (uint32_t) o.r[2];
+  pd_regs z = { { 3, h, 0 } };
+  if (check (call (PD_ARGS, &z), "setext 0"))
+    return -1;
+  /* FileSwitch: whole aligned blocks go straight through, a partial block
+     waits in its buffer until it's full or the file is closed */
+  uint8_t *fbuf = calloc (1, bs);
+  uint32_t fbuf_block = 0, fbuf_used = 0;
+  int failed = 0, swap = getenv ("PDFS_FA_SWAP") != 0;
+  for (uint32_t done = 0; done < len && !failed; )
+    {
+      uint32_t n = len - done < chunk ? len - done : chunk;
+      if (swap && done == chunk && len >= 3 * chunk)
+        {
+          /* testing: write the third chunk before the second */
+          done = 2 * chunk;
+          n = chunk;
+        }
+      else if (swap && done == 3 * chunk && len >= 3 * chunk)
+        {
+          done = chunk;
+          n = chunk;
+          swap = 0;
+        }
+      for (uint32_t i = 0; i < n && !failed; )
+        {
+          uint32_t pos = done + i, blk = pos / bs * bs, in = pos - blk;
+          if (in == 0 && n - i >= bs)
+            {
+              uint32_t whole = (n - i) / bs * bs;
+              pd_regs w = { { 0, h, (pd_reg) (data + pos), whole, pos } };
+              failed = check (call (PD_PUTBYTES, &w), "putbytes");
+              i += whole;
+              continue;
+            }
+          if (fbuf_used && fbuf_block != blk)
+            {
+              pd_regs w = { { 0, h, (pd_reg) fbuf, bs, fbuf_block } };
+              failed = check (call (PD_PUTBYTES, &w), "putbytes (buffer)");
+              fbuf_used = 0;
+            }
+          if (!fbuf_used)
+            memset (fbuf, 0, bs);
+          fbuf_block = blk;
+          uint32_t k = bs - in < n - i ? bs - in : n - i;
+          memcpy (fbuf + in, data + pos, k);
+          fbuf_used = in + k;
+          i += k;
+          if (fbuf_used == bs)
+            {
+              pd_regs w = { { 0, h, (pd_reg) fbuf, bs, fbuf_block } };
+              failed = check (call (PD_PUTBYTES, &w), "putbytes (buffer full)");
+              fbuf_used = 0;
+            }
+        }
+      done += n;
+      if (!swap && getenv ("PDFS_FA_SWAP") && done == 2 * chunk)
+        done = 3 * chunk;
+    }
+  if (!failed && fbuf_used)
+    {
+      pd_regs w = { { 0, h, (pd_reg) fbuf, bs, fbuf_block } };
+      failed = check (call (PD_PUTBYTES, &w), "putbytes (last)");
+    }
+  free (fbuf);
+  pd_regs a = { { 3, h, len } };
+  check (call (PD_ARGS, &a), "setext");
+  pd_regs le = { { 9, h } };
+  check (call (PD_ARGS, &le), "readloadexec");
+  pd_regs cl = { { 0, h, le.r[2], le.r[3] } };
+  int e = check (call (PD_CLOSE, &cl), "close");
+  pd_regs wi = { { 1, (pd_reg) p, 0xFFF00000u | (uint32_t) type << 8, 0, 0, 3 } };
+  if (!e)
+    check (call (PD_FILE, &wi), "writeinfo");
+  free (data);
+  return e;
+}
+
 static int
 run (int argc, char **argv)
 {
@@ -475,6 +570,9 @@ run (int argc, char **argv)
     return do_get (argv[1], argv[2]);
   if (!strcmp (cmd, "save") && argc > 2)
     return do_save (argv[1], argv[2], argc > 3 ? (int) strtol (argv[3], 0, 16) : 0xFFD, 0);
+  if (!strcmp (cmd, "facopy") && argc > 2)
+    return do_facopy (argv[1], argv[2], argc > 3 ? (int) strtol (argv[3], 0, 16) : 0xFFD,
+                      argc > 4 ? (uint32_t) atoi (argv[4]) : 65536 + 1000);
   if (!strcmp (cmd, "openout") && argc > 2)
     return do_save (argv[1], argv[2], 0xFFD, 1);
   if (!strcmp (cmd, "append") && argc > 2)

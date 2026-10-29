@@ -31,6 +31,7 @@ struct node
   unsigned listed_at;
   unsigned seen;              /* mark of the last listing that included it */
   uint64_t size;
+  uint32_t decl;              /* size given when created with FSEntry_File 7 */
   uint32_t mtime;             /* unix seconds */
   int filetype;               /* -1: from the name */
   int name_type;              /* type the name's suffix gives, or -1 */
@@ -72,6 +73,15 @@ struct ofile
   uint8_t *wbuf;              /* whole file for writing (HEADROOM bytes before data) */
   uint32_t wcap;
   int spill;                  /* or, when it's big, a scrap file (pd_spill_open) */
+  /* Or sent to the device as it's written (a big file created with its
+     size, written in order: Filer_Action, *Copy): stream 1 while sending,
+     2 once it has gone wrong (out of order); sent = bytes sent so far;
+     the last bytes written are kept, for FileSwitch to read back */
+  int stream;
+  uint64_t sent;
+  uint8_t *tail;
+  uint64_t tail_off;
+  uint32_t tail_len;
   uint8_t *rbuf;              /* read-ahead */
   uint64_t roff;
   uint32_t rlen;
@@ -106,6 +116,9 @@ E (err_nomem, 0xB8, "Not enough memory");
 E (err_toobig, 0xB9, "File too big for a portable device (4GB at most)");
 E (err_noscrap, 0xBA, "No room for the file: PDFS keeps big files in the scrap directory while writing them");
 E (err_scrapio, 0xBB, "PDFS couldn't use its scrap file");
+E (err_busy, 0xBC, "The device is busy receiving a file: try again when it has finished");
+E (err_order, 0xBE, "The file couldn't be sent to the device: it wasn't written in order");
+E (err_stream_size, 0xBF, "The file sent to the device isn't the size it was created with");
 E (err_badname, 0xCC, "Bad name");
 E (err_unsupported, 0xA5, "The device can't do that");
 E (err_proto, 0xCA, "The device sent something PDFS doesn't understand");
@@ -128,6 +141,7 @@ rc_error (int rc)
     case PDT_GONE: return &err_gone;
     case PDT_IO: return &err_io;
     case MTP_ENOMEM: return &err_nomem;
+    case MTP_EBUSY: return &err_busy;
     case MTP_EPROTO: return &err_proto;
     case RC_InvalidObjectHandle:
     case RC_InvalidParentObject: return &err_notfound;
@@ -179,6 +193,15 @@ exact_eq (const char *a, const char *b, int blen)
     if (a[i] != b[i])
       return 0;
   return a[i] == 0;
+}
+
+static int
+memcmp_bytes (const uint8_t *a, const uint8_t *b, uint32_t n)
+{
+  for (uint32_t i = 0; i < n; i++)
+    if (a[i] != b[i])
+      return 1;
+  return 0;
 }
 
 static char *
@@ -929,6 +952,8 @@ ensure_listed (node *dir)
 {
   if (dir->listed && pd_time_cs () - dir->listed_at < pdfs_dir_ttl_cs)
     return 0;
+  if (dir->st->dev->mtp.streaming)      /* busy receiving a file: what we know */
+    return dir->listed ? 0 : &err_busy;
   return list_dir (dir);
 }
 
@@ -1070,13 +1095,12 @@ can_edit (mtp_dev *m)
          && mtp_supports (m, OP_TruncateObject) && mtp_supports (m, OP_EndEditObject);
 }
 
-/* Create an object on the device: a directory, or a file with the contents
-   of f (0: empty). Sets n->handle. */
+/* Name a new object (with its type suffix) and send its ObjectInfo, for a
+   directory or a file of len bytes. Sets n->handle. */
 static const pd_error *
-send_object (node *n, ofile *f)
+send_info (node *n, uint32_t len)
 {
   mtp_dev *m = dev_of (n);
-  uint32_t len = f ? (uint32_t) f->size : 0;
   uint8_t info[HEADROOM + 52 + 3 * 512 + 16];
   uint8_t *p = info + HEADROOM;
   node *dir = n->parent;
@@ -1100,15 +1124,10 @@ send_object (node *n, ofile *f)
         }
       pd_free (dn);
     }
-  /* A file whose data phase would need a zero-length packet that can't be
-     sent: send all but its last byte, then add that with an edit */
-  uint32_t sendlen = len;
-  if (!n->isdir && len > 1 && mtp_needs_zlp (m, len) && can_edit (m))
-    sendlen = len - 1;
   memset (p, 0, 52);
   put32 (p, n->st->id);
   put16 (p + 4, n->isdir ? FMT_Association : FMT_Undefined);
-  put32 (p + 8, n->isdir ? 0 : sendlen);
+  put32 (p + 8, n->isdir ? 0 : len);
   put32 (p + 38, dir == &n->st->root ? 0 : dir->handle);
   put16 (p + 42, n->isdir ? 1 : 0);            /* association type: generic folder */
   int k = 52;
@@ -1125,8 +1144,28 @@ send_object (node *n, ofile *f)
     return rc_error (rc);
   n->handle = rp[2];
   n->pending = 0;
-  if (n->isdir)
-    return 0;
+  return 0;
+}
+
+/* Create an object on the device: a directory, or a file with the contents
+   of f (0: empty). Sets n->handle. */
+static const pd_error *
+send_object (node *n, ofile *f)
+{
+  mtp_dev *m = dev_of (n);
+  uint32_t len = f ? (uint32_t) f->size : 0;
+  uint8_t info[HEADROOM + 4];
+  if (!n->parent)
+    return &err_notfound;
+  /* A file whose data phase would need a zero-length packet that can't be
+     sent: send all but its last byte, then add that with an edit */
+  uint32_t sendlen = len;
+  if (!n->isdir && len > 1 && mtp_needs_zlp (m, len) && can_edit (m))
+    sendlen = len - 1;
+  const pd_error *e = send_info (n, sendlen);
+  if (e || n->isdir)
+    return e;
+  int rc;
   if (sendlen)
     {
       fill_src src = { f, 0 };
@@ -1396,6 +1435,8 @@ f_read (ofile *f, uint64_t off, void *dst, uint32_t n)
 static void
 f_free (ofile *f)
 {
+  pd_free (f->tail);
+  f->tail = 0;
   pd_free (f->wbuf);
   f->wbuf = 0;
   f->wcap = 0;
@@ -1557,6 +1598,157 @@ fs_open (pd_regs *r)
   return 0;
 }
 
+/* --- streaming a big file to the device as it's written ------------------------------
+   Filer_Action and FileSwitch's *Copy create a file with its size (FSEntry_
+   File 7), open it, and write it in order. Sending it as it comes, not all
+   at the close, keeps the desktop going; and it needs no scrap file. */
+
+#define STREAM_AT   SPILL_AT      /* files this big or bigger are streamed */
+#define TAIL        65536         /* the last bytes written, kept */
+
+static const pd_error *
+stream_start (ofile *f)
+{
+  node *n = f->n;
+  mtp_dev *m = dev_of (n);
+  const pd_error *e = send_info (n, n->decl);
+  if (e)
+    return e;
+  int rc = mtp_stream_begin (m, OP_SendObject, 0, 0, n->decl);
+  if (rc < 0)
+    return rc_error (rc);
+  f->stream = 1;
+  f->sent = 0;
+  f->tail_len = 0;
+  f->tail_off = 0;
+  if (!f->tail && !(f->tail = pd_alloc (TAIL)))
+    f->stream = 2;
+  return 0;
+}
+
+static void
+keep_tail (ofile *f, uint64_t off, const uint8_t *src, uint32_t len)
+{
+  if (!f->tail || !len)
+    return;
+  if (off != f->tail_off + f->tail_len)
+    f->tail_len = 0;              /* not following on: start again */
+  if (len >= TAIL)
+    {
+      memcpy (f->tail, src + len - TAIL, TAIL);
+      f->tail_off = off + len - TAIL;
+      f->tail_len = TAIL;
+      return;
+    }
+  if (!f->tail_len)
+    f->tail_off = off;
+  if (f->tail_len + len > TAIL)
+    {
+      uint32_t drop = f->tail_len + len - TAIL;
+      memmove (f->tail, f->tail + drop, f->tail_len - drop);
+      f->tail_len -= drop;
+      f->tail_off += drop;
+    }
+  memcpy (f->tail + f->tail_len, src, len);
+  f->tail_len += len;
+}
+
+static const pd_error *
+stream_put (ofile *f, uint64_t off, const uint8_t *src, uint32_t len)
+{
+  mtp_dev *m = dev_of (f->n);
+  if (off + len > f->size)
+    f->size = off + len;
+  if (f->stream != 1)
+    return 0;
+  if (off < f->sent)
+    {
+      /* written again: fine if it's the same as what went (FileSwitch
+         writing its buffer out twice) */
+      uint64_t end = off + len < f->sent ? off + len : f->sent;
+      if (off >= f->tail_off && end <= f->tail_off + f->tail_len
+          && !memcmp_bytes (f->tail + (off - f->tail_off), src, (uint32_t) (end - off)))
+        {
+          src += end - off;
+          len -= (uint32_t) (end - off);
+          off = end;
+        }
+      else
+        {
+          f->stream = 2;
+          return 0;
+        }
+      if (!len)
+        return 0;
+    }
+  int rc = 0;
+  if (off > f->sent)                    /* a gap: zeros */
+    {
+      uint64_t gap = off - f->sent;
+      while (gap && rc >= 0)
+        {
+          uint32_t k = gap > 65536 ? 65536 : (uint32_t) gap;
+          rc = mtp_stream_put (m, 0, k);
+          gap -= k;
+        }
+      f->sent = off;
+    }
+  if (rc >= 0)
+    rc = mtp_stream_put (m, src, len);  /* beyond the size given: dropped */
+  if (rc < 0)
+    {
+      f->stream = 3;                    /* the transfer failed */
+      return rc_error (rc);
+    }
+  keep_tail (f, off, src, len);
+  f->sent = off + len;
+  return 0;
+}
+
+/* At the close: finish the transfer; the file must be the size it was
+   created with (Android can trim it if it's shorter). */
+static const pd_error *
+stream_finish (ofile *f)
+{
+  node *n = f->n;
+  mtp_dev *m = dev_of (n);
+  uint32_t rp[5];
+  int rc = m->streaming ? mtp_stream_end (m, rp) : PDT_IO;
+  int state = f->stream;
+  f->stream = 0;
+  pd_free (f->tail);
+  f->tail = 0;
+  if (rc != RC_OK || state != 1 || f->size > n->decl)
+    {
+      if (n->handle)
+        delete_object (n);
+      n->handle = 0;
+      n->pending = 1;
+      n->size = 0;
+      if (rc < 0 && rc != MTP_EBUSY)
+        return rc_error (rc);
+      return state == 2 ? &err_order : rc != RC_OK ? rc_error (rc) : &err_stream_size;
+    }
+  if (f->size < n->decl)
+    {
+      uint32_t h = n->handle, tp[3] = { h, (uint32_t) f->size, 0 };
+      if (!can_edit (m)
+          || (rc = mtp_transaction (m, OP_BeginEditObject, &h, 1, 0, 0, 0, 0)) != RC_OK
+          || (rc = mtp_transaction (m, OP_TruncateObject, tp, 3, 0, 0, 0, 0),
+              mtp_transaction (m, OP_EndEditObject, &h, 1, 0, 0, 0, 0), rc) != RC_OK)
+        {
+          delete_object (n);
+          n->handle = 0;
+          n->pending = 1;
+          return &err_stream_size;
+        }
+    }
+  n->size = f->size;
+  n->mtime = pd_unix_time ();
+  f->dirty = 0;
+  return 0;
+}
+
 static const pd_error *
 fs_getbytes (pd_regs *r)
 {
@@ -1573,6 +1765,21 @@ fs_getbytes (pd_regs *r)
     memset (dst + avail, 0, n - avail);
   if (!avail)
     return 0;
+  if (f->stream)
+    {
+      /* being sent: only what's still kept can be read back */
+      if (f->tail && off >= f->tail_off && off + avail <= f->tail_off + f->tail_len)
+        {
+          memcpy (dst, f->tail + (off - f->tail_off), avail);
+          return 0;
+        }
+      if (off >= f->sent)
+        {
+          memset (dst, 0, avail);         /* not written yet */
+          return 0;
+        }
+      return &err_busy;
+    }
   if (f->writable || f->loaded)
     {
       if (!f->loaded && (e = load_whole (f)))
@@ -1623,6 +1830,15 @@ fs_putbytes (pd_regs *r)
   const pd_error *e;
   if (!f)
     return &err_badhandle;
+  node *nd = f->n;
+  if (!f->stream && nd->pending && nd->decl >= STREAM_AT && off == 0 && f->size == 0
+      && !dev_of (nd)->streaming && !nd->gone && !mtp_needs_zlp (dev_of (nd), nd->decl))
+    {
+      if ((e = stream_start (f)))
+        return e;
+    }
+  if (f->stream)
+    return stream_put (f, off, src, n);
   if (!f->loaded && (e = load_whole (f)))
     return e;
   return f_write (f, off, src, n);
@@ -1643,6 +1859,11 @@ fs_args (pd_regs *r)
         uint64_t ext = (uint32_t) r->r[2];
         if (r->r[0] == 7 && ext <= f->size)
           return 0;
+        if (f->stream)
+          {
+            f->size = ext;              /* checked at the close */
+            return 0;
+          }
         if (!f->loaded && (e = load_whole (f)))
           return e;
         if (ext != f->size)
@@ -1652,9 +1873,21 @@ fs_args (pd_regs *r)
     case 8:                     /* write zeroes */
       {
         uint64_t off = (uint32_t) r->r[2], cnt = (uint32_t) r->r[3];
+        static const uint8_t zeros[4096];
+        if (f->stream)
+          {
+            while (cnt)
+              {
+                uint32_t k = cnt > sizeof zeros ? sizeof zeros : (uint32_t) cnt;
+                if ((e = stream_put (f, off, zeros, k)))
+                  return e;
+                off += k;
+                cnt -= k;
+              }
+            return 0;
+          }
         if (!f->loaded && (e = load_whole (f)))
           return e;
-        static const uint8_t zeros[4096];
         while (cnt)
           {
             uint32_t k = cnt > sizeof zeros ? sizeof zeros : (uint32_t) cnt;
@@ -1669,7 +1902,7 @@ fs_args (pd_regs *r)
       node_loadexec (f->n, &r->r[2], &r->r[3]);
       return 0;
     case 6:                     /* flush */
-      if (f->dirty && !f->n->gone)
+      if (f->dirty && !f->n->gone && !f->stream)
         return commit (f);
       return 0;
     case 4:                     /* read allocated size */
@@ -1692,9 +1925,11 @@ fs_close (pd_regs *r)
     return &err_badhandle;
   node *n = f->n;
   uint32_t load = (uint32_t) r->r[2];
-  if ((load & 0xFFF00000u) == 0xFFF00000u && f->writable && !n->isdir && !n->gone)
+  if (f->stream)
+    e = stream_finish (f);      /* first: the device can do nothing else till then */
+  if (!e && (load & 0xFFF00000u) == 0xFFF00000u && f->writable && !n->isdir && !n->gone)
     set_type (n, (int) ((load >> 8) & 0xFFF));
-  if (f->dirty && !n->gone)
+  if (!e && f->dirty && !n->gone)
     e = commit (f);
   ofile **pp = &files;
   while (*pp != f)
@@ -1707,6 +1942,8 @@ fs_close (pd_regs *r)
     drop_node (n);
   else if (n->pending && !n->gone && !e)
     e = send_object (n, 0);   /* opened for writing and closed unwritten */
+  if (!e)
+    n->decl = 0;
   return e;
 }
 
@@ -1812,6 +2049,7 @@ fs_file (pd_regs *r)
           return &err_nomem;
         n->pending = 1;
         n->size = (uint32_t) r->r[5] - (uint32_t) r->r[4];
+        n->decl = (uint32_t) n->size;
         n->mtime = pd_unix_time ();
         uint32_t load = (uint32_t) r->r[2];
         if ((load & 0xFFF00000u) == 0xFFF00000u)

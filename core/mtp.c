@@ -21,6 +21,9 @@ mtp_finish (mtp_dev *d)
 {
   pd_free (d->stage);
   d->stage = 0;
+  pd_free (d->sbuf);
+  d->sbuf = 0;
+  d->streaming = 0;
   if (d->tr && d->tr->close)
     d->tr->close (d->tr);
   d->tr = 0;
@@ -172,97 +175,13 @@ rd (mtp_dev *d, uint8_t *dst, uint32_t n)
 
 /* --- transactions ------------------------------------------------------------ */
 
+/* Read the reply to transaction tid: data (into in) and the response.
+   Returns the response code or a negative error. */
 static int
-transaction (mtp_dev *d, uint16_t op, const uint32_t *params, int nparams,
-             const void *out, uint32_t outlen, mtp_data *in, uint32_t *rparams)
+read_response (mtp_dev *d, uint16_t op, uint32_t tid, mtp_data *in, uint32_t *rparams)
 {
-  uint8_t cmd[32];
   int e;
-  uint32_t tid = ++d->tid;
-  d->transactions++;
-
-  put32 (cmd, 12 + 4 * (uint32_t) nparams);
-  put16 (cmd + 4, MTP_CMD);
-  put16 (cmd + 6, op);
-  put32 (cmd + 8, tid);
-  for (int i = 0; i < nparams; i++)
-    put32 (cmd + 12 + 4 * i, params[i]);
-  e = d->tr->write (d->tr, cmd, 12 + 4 * (uint32_t) nparams, d->timeout_cs);
-  if (e < 0)
-    return e;
-
-  if (out && d->fill)
-    {
-      /* Data from a callback, in pieces: each a whole number of USB packets
-         (64K), the last excepted, so no transfer ends early */
-      enum { PIECE = 65536 };
-      uint8_t *buf = pd_alloc (PIECE);
-      if (!buf)
-        return MTP_ENOMEM;
-      put32 (buf, 12 + outlen);
-      put16 (buf + 4, MTP_DATA);
-      put16 (buf + 6, op);
-      put32 (buf + 8, tid);
-      uint64_t off = 0;
-      uint32_t head = 12;
-      e = 0;
-      while (e >= 0 && (off < outlen || head))
-        {
-          uint32_t k = PIECE - head;
-          if (k > outlen - off)
-            k = (uint32_t) (outlen - off);
-          if (k && d->fill (d->fill_ctx, buf + head, off, k) < 0)
-            {
-              e = PDT_IO;
-              break;
-            }
-          d->tr->more = off + k < outlen;
-          e = d->tr->write (d->tr, buf, head + k, d->timeout_cs + (head + k) / 4096);
-          off += k;
-          head = 0;
-        }
-      d->tr->more = 0;
-      pd_free (buf);
-      if (e < 0)
-        return e;
-      goto response;
-    }
-  if (out)
-    {
-      /* The data container travels as one transfer: header and payload
-         contiguous, so out must have 12 bytes of headroom (mtp.h). */
-      uint8_t *h = (uint8_t *) out - 12;
-      uint8_t save[12];
-      if (mtp_needs_zlp (d, outlen) && op != OP_SendObject && op != OP_SendPartialObject)
-        {
-          /* No zero-length packet possible: pad the dataset by a byte (the
-             device reads the fields it knows and ignores the rest) */
-          uint8_t *t = pd_alloc (12 + outlen + 1);
-          if (!t)
-            return MTP_ENOMEM;
-          memcpy (t + 12, out, outlen);
-          put32 (t, 12 + outlen + 1);
-          put16 (t + 4, MTP_DATA);
-          put16 (t + 6, op);
-          put32 (t + 8, tid);
-          e = d->tr->write (d->tr, t, 12 + outlen + 1, d->timeout_cs);
-          pd_free (t);
-          if (e < 0)
-            return e;
-          goto response;
-        }
-      memcpy (save, h, 12);
-      put32 (h, 12 + outlen);
-      put16 (h + 4, MTP_DATA);
-      put16 (h + 6, op);
-      put32 (h + 8, tid);
-      e = d->tr->write (d->tr, h, 12 + outlen, d->timeout_cs + outlen / 4096);
-      memcpy (h, save, 12);
-      if (e < 0)
-        return e;
-    }
-
-response:
+  (void) op;
   if (in)
     in->len = 0;
   for (;;)
@@ -346,6 +265,106 @@ response:
     }
 }
 
+static int
+transaction (mtp_dev *d, uint16_t op, const uint32_t *params, int nparams,
+             const void *out, uint32_t outlen, mtp_data *in, uint32_t *rparams)
+{
+  uint8_t cmd[32];
+  int e;
+  uint32_t tid = ++d->tid;
+  d->transactions++;
+
+  put32 (cmd, 12 + 4 * (uint32_t) nparams);
+  put16 (cmd + 4, MTP_CMD);
+  put16 (cmd + 6, op);
+  put32 (cmd + 8, tid);
+  for (int i = 0; i < nparams; i++)
+    put32 (cmd + 12 + 4 * i, params[i]);
+  e = d->tr->write (d->tr, cmd, 12 + 4 * (uint32_t) nparams, d->timeout_cs);
+  if (e < 0)
+    return e;
+
+  if (out && d->fill)
+    {
+      /* Data from a callback, in pieces: each a whole number of USB packets
+         (64K), the last excepted, so no transfer ends early */
+      enum { PIECE = 65536 };
+      uint8_t *buf = pd_alloc (PIECE);
+      if (!buf)
+        return MTP_ENOMEM;
+      put32 (buf, 12 + outlen);
+      put16 (buf + 4, MTP_DATA);
+      put16 (buf + 6, op);
+      put32 (buf + 8, tid);
+      uint64_t off = 0;
+      uint32_t head = 12;
+      e = 0;
+      while (e >= 0 && (off < outlen || head))
+        {
+          uint32_t k = PIECE - head;
+          if (k > outlen - off)
+            k = (uint32_t) (outlen - off);
+          if (k && d->fill (d->fill_ctx, buf + head, off, k) < 0)
+            {
+              e = PDT_IO;
+              break;
+            }
+          d->tr->more = off + k < outlen;
+          e = d->tr->write (d->tr, buf, head + k, d->timeout_cs + (head + k) / 4096);
+          off += k;
+          head = 0;
+        }
+      d->tr->more = 0;
+      pd_free (buf);
+      if (e < 0)
+        return e;
+      /* the device may take a while to finish writing a big file */
+      unsigned t = d->timeout_cs;
+      if (d->timeout_cs < 6000 && outlen > (1u << 20))
+        d->timeout_cs = 6000;
+      e = read_response (d, op, tid, in, rparams);
+      d->timeout_cs = t;
+      return e;
+    }
+  if (out)
+    {
+      /* The data container travels as one transfer: header and payload
+         contiguous, so out must have 12 bytes of headroom (mtp.h). */
+      uint8_t *h = (uint8_t *) out - 12;
+      uint8_t save[12];
+      if (mtp_needs_zlp (d, outlen) && op != OP_SendObject && op != OP_SendPartialObject)
+        {
+          /* No zero-length packet possible: pad the dataset by a byte (the
+             device reads the fields it knows and ignores the rest) */
+          uint8_t *t = pd_alloc (12 + outlen + 1);
+          if (!t)
+            return MTP_ENOMEM;
+          memcpy (t + 12, out, outlen);
+          put32 (t, 12 + outlen + 1);
+          put16 (t + 4, MTP_DATA);
+          put16 (t + 6, op);
+          put32 (t + 8, tid);
+          e = d->tr->write (d->tr, t, 12 + outlen + 1, d->timeout_cs);
+          pd_free (t);
+          if (e < 0)
+            return e;
+          goto response;
+        }
+      memcpy (save, h, 12);
+      put32 (h, 12 + outlen);
+      put16 (h + 4, MTP_DATA);
+      put16 (h + 6, op);
+      put32 (h + 8, tid);
+      e = d->tr->write (d->tr, h, 12 + outlen, d->timeout_cs + outlen / 4096);
+      memcpy (h, save, 12);
+      if (e < 0)
+        return e;
+    }
+
+response:
+  return read_response (d, op, tid, in, rparams);
+}
+
 int
 mtp_recover (mtp_dev *d, int level)
 {
@@ -378,6 +397,8 @@ int
 mtp_transaction (mtp_dev *d, uint16_t op, const uint32_t *params, int nparams,
                  const void *out, uint32_t outlen, mtp_data *in, uint32_t *rparams)
 {
+  if (d->streaming)
+    return MTP_EBUSY;
   if (d->broken)
     {
       int e = mtp_recover (d, 1);
@@ -519,4 +540,140 @@ mtp_transaction_fill (mtp_dev *d, uint16_t op, const uint32_t *params, int npara
   d->fill = 0;
   d->fill_ctx = 0;
   return rc;
+}
+
+/* --- streamed data phases ------------------------------------------------------- */
+
+enum { SPIECE = 65536 };        /* a whole number of USB packets */
+
+static int
+stream_flush (mtp_dev *d, int last)
+{
+  if (!d->slen)
+    return 0;
+  d->tr->more = !last;
+  int e = d->tr->write (d->tr, d->sbuf, d->slen, d->timeout_cs + d->slen / 4096);
+  d->tr->more = 0;
+  d->slen = 0;
+  return e;
+}
+
+static void
+stream_failed (mtp_dev *d)
+{
+  pd_free (d->sbuf);
+  d->sbuf = 0;
+  d->streaming = 0;
+  d->errors++;
+  d->broken = 1;
+}
+
+int
+mtp_stream_begin (mtp_dev *d, uint16_t op, const uint32_t *params, int nparams, uint32_t total)
+{
+  if (d->streaming)
+    return MTP_EBUSY;
+  if (d->broken && mtp_recover (d, 1) < 0 && mtp_recover (d, 2) < 0)
+    return PDT_IO;
+  d->sbuf = pd_alloc (SPIECE);
+  if (!d->sbuf)
+    return MTP_ENOMEM;
+  uint8_t cmd[32];
+  uint32_t tid = ++d->tid;
+  d->transactions++;
+  put32 (cmd, 12 + 4 * (uint32_t) nparams);
+  put16 (cmd + 4, MTP_CMD);
+  put16 (cmd + 6, op);
+  put32 (cmd + 8, tid);
+  for (int i = 0; i < nparams; i++)
+    put32 (cmd + 12 + 4 * i, params[i]);
+  int e = d->tr->write (d->tr, cmd, 12 + 4 * (uint32_t) nparams, d->timeout_cs);
+  if (e < 0)
+    {
+      stream_failed (d);
+      return e;
+    }
+  /* the data container's header goes with the first piece of data */
+  put32 (d->sbuf, 12 + total);
+  put16 (d->sbuf + 4, MTP_DATA);
+  put16 (d->sbuf + 6, op);
+  put32 (d->sbuf + 8, tid);
+  d->slen = 12;
+  d->sleft = total;
+  d->stid = tid;
+  d->sop = op;
+  d->streaming = 1;
+  return 0;
+}
+
+int
+mtp_stream_put (mtp_dev *d, const void *data, uint32_t len)
+{
+  const uint8_t *p = data;
+  if (!d->streaming)
+    return PDT_IO;
+  if (len > d->sleft)
+    len = (uint32_t) d->sleft;
+  while (len)
+    {
+      uint32_t k = SPIECE - d->slen;
+      if (k > len)
+        k = len;
+      if (p)
+        memcpy (d->sbuf + d->slen, p, k);
+      else
+        memset (d->sbuf + d->slen, 0, k);
+      d->slen += k;
+      d->sleft -= k;
+      len -= k;
+      if (p)
+        p += k;
+      if (d->slen == SPIECE || d->sleft == 0)
+        {
+          int e = stream_flush (d, d->sleft == 0);
+          if (e < 0)
+            {
+              stream_failed (d);
+              return e;
+            }
+        }
+    }
+  return 0;
+}
+
+int
+mtp_stream_end (mtp_dev *d, uint32_t *rparams)
+{
+  if (!d->streaming)
+    return PDT_IO;
+  int e = 0;
+  while (d->sleft && e >= 0)    /* owed: zeros (the caller deals with the result) */
+    {
+      uint32_t k = d->sleft > SPIECE ? SPIECE : (uint32_t) d->sleft;
+      e = mtp_stream_put (d, 0, k);
+    }
+  if (e < 0)
+    return e;
+  e = stream_flush (d, 1);
+  pd_free (d->sbuf);
+  d->sbuf = 0;
+  d->streaming = 0;
+  if (e < 0)
+    {
+      d->errors++;
+      d->broken = 1;
+      return e;
+    }
+  /* the device may take a while to finish writing a big file */
+  unsigned t = d->timeout_cs;
+  if (d->timeout_cs < 6000)
+    d->timeout_cs = 6000;
+  e = read_response (d, d->sop, d->stid, 0, rparams);
+  d->timeout_cs = t;
+  if (e < 0)
+    {
+      d->errors++;
+      d->broken = 1;
+    }
+  return e;
 }

@@ -53,6 +53,7 @@ open(os.path.join(t, 'phone/int/Documents/Shopping list.txt'), 'w').write('milk\
 w('phone/int/Documents/Boarding pass.pdf', 80000)
 w('phone/sd/Movies/Holiday.mkv', 250000)
 w('w/rand,ffd', 100000); w('w/ToPhone/Archive,ffd', 100000)
+w('w/ToPhone/Film,ffd', 20 * 1048576 + 5)   # Filer_Action streams it to the phone
 w('w/z500,ffd', 500)
 w('w/big6,ffd', 6 * 1048576 + 3)  # over 4MB: written through a scrap file       # with its 12-byte header, one 512-byte packet: needs care on USB
 open(os.path.join(t, 'w/local,fff'), 'w').write('a local text file\n')
@@ -115,6 +116,8 @@ else
   check 'cmp -s "$T/w/IMG_20261029_0910.jpg" "$T/phone/int/DCIM/Camera/IMG_20261029_0910.jpg"' "Filer_Action copies a photo back"
   check 'grep -q "filetype C85" "$T/w/results"' "the photo is a JPEG on RISC OS"
   check '[ -f "$T/phone/int/Documents/ToPhone/ReadMe.txt" ]' "a Text file copied by the Filer is ReadMe.txt on the phone"
+  check 'cmp -s "$T/w/ToPhone/Film,ffd" "$T/phone/int/Documents/ToPhone/Film"' "a 20MB file copied by Filer_Action"
+  grep "longest pause" "$T/w/results" || true
   check 'grep -q "icon .*: Internal" "$T/w/results" && grep -q "icon .*: SD card" "$T/w/results"' "icon bar icons for both storages"
   check 'cmp -s "$T/w/local,fff" "$T/phone/sd/local.txt"' "a file dropped on the SD card's icon is copied there"
   check 'grep -q "ShowFree ok" "$T/w/results"' "*ShowFree (the icon menu's Free) works"

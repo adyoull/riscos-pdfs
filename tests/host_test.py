@@ -276,6 +276,29 @@ def big():
                 ok(r.returncode == 0 and open(p, "rb").read() == data,
                    "a %d-byte file written %s" % (size, flags))
                 os.unlink(src)
+            # copied as Filer_Action does: streamed to the device as written
+            for size in (sizes[0], sizes[1] + 4093):
+                data = random.randbytes(size)
+                src = tmpfile(data)
+                # no scrap directory: it must go straight to the device
+                # (but a USB transfer needing a zero-length packet goes the
+                # long way, through a scrap file)
+                fenv = dict(env) if "--zlp-strict" in flags else dict(env, PDFS_SPILL_DIR="/nonexistent")
+                r = s.run(["facopy", src, D + ".Download.fa%d" % size, "C85"], env=fenv)
+                p = local(s, "Download", "fa%d.jpg" % size)
+                ok(r.returncode == 0 and os.path.isfile(p) and open(p, "rb").read() == data,
+                   "a %d-byte file copied as Filer_Action does %s" % (size, flags))
+                os.unlink(src)
+            # written out of order: refused, and nothing left on the device
+            data = random.randbytes(6 * 1048576)
+            src = tmpfile(data)
+            r = s.run(["facopy", src, D + ".Download.swapped", "FFD", "1048576"],
+                      env=dict(env, PDFS_FA_SWAP="1"), expect=None)
+            ok(not os.path.exists(local(s, "Download", "swapped")) and (
+               "wasn't written in order" in r.stdout or r.returncode == 0 and
+               open(local(s, "Download", "swapped"), "rb").read() == data),
+               "a big file written out of order is refused (or sent right) %s" % flags)
+            os.unlink(src)
             # append to a big file: it's loaded into a scrap file first
             tail = b"--tail--"
             src = tmpfile(tail)

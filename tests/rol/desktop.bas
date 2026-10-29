@@ -1,5 +1,5 @@
 REM PDFS desktop test: Filer windows on a simulated phone, copy with Filer_Action
-log%=0:icon%=-1
+log%=0:icon%=-1:maxgap%=0
 ON ERROR PROClog("Error: "+REPORT$+" at line "+STR$ERL):END
 DIM b% 1024, n% 256
 SYS "Wimp_Initialise",310,&4B534154,"PDFS test",0 TO ,me%
@@ -28,9 +28,11 @@ $(b%+20)=""
 b%!20=0:b%!24=1:$(b%+28)="PDFS::SimPhone-Internal.$.Documents":b%?(28+LEN"PDFS::SimPhone-Internal.$.Documents")=0
 PROCsend(fa%,&405,28+LEN"PDFS::SimPhone-Internal.$.Documents"+1)
 OSCLI "Filer_OpenDir PDFS::SimPhone-Internal.$.Documents 1000 560 600 440"
+maxgap%=0
 PROCwait(150)
 OSCLI "TBShot"
-PROCwait(400)
+PROCwait(800)
+PROClog("longest pause in the desktop during the folder copy: "+STR$maxgap%+"cs")
 OSCLI "TBShot"
 OSCLI "Filer_OpenDir PDFS::SimPhone-Internal.$.Documents.ToPhone 1000 160 600 300"
 PROCwait(300)
@@ -122,11 +124,13 @@ IF t%=-2 THEN SYS "Wimp_SendMessage",17,b%,-2,icon% ELSE SYS "Wimp_SendMessage",
 ENDPROC
 
 DEF PROCwait(cs%)
-LOCAL e%,r%,now%
-SYS "OS_ReadMonotonicTime" TO e%:e%+=cs%
+LOCAL e%,r%,now%,last%
+SYS "OS_ReadMonotonicTime" TO e%:last%=e%:e%+=cs%
 REPEAT
-  SYS "Wimp_PollIdle",&1830,b%,e% TO r%
+  SYS "Wimp_PollIdle",&1830,b%,last%+5 TO r%
   IF (r%=17 OR r%=18) AND b%!16=0 THEN CLOSE#log%:SYS "Wimp_CloseDown":END
   SYS "OS_ReadMonotonicTime" TO now%
+  IF now%-last%>maxgap% THEN maxgap%=now%-last%
+  last%=now%
 UNTIL now%-e%>=0
 ENDPROC
