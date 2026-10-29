@@ -224,6 +224,116 @@ pd_filetype_to_ext (int type, char *buf)
   return 0;
 }
 
+/* --- scrap files (big files being written): <Wimp$ScrapDir>.PDFS ---------------------- */
+
+#define OS_Args                 0x09
+#define OS_GBPB                 0x0C
+#define OS_Find                 0x0D
+#define OS_File                 0x08
+
+static struct { int handle; char name[16]; } spills[8];
+static unsigned spill_seq;
+static int spill_dir_ready;
+
+static void
+spill_path (char *o, const char *leaf)
+{
+  const char *d = "<Wimp$ScrapDir>.PDFS";
+  while (*d)
+    *o++ = *d++;
+  if (leaf)
+    {
+      *o++ = '.';
+      while (*leaf)
+        *o++ = *leaf++;
+    }
+  *o = 0;
+}
+
+int
+pd_spill_open (void)
+{
+  char path[64];
+  if (!spill_dir_ready)
+    {
+      /* our directory in the scrap directory; files left in it by a crash
+         or a reset are deleted (OS_FSControl 27: wipe, forced) */
+      spill_path (path, 0);
+      regs cd = {{ 8, (unsigned) path, 0, 0, 0 }};
+      if (swix_regs (OS_File, &cd))
+        return 0;
+      spill_path (path, "*");
+      regs w = {{ 27, (unsigned) path, 0, 2 }};
+      swix_regs (OS_FSControl, &w);
+      spill_dir_ready = 1;
+    }
+  for (int i = 0; i < 8; i++)
+    if (!spills[i].handle)
+      {
+        char leaf[16] = "S", *q = leaf + 1;
+        unsigned v = ++spill_seq;
+        char t[12];
+        int k = 0;
+        do
+          t[k++] = (char) ('0' + v % 10);
+        while ((v /= 10));
+        while (k)
+          *q++ = t[--k];
+        *q = 0;
+        spill_path (path, leaf);
+        regs c = {{ 11, (unsigned) path, 0xFFD, 0, 0, 0 }};    /* create, empty */
+        if (swix_regs (OS_File, &c))
+          return 0;
+        regs o = {{ 0xCF, (unsigned) path }};                     /* open for update */
+        if (swix_regs (OS_Find, &o) || !o.r[0])
+          return 0;
+        spills[i].handle = (int) o.r[0];
+        for (int j = 0; j < 16; j++)
+          spills[i].name[j] = leaf[j];
+        return spills[i].handle;
+      }
+  return 0;
+}
+
+int
+pd_spill_read (int h, uint64_t off, void *buf, uint32_t len)
+{
+  regs r = {{ 3, (unsigned) h, (unsigned) buf, len, (unsigned) off }};
+  if (swix_regs (OS_GBPB, &r))
+    return -1;
+  return (int) (len - r.r[3]);
+}
+
+int
+pd_spill_write (int h, uint64_t off, const void *buf, uint32_t len)
+{
+  regs r = {{ 1, (unsigned) h, (unsigned) buf, len, (unsigned) off }};
+  return swix_regs (OS_GBPB, &r) || r.r[3] ? -1 : 0;
+}
+
+int
+pd_spill_setext (int h, uint64_t ext)
+{
+  regs r = {{ 3, (unsigned) h, (unsigned) ext }};
+  return swix_regs (OS_Args, &r) ? -1 : 0;
+}
+
+void
+pd_spill_close (int h)
+{
+  regs c = {{ 0, (unsigned) h }};
+  swix_regs (OS_Find, &c);
+  for (int i = 0; i < 8; i++)
+    if (spills[i].handle == h)
+      {
+        char path[64];
+        spill_path (path, spills[i].name);
+        regs d = {{ 6, (unsigned) path }};                        /* delete */
+        swix_regs (OS_File, &d);
+        spills[i].handle = 0;
+      }
+}
+
 /* --- TCP transport (testing with sim/mtpsim.py) ----------------------------------------- */
 
 typedef struct

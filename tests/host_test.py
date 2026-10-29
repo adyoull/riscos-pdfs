@@ -258,6 +258,38 @@ def zlp():
             s.stop()
 
 
+def big():
+    print("== big files (over 4MB go to a scrap file while being written)")
+    for flags in ([], ["--no-partial64", "--no-edit"], ["--zlp-strict", "512"]):
+        s = Sim(*flags)
+        scrap = tempfile.mkdtemp(prefix="pdfs-scrap-")
+        env = {"PDFS_SPILL_DIR": scrap}
+        if "--zlp-strict" in flags:
+            env["PDFS_NO_ZLP"] = "512"
+        try:
+            sizes = (5 * 1048576 - 12, 40 * 1048576 + 7) if "--zlp-strict" in flags else (5 * 1048576, 40 * 1048576 + 7)
+            for size in sizes:
+                data = random.randbytes(size)
+                src = tmpfile(data)
+                r = s.run(["save", src, D + ".Download.big%d/bin" % size, "FFD"], env=env)
+                p = local(s, "Download", "big%d.bin" % size)
+                ok(r.returncode == 0 and open(p, "rb").read() == data,
+                   "a %d-byte file written %s" % (size, flags))
+                os.unlink(src)
+            # append to a big file: it's loaded into a scrap file first
+            tail = b"--tail--"
+            src = tmpfile(tail)
+            p = local(s, "Download", "big%d.bin" % sizes[1])
+            before = open(p, "rb").read()
+            r = s.run(["append", src, D + ".Download.big%d/bin" % sizes[1]], env=env)
+            ok(r.returncode == 0 and open(p, "rb").read() == before + tail,
+               "appending to a 40MB file %s" % flags)
+            ok(os.listdir(scrap) == [], "scrap files deleted %s" % flags)
+        finally:
+            s.stop()
+            shutil.rmtree(scrap, ignore_errors=True)
+
+
 def main():
     random.seed(1)
     if not os.path.exists(HOST):
@@ -269,6 +301,7 @@ def main():
     suite(["--no-rename"])
     recovery()
     zlp()
+    big()
     print("%d passed, %d failed" % (passed, failed))
     sys.exit(1 if failed else 0)
 

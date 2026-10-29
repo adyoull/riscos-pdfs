@@ -73,6 +73,18 @@ IF icon%>=0 THEN
   SYS "XOS_File",17,"PDFS::SimPhone-SD_card.$.local" TO t%,,l%,,len%
   PROClog("dropped on SD card icon: type "+STR$t%+" length "+STR$len%+" filetype "+STR$~((l%>>>8)AND&FFF))
 ENDIF
+REM a 6MB file: written through a scrap file in <Wimp$ScrapDir>.PDFS
+SYS "XOS_CLI","Copy "+here$+".big6 PDFS::SimPhone-Internal.$.Download.big6 ~C~V" TO e%;f%
+IF f% AND 1 THEN PROClog("big copy: "+FNstr(e%+4))
+SYS "XOS_File",17,"PDFS::SimPhone-Internal.$.Download.big6" TO t%,,,,len%
+PROClog("big file on phone: type "+STR$t%+" length "+STR$len%)
+n%=0:c%=0
+REPEAT
+  SYS "XOS_GBPB",9,"<Wimp$ScrapDir>.PDFS",b%+512,8,c%,256,"*" TO ,,,r%,c%;f%
+  IF (f% AND 1)=0 THEN n%+=r%
+UNTIL c%<0 OR (f% AND 1)
+SYS "XOS_File",17,"<Wimp$ScrapDir>.PDFS" TO t%
+PROClog("scrap directory type "+STR$t%+", files left: "+STR$n%)
 REM the icon menu's Free entry
 SYS "XOS_CLI","ShowFree -fs PDFS SimPhone-Internal" TO e%;f%
 IF f% AND 1 THEN PROClog("ShowFree: "+FNstr(e%+4)) ELSE PROClog("ShowFree ok")

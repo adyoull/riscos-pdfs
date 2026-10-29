@@ -86,6 +86,8 @@
 #define MTP_ENOMEM   (-11)
 #define MTP_ETOOBIG  (-12)        /* more data than the caller's buffer */
 
+typedef int (*mtp_fill_fn) (void *ctx, uint8_t *dst, uint64_t off, uint32_t len);
+
 typedef struct
 {
   pd_transport *tr;
@@ -102,6 +104,8 @@ typedef struct
   uint32_t stage_len, stage_pos, stage_size;
   /* statistics */
   uint32_t transactions, errors, recoveries;
+  mtp_fill_fn fill;             /* data out from a callback (mtp_transaction_fill) */
+  void *fill_ctx;
 } mtp_dev;
 
 /* Data received in a transaction. If buf is set, data goes there (up to cap
@@ -126,6 +130,12 @@ int mtp_supports (mtp_dev *d, uint16_t op);
 int mtp_transaction (mtp_dev *d, uint16_t op, const uint32_t *params, int nparams,
                      const void *out, uint32_t outlen, mtp_data *in,
                      uint32_t *rparams);
+/* The same, with the data to send (outlen bytes) fetched in pieces by
+   fill(ctx, dst, offset, len), which returns 0 or -1: for files too big to
+   hold in memory. Returns as mtp_transaction does. */
+int mtp_transaction_fill (mtp_dev *d, uint16_t op, const uint32_t *params, int nparams,
+                          uint32_t outlen, mtp_fill_fn fill, void *ctx, uint32_t *rparams);
+
 /* Recover after a failed transfer (called by mtp_transaction itself). */
 int mtp_recover (mtp_dev *d, int level);
 /* Read one pending event, if any: returns 1 and fills code/param1. */

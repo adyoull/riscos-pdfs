@@ -14,7 +14,8 @@ unsigned pdfs_timeout_cs = 1000;
 #define MAX_STORAGES  4
 #define BUFSIZE       4096          /* FileSwitch buffer size for our files */
 #define READAHEAD     65536
-#define MAX_WRITE     (256u << 20)  /* largest file we'll buffer for writing */
+#define MAX_WRITE     0xFFFFFFF0u   /* largest file (MTP sizes are 32 bits) */
+#define SPILL_AT      (4u << 20)    /* bigger files being written go to a scrap file */
 #define HEADROOM      12            /* bytes before out-data for the container header */
 
 /* --- types -------------------------------------------------------------------- */
@@ -70,10 +71,16 @@ struct ofile
   uint64_t size;
   uint8_t *wbuf;              /* whole file for writing (HEADROOM bytes before data) */
   uint32_t wcap;
+  int spill;                  /* or, when it's big, a scrap file (pd_spill_open) */
   uint8_t *rbuf;              /* read-ahead */
   uint64_t roff;
   uint32_t rlen;
 };
+
+typedef struct { ofile *f; uint64_t base; } fill_src;
+static int f_read (ofile *f, uint64_t off, void *dst, uint32_t n);
+static int fill_from (void *ctx, uint8_t *dst, uint64_t off, uint32_t len);
+static void f_free (ofile *f);
 
 static device devices[MAX_DEVICES];
 static ofile *files;
@@ -96,7 +103,9 @@ E (err_denied, 0xBD, "Access denied by the device");
 E (err_readonly, 0xC1, "The device's storage is read-only");
 E (err_full, 0xC6, "The device's storage is full");
 E (err_nomem, 0xB8, "Not enough memory");
-E (err_toobig, 0xB9, "File too big for PDFS to write");
+E (err_toobig, 0xB9, "File too big for a portable device (4GB at most)");
+E (err_noscrap, 0xBA, "No room for the file: PDFS keeps big files in the scrap directory while writing them");
+E (err_scrapio, 0xBB, "PDFS couldn't use its scrap file");
 E (err_badname, 0xCC, "Bad name");
 E (err_unsupported, 0xA5, "The device can't do that");
 E (err_proto, 0xCA, "The device sent something PDFS doesn't understand");
@@ -1038,16 +1047,18 @@ dev_of (node *n)
 /* Android's SendPartialObject, in two parts if one would need a zero-length
    packet the transport can't send. data has HEADROOM bytes before it. */
 static int
-send_partial (mtp_dev *m, uint32_t h, uint64_t off, uint8_t *data, uint32_t len)
+send_partial (mtp_dev *m, uint32_t h, uint64_t off, ofile *f, uint64_t from, uint32_t len)
 {
   uint32_t first = mtp_needs_zlp (m, len) && len > 1 ? len - 1 : len;
   uint32_t sp[4] = { h, (uint32_t) off, (uint32_t) (off >> 32), first };
-  int rc = mtp_transaction (m, OP_SendPartialObject, sp, 4, data, first, 0, 0);
+  fill_src src = { f, from };
+  int rc = mtp_transaction_fill (m, OP_SendPartialObject, sp, 4, first, fill_from, &src, 0);
   if (rc == RC_OK && first < len)
     {
       uint64_t o2 = off + first;
       uint32_t sp2[4] = { h, (uint32_t) o2, (uint32_t) (o2 >> 32), len - first };
-      rc = mtp_transaction (m, OP_SendPartialObject, sp2, 4, data + first, len - first, 0, 0);
+      fill_src src2 = { f, from + first };
+      rc = mtp_transaction_fill (m, OP_SendPartialObject, sp2, 4, len - first, fill_from, &src2, 0);
     }
   return rc;
 }
@@ -1059,12 +1070,13 @@ can_edit (mtp_dev *m)
          && mtp_supports (m, OP_TruncateObject) && mtp_supports (m, OP_EndEditObject);
 }
 
-/* Create an object on the device: a directory, or a file with the given
-   data (which has HEADROOM bytes before it). Sets n->handle. */
+/* Create an object on the device: a directory, or a file with the contents
+   of f (0: empty). Sets n->handle. */
 static const pd_error *
-send_object (node *n, uint8_t *data, uint32_t len)
+send_object (node *n, ofile *f)
 {
   mtp_dev *m = dev_of (n);
+  uint32_t len = f ? (uint32_t) f->size : 0;
   uint8_t info[HEADROOM + 52 + 3 * 512 + 16];
   uint8_t *p = info + HEADROOM;
   node *dir = n->parent;
@@ -1115,14 +1127,20 @@ send_object (node *n, uint8_t *data, uint32_t len)
   n->pending = 0;
   if (n->isdir)
     return 0;
-  rc = mtp_transaction (m, OP_SendObject, 0, 0, data ? data : info + HEADROOM, sendlen, 0, 0);
+  if (sendlen)
+    {
+      fill_src src = { f, 0 };
+      rc = mtp_transaction_fill (m, OP_SendObject, 0, 0, sendlen, fill_from, &src, 0);
+    }
+  else
+    rc = mtp_transaction (m, OP_SendObject, 0, 0, info + HEADROOM, 0, 0, 0);
   if (rc == RC_OK && sendlen < len)
     {
       uint32_t h = n->handle;
       rc = mtp_transaction (m, OP_BeginEditObject, &h, 1, 0, 0, 0, 0);
       if (rc == RC_OK)
         {
-          rc = send_partial (m, h, sendlen, data + sendlen, len - sendlen);
+          rc = send_partial (m, h, sendlen, f, sendlen, len - sendlen);
           int rc2 = mtp_transaction (m, OP_EndEditObject, &h, 1, 0, 0, 0, 0);
           if (rc == RC_OK)
             rc = rc2;
@@ -1193,8 +1211,6 @@ commit (ofile *f)
   if (f->size > MAX_WRITE)
     return &err_toobig;
   uint32_t len = (uint32_t) f->size;
-  uint8_t empty[HEADROOM + 4];
-  uint8_t *data = f->wbuf ? f->wbuf + HEADROOM : empty + HEADROOM;
   n->mtime = pd_unix_time ();
 
   if (!n->pending && n->handle && can_edit (m))
@@ -1205,7 +1221,7 @@ commit (ofile *f)
       if (rc == RC_OK)
         {
           if (len)
-            rc = send_partial (m, h, 0, data, len);
+            rc = send_partial (m, h, 0, f, 0, len);
           uint32_t tp[3] = { h, len, 0 };
           if (rc == RC_OK)
             rc = mtp_transaction (m, OP_TruncateObject, tp, 3, 0, 0, 0, 0);
@@ -1231,7 +1247,7 @@ commit (ofile *f)
       n->handle = 0;
       n->pending = 1;
     }
-  e = send_object (n, data, len);
+  e = send_object (n, f);
   if (!e)
     f->dirty = 0;
   return e;
@@ -1255,18 +1271,10 @@ flush_pending (node *keep)
   ofile tmp;
   memset (&tmp, 0, sizeof tmp);
   tmp.n = n;
-  tmp.size = n->size;
-  if (n->size)
-    {
-      if (n->size > MAX_WRITE)
-        return &err_toobig;
-      tmp.wbuf = pd_alloc ((size_t) n->size + HEADROOM);
-      if (!tmp.wbuf)
-        return &err_nomem;
-    }
-  const pd_error *e = commit (&tmp);
-  pd_free (tmp.wbuf);
-  return e;
+  tmp.size = n->size;           /* no buffer: reads as zeros */
+  if (n->size > MAX_WRITE)
+    return &err_toobig;
+  return commit (&tmp);
 }
 
 /* --- open files ----------------------------------------------------------------------- */
@@ -1302,6 +1310,109 @@ grow (ofile *f, uint64_t need)
 }
 
 /* Read [off, off+len) of the object into dst; *got = bytes read. */
+/* --- a file's contents while it's open for writing: in memory, or in a
+   scrap file once it passes SPILL_AT ---------------------------------------- */
+
+static const pd_error *
+f_spill (ofile *f)
+{
+  int h = pd_spill_open ();
+  if (!h)
+    return &err_noscrap;
+  if (f->size && pd_spill_write (h, 0, f->wbuf + HEADROOM, (uint32_t) f->size) < 0)
+    {
+      pd_spill_close (h);
+      return &err_scrapio;
+    }
+  pd_free (f->wbuf);
+  f->wbuf = 0;
+  f->wcap = 0;
+  f->spill = h;
+  return 0;
+}
+
+/* Make the file len bytes long (new bytes are zero) */
+static const pd_error *
+f_setsize (ofile *f, uint64_t len)
+{
+  const pd_error *e;
+  if (len > MAX_WRITE)
+    return &err_toobig;
+  if (!f->spill && len > SPILL_AT && (e = f_spill (f)))
+    return e;
+  if (f->spill)
+    {
+      if (len != f->size && pd_spill_setext (f->spill, len) < 0)
+        return &err_scrapio;
+    }
+  else
+    {
+      if ((e = grow (f, len)))
+        return e;
+      if (len > f->size)
+        memset (f->wbuf + HEADROOM + f->size, 0, (size_t) (len - f->size));
+    }
+  f->size = len;
+  return 0;
+}
+
+static const pd_error *
+f_write (ofile *f, uint64_t off, const void *src, uint32_t n)
+{
+  const pd_error *e;
+  if (off + n > f->size && (e = f_setsize (f, off + n)))
+    return e;
+  if (f->spill)
+    {
+      if (pd_spill_write (f->spill, off, src, n) < 0)
+        return &err_scrapio;
+    }
+  else
+    memcpy (f->wbuf + HEADROOM + off, src, n);
+  f->dirty = 1;
+  return 0;
+}
+
+/* Read n bytes at off (within the file's size) */
+static int
+f_read (ofile *f, uint64_t off, void *dst, uint32_t n)
+{
+  if (f->spill)
+    {
+      int k = pd_spill_read (f->spill, off, dst, n);
+      if (k < 0)
+        return -1;
+      if ((uint32_t) k < n)
+        memset ((uint8_t *) dst + k, 0, n - (uint32_t) k);
+      return 0;
+    }
+  if (f->wbuf)
+    memcpy (dst, f->wbuf + HEADROOM + off, n);
+  else
+    memset (dst, 0, n);     /* created with a size but never written */
+  return 0;
+}
+
+static void
+f_free (ofile *f)
+{
+  pd_free (f->wbuf);
+  f->wbuf = 0;
+  f->wcap = 0;
+  if (f->spill)
+    pd_spill_close (f->spill);   /* deletes the scrap file */
+  f->spill = 0;
+}
+
+/* For mtp_transaction_fill: the file from base on */
+
+static int
+fill_from (void *ctx, uint8_t *dst, uint64_t off, uint32_t len)
+{
+  fill_src *fs = ctx;
+  return f_read (fs->f, fs->base + off, dst, len);
+}
+
 static const pd_error *
 read_object (node *n, uint64_t off, uint8_t *dst, uint32_t len, uint32_t *got)
 {
@@ -1335,28 +1446,38 @@ load_whole (ofile *f)
 {
   node *n = f->n;
   const pd_error *e;
+  uint64_t size = f->size;
+  int dirty = f->dirty;
   f->loaded = 1;
-  if (n->pending || !n->handle || f->size == 0)
-    return grow (f, f->size);
-  e = grow (f, f->size);
-  if (e)
+  f->size = 0;
+  if ((e = f_setsize (f, size)))
     return e;
+  if (n->pending || !n->handle || size == 0)
+    return 0;
   mtp_dev *m = dev_of (n);
   if (mtp_supports (m, OP_GetPartialObject64) || mtp_supports (m, OP_GetPartialObject))
     {
+      uint8_t *tmp = pd_alloc (READAHEAD);
+      if (!tmp)
+        return &err_nomem;
       uint64_t off = 0;
-      while (off < f->size)
+      while (off < size)
         {
-          uint32_t want = f->size - off > 1048576 ? 1048576 : (uint32_t) (f->size - off), got;
-          e = read_object (n, off, f->wbuf + HEADROOM + off, want, &got);
-          if (e)
-            return e;
-          if (got == 0)
+          uint32_t want = size - off > READAHEAD ? READAHEAD : (uint32_t) (size - off), got;
+          e = read_object (n, off, tmp, want, &got);
+          if (!e && got)
+            e = f_write (f, off, tmp, got);
+          if (e || !got)
             break;
           off += got;
         }
-      return 0;
+      pd_free (tmp);
+      f->dirty = dirty;
+      return e;
     }
+  /* No partial reads: the whole object at once, so only into memory */
+  if (f->spill)
+    return &err_unsupported;
   uint32_t h = n->handle;
   mtp_data in = { f->wbuf + HEADROOM, f->wcap, 0 };
   int rc = mtp_transaction (m, OP_GetObject, &h, 1, 0, 0, &in, 0);
@@ -1456,8 +1577,7 @@ fs_getbytes (pd_regs *r)
     {
       if (!f->loaded && (e = load_whole (f)))
         return e;
-      memcpy (dst, f->wbuf + HEADROOM + off, avail);
-      return 0;
+      return f_read (f, off, dst, avail) < 0 ? &err_scrapio : 0;
     }
   while (avail)
     {
@@ -1481,8 +1601,7 @@ fs_getbytes (pd_regs *r)
           /* No partial reads on this device: fetch the whole object once */
           if ((e = load_whole (f)))
             return e;
-          memcpy (dst, f->wbuf + HEADROOM + off, avail);
-          return 0;
+          return f_read (f, off, dst, avail) < 0 ? &err_scrapio : 0;
         }
       if (e)
         return e;
@@ -1506,13 +1625,7 @@ fs_putbytes (pd_regs *r)
     return &err_badhandle;
   if (!f->loaded && (e = load_whole (f)))
     return e;
-  if ((e = grow (f, off + n)))
-    return e;
-  memcpy (f->wbuf + HEADROOM + off, src, n);
-  if (off + n > f->size)
-    f->size = off + n;
-  f->dirty = 1;
-  return 0;
+  return f_write (f, off, src, n);
 }
 
 static const pd_error *
@@ -1532,26 +1645,24 @@ fs_args (pd_regs *r)
           return 0;
         if (!f->loaded && (e = load_whole (f)))
           return e;
-        if ((e = grow (f, ext)))
-          return e;
-        if (ext > f->size)
-          memset (f->wbuf + HEADROOM + f->size, 0, (size_t) (ext - f->size));
         if (ext != f->size)
           f->dirty = 1;
-        f->size = ext;
-        return 0;
+        return f_setsize (f, ext);
       }
     case 8:                     /* write zeroes */
       {
         uint64_t off = (uint32_t) r->r[2], cnt = (uint32_t) r->r[3];
         if (!f->loaded && (e = load_whole (f)))
           return e;
-        if ((e = grow (f, off + cnt)))
-          return e;
-        memset (f->wbuf + HEADROOM + off, 0, (size_t) cnt);
-        if (off + cnt > f->size)
-          f->size = off + cnt;
-        f->dirty = 1;
+        static const uint8_t zeros[4096];
+        while (cnt)
+          {
+            uint32_t k = cnt > sizeof zeros ? sizeof zeros : (uint32_t) cnt;
+            if ((e = f_write (f, off, zeros, k)))
+              return e;
+            off += k;
+            cnt -= k;
+          }
         return 0;
       }
     case 9:                     /* read load/exec */
@@ -1589,13 +1700,13 @@ fs_close (pd_regs *r)
   while (*pp != f)
     pp = &(*pp)->next;
   *pp = f->next;
-  pd_free (f->wbuf);
+  f_free (f);                   /* and its scrap file */
   pd_free (f->rbuf);
   pd_free (f);
   if (--n->refs == 0 && n->gone)
     drop_node (n);
   else if (n->pending && !n->gone && !e)
-    e = send_object (n, 0, 0);   /* opened for writing and closed unwritten */
+    e = send_object (n, 0);   /* opened for writing and closed unwritten */
   return e;
 }
 
@@ -1732,7 +1843,7 @@ fs_file (pd_regs *r)
         derive_names (n);
         n->pending = 1;
         n->mtime = pd_unix_time ();
-        e = send_object (n, 0, 0);
+        e = send_object (n, 0);
         if (e)
           drop_node (n);
         else
@@ -2221,7 +2332,7 @@ release (device *dv)
         {
           *pp = f->next;
           f->n->refs--;
-          pd_free (f->wbuf);
+          f_free (f);           /* and its scrap file */
           pd_free (f->rbuf);
           pd_free (f);
         }

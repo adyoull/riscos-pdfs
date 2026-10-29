@@ -5,7 +5,7 @@ MTP (Media Transfer Protocol). A connected device's storages show up as
 discs, such as `PDFS::Pixel-Internal.$`, and work with the Filer, `*Copy`,
 BASIC's OPENIN/OPENOUT and every program that uses FileSwitch.
 
-Status: **0.03.** USB (the RISC OS 5 USB stack), the icon bar filer and
+Status: **0.04.** USB (the RISC OS 5 USB stack), the icon bar filer and
 filetype extensions are done. It's tested against a simulated device, over
 TCP and through an emulation of USBDriver and DeviceFS; it still has to be
 tried with a real phone (see docs/TESTING-ON-A-PI.md).
@@ -73,7 +73,7 @@ and `*PDFSMount 127.0.0.1:7015`.
 
     TB=../riscos-linux-testbed RCD_DIR=../riscos-crossdev tests/rol/run.sh
     TB=... RCD_DIR=... ROL_HARDDISC=.../HardDisc4 tests/rol/run.sh --desktop
-    make out/PDFS-usbemu,ffa && TB=... tests/rol/run.sh --usbemu [--desktop]
+    make out/PDFS-usbemu,ffa && TB=... tests/rol/run.sh --usbemu [--old-usbdriver] [--desktop]
 
 `--usbemu` uses a test build whose USB transport talks to an emulation of
 USBDriver and DeviceFS (tests/rol/usbemu.c): a fake phone, USB9, bridged to
@@ -99,15 +99,35 @@ and a photo back with Filer_Action, and saves screenshots.
 - Otherwise: `.` and `/` swap, a space becomes a hard space (&A0), characters
   RISC OS reserves become `_`, and so does anything outside Latin-1.
 
+## Big files
+
+Files up to 4 GB (MTP's limit). A file being written is kept in memory up
+to 4 MB; beyond that PDFS keeps it in a scrap file in
+`<Wimp$ScrapDir>.PDFS` and sends it to the device in 64 KB pieces when
+it's closed. Scrap files are deleted when the file is closed or its device
+goes; any left by a crash are deleted the next time one is needed.
+
 ## USB notes
 
-- Control requests aren't used (USBDriver 1.31 does them synchronously and
-  they have frozen machines); recovery drains and reopens the pipes.
+Written to RISC OS Open's USB API: USBDriver's `Doc/USB` (0.95) and
+`h/USBDevFS`, checked against its `c/usbmodule` (from ROOL's source archive,
+src-iyo-dev.5.31).
+
+- Devices come from Service_USB 1 (USBServiceAnswer/USBServiceCall blocks).
+  Endpoints are DeviceFS streams with special fields
+  `interface;alternate;endpoint;bulk;nopad;size`.
+- Reads: WakeUpRX with the length wanted, then only what Check Buffer Space
+  says is there, so nothing blocks inside DeviceFS. (USBDriver returns R3 =
+  the buffer's size, R4 = free, as `get_buffer_space` does.)
+- Writes: USBDriver sends what's in the buffer as one transfer, so each piece
+  goes into an empty buffer, in whole packets but for a container's last.
+- MTP needs a zero-length packet after a container that's a whole number of
+  packets: the stream's `short` flag (USBDriver 0.49+, set with Get/Set
+  Options for a container's last piece only) sends one. With an older
+  USBDriver, PDFS avoids such containers: datasets get a padding byte and
+  such a file goes as all but its last byte followed by an edit that adds it.
+- Control requests aren't used: USBDriver does them synchronously.
   `*PDFSUSB control on` allows MTP's Cancel request for testing.
-- DeviceFS can't end a transfer with a zero-length packet, which Android
-  needs after a data phase that's a whole number of packets. PDFS never sends
-  one: datasets get a padding byte, and such a file goes as all but its last
-  byte followed by an edit that adds it.
 
 ## Not done yet
 

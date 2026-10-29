@@ -7,7 +7,9 @@
    pipes, opened through OS_Find as DeviceFS streams, are carried to
    sim/mtpsim.py on 127.0.0.1:7015 over TCP. The streams behave as
    USBDriver's do: OS_GBPB fills or empties a buffer of the size asked for;
-   WakeUpTX sends what's in the output buffer as one transfer; WakeUpRX
+   WakeUpTX sends what's in the output buffer as one transfer, followed by a
+   zero-length packet if the stream's 'short' flag is set (Get/Set Options)
+   and the transfer is a whole number of 512-byte packets; WakeUpRX
    fetches up to the bytes asked for into the input buffer; BufferSpace
    gives the size and free space. Everything else goes to the real SWI.
 
@@ -33,6 +35,7 @@
 typedef struct
 {
   int used, output, ep;
+  unsigned flags;           /* Get/Set Options: bit 1 'short' */
   unsigned cap, len;        /* buffer size and bytes in it */
   uint8_t *buf;
 } stream;
@@ -44,11 +47,31 @@ static uint32_t container_left;     /* bytes of the current OUT container still 
 static uint8_t hdr_bytes[4];
 static unsigned hdr_have;
 
-/* Follow the containers in what goes out; a transfer that isn't a whole
-   number of 512-byte packets ends with a short packet: the device would
-   take it as the end of the container. Count those that come too soon. */
 static void
-check_transfer (const uint8_t *p, unsigned n)
+set_count (const char *var, unsigned x)
+{
+  char v[12], t[12];
+  int k = 0;
+  do
+    t[k++] = (char) ('0' + x % 10);
+  while ((x /= 10));
+  for (int j = 0; j < k; j++)
+    v[j] = t[k - 1 - j];
+  v[k] = 0;
+  regs r = {{ (unsigned) var, (unsigned) v, (unsigned) k, 0, 0 }};
+  swix_regs (0x24, &r);         /* OS_SetVarVal */
+}
+
+static unsigned usbemu_missing_zlp;
+
+/* Follow the containers in what goes out. A transfer ends with a short
+   packet if it isn't a whole number of 512-byte packets, or with a
+   zero-length packet if the stream's 'short' flag is set; either tells the
+   device the container has ended. Count those that come too soon
+   (PDFSEmu$ShortPackets), and containers that end on a packet boundary
+   with nothing to say so (PDFSEmu$MissingZLP). */
+static void
+check_transfer (const uint8_t *p, unsigned n, int short_flag)
 {
   unsigned i = 0;
   while (i < n)
@@ -69,22 +92,12 @@ check_transfer (const uint8_t *p, unsigned n)
       i += k;
       container_left -= k;
     }
-  if ((n & 511) && (container_left || hdr_have))
-    {
-      usbemu_short++;
-      char v[12];
-      int k = 0;
-      unsigned x = usbemu_short;
-      char t[12];
-      do
-        t[k++] = (char) ('0' + x % 10);
-      while ((x /= 10));
-      for (int j = 0; j < k; j++)
-        v[j] = t[k - 1 - j];
-      v[k] = 0;
-      regs r = {{ (unsigned) "PDFSEmu$ShortPackets", (unsigned) v, (unsigned) k, 0, 0 }};
-      swix_regs (0x24, &r);     /* OS_SetVarVal */
-    }
+  int ends = (n & 511) || short_flag;
+  int inside = container_left || hdr_have;
+  if (ends && inside)
+    set_count ("PDFSEmu$ShortPackets", ++usbemu_short);
+  if (!ends && !inside)
+    set_count ("PDFSEmu$MissingZLP", ++usbemu_missing_zlp);
 }
 
 static void
@@ -224,6 +237,7 @@ open_fake (const char *path, int output)
         if (!s->buf)
           return -1;
         s->used = 1;
+        s->flags = 0;
         s->output = output;
         s->len = 0;
         if (s->ep == 1 && !output && connect_sim ())
@@ -279,6 +293,15 @@ usbemu_swix (unsigned swi, regs *r)
   stream *s;
   switch (swi)
     {
+    case 0x54A45:                                /* USBDriver_Version */
+      {
+        /* PDFSEmu$OldDriver set: a USBDriver before 0.49 (no 'short') */
+        regs v = {{ (unsigned) "PDFSEmu$OldDriver", 0, (unsigned) -1, 0, 0 }};
+        swix_regs (0x23, &v);                    /* OS_ReadVarVal: R2 < 0 if set */
+        r->r[0] = (int) v.r[2] < 0 ? 48 : 131;
+        return 0;
+      }
+
     case OS_ServiceCall:
       if (r->r[1] == 0xD2 && r->r[0] == 1)
         {
@@ -360,6 +383,16 @@ usbemu_swix (unsigned swi, regs *r)
         case 0x80000006u:                        /* TransferInfo: done */
           r->r[3] = 1;
           return 0;
+        case 0x80000008u:                        /* Get/Set Options */
+          if ((s = fake_stream (r->r[2])))
+            {
+              unsigned old = s->flags;
+              s->flags = ((s->flags & r->r[4]) ^ r->r[3]) & 3;
+              r->r[3] = old;
+              r->r[4] = s->flags;
+              return 0;
+            }
+          break;
         case 0x80000005u:                        /* ClearStall */
           return 0;
         case 0x80000000u:                        /* control request */
@@ -369,7 +402,7 @@ usbemu_swix (unsigned swi, regs *r)
           if ((s = fake_stream (r->r[2])) && s->output && s->len)
             {
               usbemu_transfers++;
-              check_transfer (s->buf, s->len);
+              check_transfer (s->buf, s->len, (s->flags & 2) != 0);
               send_all (s->buf, s->len);
               s->len = 0;
             }

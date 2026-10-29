@@ -22,11 +22,17 @@ DESKTOP=0 USBEMU=0 SIMFLAGS=
 for a in "$@"; do
   case "$a" in
     --desktop) DESKTOP=1 ;;
-    --usbemu)  USBEMU=1 SIMFLAGS="--zlp-strict 512"
+    --usbemu)  USBEMU=1
                MOD=$ROOT/out/PDFS-usbemu,ffa
                [ -f "$MOD" ] || { echo "make out/PDFS-usbemu,ffa first" >&2; exit 1; } ;;
+    --old-usbdriver) OLDUSB=1 ;;
   esac
 done
+# USB through the emulator: zero-length packets are real (the 'short'
+# flag); with --old-usbdriver they can't be, so PDFS must avoid needing
+# them and the simulator fails any container that would
+OLDUSB=${OLDUSB:-0}
+[ $USBEMU = 1 ] && [ $OLDUSB = 1 ] && SIMFLAGS="--zlp-strict 512"
 OUT=$ROOT/out/rol
 mkdir -p "$OUT"
 T=$(mktemp -d /tmp/pdfs-rol.XXXXXX)
@@ -47,7 +53,8 @@ open(os.path.join(t, 'phone/int/Documents/Shopping list.txt'), 'w').write('milk\
 w('phone/int/Documents/Boarding pass.pdf', 80000)
 w('phone/sd/Movies/Holiday.mkv', 250000)
 w('w/rand,ffd', 100000); w('w/ToPhone/Archive,ffd', 100000)
-w('w/z500,ffd', 500)       # with its 12-byte header, one 512-byte packet: needs care on USB
+w('w/z500,ffd', 500)
+w('w/big6,ffd', 6 * 1048576 + 3)  # over 4MB: written through a scrap file       # with its 12-byte header, one 512-byte packet: needs care on USB
 open(os.path.join(t, 'w/local,fff'), 'w').write('a local text file\n')
 open(os.path.join(t, 'w/ToPhone/ReadMe,fff'), 'w').write('Written on RISC OS\nand copied by the Filer\n')
 PY
@@ -57,11 +64,14 @@ mv "$T/w/desktop,ffb" "$T/w/desk,ffb"
 cp "$MOD" "$T/w/PDFS,ffa"
 { echo "RMRun TESTDIR.PDFS"; cat "$HERE/cli-test.obey"; } > "$T/w/t,feb"
 # the work directory as RISC OS sees it (IXFS: '/' and '.' swap)
-sed -i "s|TESTDIR|IXFS:\$$(printf '%s' "$T/w" | tr './' '/.')|" "$T/w/t,feb"
+sed -i "s|TESTDIR|IXFS:\$$(printf '%s' "$T/w" | tr './' '/.')|g" "$T/w/t,feb"
 if [ $USBEMU = 1 ]; then
   # mount through the USB transport (a fake USB phone bridged to the simulator);
   # in the desktop the filer mounts it by itself
   sed -i 's/^PDFSMount 127.0.0.1:7015$/PDFSUSB\nPDFSMount/' "$T/w/t,feb"
+  [ $OLDUSB = 1 ] && sed -i '1i Set PDFSEmu$OldDriver 1' "$T/w/t,feb"
+  sed -i '1i Set PDFSEmu$MissingZLP 0' "$T/w/t,feb"
+  echo "Show PDFSEmu\$MissingZLP" >> "$T/w/t,feb"
   python3 - "$T/w/desk,ffb" <<'PY'
 import sys
 p = sys.argv[1]; b = open(p, "rb").read()
@@ -85,6 +95,8 @@ if [ $DESKTOP = 0 ]; then
   check '[ ! -e "$T/phone/int/Books" ]' "*Wipe R deletes a tree"
   check 'grep -q "0 errors, 0 recoveries" "$OUT/cli.txt"' "no transport errors"
   check 'cmp -s "$T/w/z500,ffd" "$T/phone/int/Download/z500"' "a 500-byte file (one 512-byte data phase)"
+  check 'cmp -s "$T/w/big6,ffd" "$T/phone/int/Download/big6"' "a 6MB file (through a scrap file)"
+  check '[ -d "$T/w/scrap/PDFS" ] && [ -z "$(ls -A "$T/w/scrap/PDFS")" ]' "the scrap file is deleted"
   check 'grep -q "^SimPhone-SD_card has been ejected$" "$OUT/cli.txt"' "*PDFSEject one storage"
   check 'grep -q "eject refused: .*Files on it are open" "$OUT/cli.txt"' "eject refused while a file is open"
   check 'grep -q "^SimPhone has been ejected: it can be unplugged" "$OUT/cli.txt" && grep -q "CloseSession\|op 1003" "$OUT/sim.log"' "*PDFSEject all closes the session"
@@ -92,6 +104,7 @@ if [ $DESKTOP = 0 ]; then
   if [ $USBEMU = 1 ]; then
     check 'grep -q "USB9 .*18D1:4EE1.*06/01/01" "$OUT/cli.txt" && grep -q "MTP" "$OUT/cli.txt"' "*PDFSUSB lists the phone as MTP"
     check 'grep -q "PDFSEmu\$ShortPackets : 0" "$OUT/cli.txt"' "no transfer ends with a short packet inside a container"
+    check 'grep -q "PDFSEmu\$MissingZLP : 0" "$OUT/cli.txt"' "every container ends with a short or zero-length packet"
     check 'grep -q "USB8 .*08/06/50" "$OUT/cli.txt" && grep -q "PDFS test SimPhone (USB USB9)" "$OUT/cli.txt"' "the memory stick is listed but not mounted; the phone is, over USB"
   fi
 else
@@ -105,6 +118,8 @@ else
   check 'grep -q "icon .*: Internal" "$T/w/results" && grep -q "icon .*: SD card" "$T/w/results"' "icon bar icons for both storages"
   check 'cmp -s "$T/w/local,fff" "$T/phone/sd/local.txt"' "a file dropped on the SD card's icon is copied there"
   check 'grep -q "ShowFree ok" "$T/w/results"' "*ShowFree (the icon menu's Free) works"
+  check 'grep -q "big file on phone: type 1 length 6291459" "$T/w/results" && cmp -s "$T/w/big6,ffd" "$T/phone/int/Download/big6"' "a 6MB file copied through a scrap file"
+  check 'grep -q "scrap directory type 2, files left: 0" "$T/w/results"' "no scrap files left"
   if [ $USBEMU = 1 ]; then
     check 'grep -q "icons after unplug: 0" "$T/w/results"' "unplugging the phone removes its icons"
   fi

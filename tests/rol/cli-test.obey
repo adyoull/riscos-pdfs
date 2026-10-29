@@ -5,6 +5,9 @@ CDir PDFS::SimPhone-Internal.$.Books
 CDir PDFS::SimPhone-Internal.$.Books.SF
 Copy rand PDFS::SimPhone-Internal.$.Books.SF.rand ~C~V
 Copy z500 PDFS::SimPhone-Internal.$.Download.z500 ~C~V
+CDir TESTDIR.scrap
+Set Wimp$ScrapDir TESTDIR.scrap
+Copy big6 PDFS::SimPhone-Internal.$.Download.big6 ~C~V
 Copy local PDFS::SimPhone-Internal.$.Books.Letter ~C~V
 Ex PDFS::SimPhone-Internal.$.Books
 Copy PDFS::SimPhone-Internal.$.Books.SF.rand back ~C~V

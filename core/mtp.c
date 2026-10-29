@@ -191,6 +191,42 @@ transaction (mtp_dev *d, uint16_t op, const uint32_t *params, int nparams,
   if (e < 0)
     return e;
 
+  if (out && d->fill)
+    {
+      /* Data from a callback, in pieces: each a whole number of USB packets
+         (64K), the last excepted, so no transfer ends early */
+      enum { PIECE = 65536 };
+      uint8_t *buf = pd_alloc (PIECE);
+      if (!buf)
+        return MTP_ENOMEM;
+      put32 (buf, 12 + outlen);
+      put16 (buf + 4, MTP_DATA);
+      put16 (buf + 6, op);
+      put32 (buf + 8, tid);
+      uint64_t off = 0;
+      uint32_t head = 12;
+      e = 0;
+      while (e >= 0 && (off < outlen || head))
+        {
+          uint32_t k = PIECE - head;
+          if (k > outlen - off)
+            k = (uint32_t) (outlen - off);
+          if (k && d->fill (d->fill_ctx, buf + head, off, k) < 0)
+            {
+              e = PDT_IO;
+              break;
+            }
+          d->tr->more = off + k < outlen;
+          e = d->tr->write (d->tr, buf, head + k, d->timeout_cs + (head + k) / 4096);
+          off += k;
+          head = 0;
+        }
+      d->tr->more = 0;
+      pd_free (buf);
+      if (e < 0)
+        return e;
+      goto response;
+    }
   if (out)
     {
       /* The data container travels as one transfer: header and payload
@@ -470,4 +506,17 @@ mtp_poll_event (mtp_dev *d, uint16_t *code, uint32_t *param1)
   *code = get16 (ev + 6);
   *param1 = n >= 16 ? get32 (ev + 12) : 0;
   return 1;
+}
+
+int
+mtp_transaction_fill (mtp_dev *d, uint16_t op, const uint32_t *params, int nparams,
+                      uint32_t outlen, mtp_fill_fn fill, void *ctx, uint32_t *rparams)
+{
+  static uint8_t mark[16];      /* "there is data": the callback gives it */
+  d->fill = fill;
+  d->fill_ctx = ctx;
+  int rc = mtp_transaction (d, op, params, nparams, mark + 12, outlen, 0, rparams);
+  d->fill = 0;
+  d->fill_ctx = 0;
+  return rc;
 }

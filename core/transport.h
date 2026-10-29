@@ -36,6 +36,9 @@ struct pd_transport
      byte and sends file data in two parts. 0, 0 for a stream (TCP). */
   uint32_t max_packet;
   int no_zlp;
+  /* Set by the MTP layer around write: 1 while more of the same container
+     follows this write (a container sent in pieces), 0 for its last. */
+  int more;
   /* Set by the transport when the device has been unplugged. */
   volatile int gone;
 };

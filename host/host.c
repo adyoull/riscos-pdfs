@@ -81,6 +81,69 @@ pd_filetype_to_ext (int type, char *buf)
   return 0;
 }
 
+/* --- scrap files (big files being written) ------------------------------------------ */
+
+static char spill_names[16][300];
+int spill_count;                /* open now (for tests) */
+
+int
+pd_spill_open (void)
+{
+  const char *dir = getenv ("PDFS_SPILL_DIR") ? getenv ("PDFS_SPILL_DIR") : "/tmp";
+  for (int i = 0; i < 16; i++)
+    if (!spill_names[i][0])
+      {
+        snprintf (spill_names[i], sizeof spill_names[i], "%s/pdfs-spill-XXXXXX", dir);
+        int fd = mkstemp (spill_names[i]);
+        if (fd < 0)
+          {
+            spill_names[i][0] = 0;
+            return 0;
+          }
+        spill_count++;
+        return fd + 1;
+      }
+  return 0;
+}
+
+int
+pd_spill_read (int h, uint64_t off, void *buf, uint32_t len)
+{
+  ssize_t k = pread (h - 1, buf, len, (off_t) off);
+  return k < 0 ? -1 : (int) k;
+}
+
+int
+pd_spill_write (int h, uint64_t off, const void *buf, uint32_t len)
+{
+  return pwrite (h - 1, buf, len, (off_t) off) == (ssize_t) len ? 0 : -1;
+}
+
+int
+pd_spill_setext (int h, uint64_t ext)
+{
+  return ftruncate (h - 1, (off_t) ext) == 0 ? 0 : -1;
+}
+
+void
+pd_spill_close (int h)
+{
+  char path[64];
+  snprintf (path, sizeof path, "/proc/self/fd/%d", h - 1);
+  char target[300];
+  ssize_t n = readlink (path, target, sizeof target - 1);
+  close (h - 1);
+  if (n > 0)
+    {
+      target[n] = 0;
+      unlink (target);
+      for (int i = 0; i < 16; i++)
+        if (!strcmp (spill_names[i], target))
+          spill_names[i][0] = 0;
+    }
+  spill_count--;
+}
+
 /* --- TCP transport ------------------------------------------------------------------- */
 
 typedef struct
