@@ -25,16 +25,20 @@ LDFLAGS := -nostdlib -static -Wl,--no-dynamic-linker -Wl,-T,riscos/module.ld \
            -Wl,--build-id=none -Wl,-z,norelro
 
 CORE := core/fs.c core/mtp.c
-OBJS := $(OBJ)/header.o $(OBJ)/module.o $(OBJ)/cmodule.o $(OBJ)/fs.o $(OBJ)/mtp.o
+OBJS := $(OBJ)/header.o $(OBJ)/module.o $(OBJ)/filer.o $(OBJ)/cmodule.o $(OBJ)/fs.o $(OBJ)/mtp.o
 
 all: $(OUT)/PDFS,ffa $(OUT)/pdfs-host
 
 $(OBJ):
 	mkdir -p $@
 
-$(OBJ)/header.o: riscos/header.s riscos/cmodule.inc | $(OBJ)
+$(OBJ)/resources.bin: tools/mksprites.py | $(OBJ)
+	python3 tools/mksprites.py $@
+$(OBJ)/header.o: riscos/header.s riscos/cmodule.inc $(OBJ)/resources.bin | $(OBJ)
 	$(AS) -I riscos -o $@ $<
-$(OBJ)/module.o: riscos/module.c riscos/cmodule.h core/pdfs.h core/plat.h core/transport.h | $(OBJ)
+$(OBJ)/filer.o: riscos/filer.c riscos/filer.h riscos/cmodule.h core/pdfs.h | $(OBJ)
+	$(CC) $(CFLAGS) -c -o $@ $<
+$(OBJ)/module.o: riscos/module.c riscos/filer.h riscos/cmodule.h core/pdfs.h core/plat.h core/transport.h | $(OBJ)
 	$(CC) $(CFLAGS) -c -o $@ $<
 $(OBJ)/cmodule.o: riscos/cmodule.c riscos/cmodule.h | $(OBJ)
 	$(CC) $(CFLAGS) -c -o $@ $<

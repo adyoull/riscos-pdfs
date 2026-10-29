@@ -64,11 +64,15 @@ if [ $DESKTOP = 0 ]; then
   check 'grep -q "0 errors, 0 recoveries" "$OUT/cli.txt"' "no transport errors"
 else
   : "${ROL_HARDDISC:?set ROL_HARDDISC to a HardDisc4 (desktop mode)}"
-  ROL_HARDDISC=$ROL_HARDDISC "$TB/bin/rol-run" -t 90 -w 45 -s "$OUT/desktop.png" -m "$MOD" -C "$T/w" -c 'Run desk' || true
+  ROL_HARDDISC=$ROL_HARDDISC "$TB/bin/rol-run" ${ROL_VERBOSE:+-v} -t 90 -w 45 -s "$OUT/desktop.png" -m "$MOD" -C "$T/w" -c 'Run desk' || true
   cat "$T/w/results"
   check 'cmp -s "$T/w/ToPhone/Archive,ffd" "$T/phone/int/Documents/ToPhone/Archive"' "Filer_Action copies a folder to the phone"
   check 'cmp -s "$T/w/IMG_20261029_0910.jpg" "$T/phone/int/DCIM/Camera/IMG_20261029_0910.jpg"' "Filer_Action copies a photo back"
   check 'grep -q "filetype C85" "$T/w/results"' "the photo is a JPEG on RISC OS"
+  check '[ -f "$T/phone/int/Documents/ToPhone/ReadMe.txt" ]' "a Text file copied by the Filer is ReadMe.txt on the phone"
+  check 'grep -q "icon .*: Internal" "$T/w/results" && grep -q "icon .*: SD card" "$T/w/results"' "icon bar icons for both storages"
+  check 'cmp -s "$T/w/local,fff" "$T/phone/sd/local.txt"' "a file dropped on the SD card's icon is copied there"
+  check 'grep -q "ShowFree ok" "$T/w/results"' "*ShowFree (the icon menu's Free) works"
   echo "screenshots: $OUT/desktop*.png"
 fi
 rm -rf "$T"

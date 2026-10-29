@@ -2237,6 +2237,31 @@ pdfs_disc_name (int i)
   return 0;
 }
 
+const pd_error *
+pdfs_free_space (const char *disc, uint64_t *size, uint64_t *free)
+{
+  storage *st = find_disc (disc, (int) strlen (disc));
+  if (!st)
+    return &err_nodisc;
+  const pd_error *e = storage_info (st);
+  if (e)
+    return e;
+  *size = st->capacity;
+  *free = st->free;
+  return 0;
+}
+
+const char *
+pdfs_disc_desc (int i)
+{
+  for (int d = 0; d < MAX_DEVICES; d++)
+    if (devices[d].used)
+      for (int s = 0; s < devices[d].nst; s++)
+        if (i-- == 0)
+          return devices[d].st[s].desc;
+  return 0;
+}
+
 static char *
 cat (char *o, const char *s)
 {

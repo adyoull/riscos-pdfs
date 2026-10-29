@@ -12,7 +12,7 @@
 	.section .text.header, "ax"
 	.global	module_start
 module_start:
-	.word	0				@ start
+	.word	pd_start - module_start		@ start: the filer task
 	.word	cm_init - module_start
 	.word	cm_final - module_start
 	.word	pd_service - module_start
@@ -82,12 +82,59 @@ fs_return:
 	msr	APSR_nzcvq, #0x10000000		@ V set
 	mov	pc, lr
 
-@ Service call handler: only Service_FSRedeclare (&40) matters, so
-@ reject everything else quickly before going to C.
+@ Service call handler: reject all but the ones that matter quickly:
+@ Reset (&27), FSRedeclare (&40), StartWimp (&49), StartedWimp (&4A),
+@ ResourceFSStarting (&60).
 pd_service:
 	teq	r1, #0x40
+	teqne	r1, #0x27
+	teqne	r1, #0x49
+	teqne	r1, #0x4A
+	teqne	r1, #0x60
 	movne	pc, lr
 	b	cm_service
+
+@ Module start code: the filer task, entered in USR mode by
+@ *Desktop_PDFSFiler. Runs on its own stack in the RMA.
+pd_start:
+	ldr	r1, 2f
+1:	add	r1, r1, pc
+	ldr	sp, [r1]
+	bl	filer_main
+	swi	0x11				@ OS_Exit (filer_main doesn't return)
+2:	.word	filer_sp - (1b + 8)
+
+@ The Free module's call for free space (Free_Register): r0-r11 as a
+@ block for free_entry, which returns 1 to set Z (reason 3: same device).
+@ Free calls it with the return address pushed on the stack, not in lr
+@ (Push PC; LDR PC, entry), so it returns with Pull PC.
+	.global	pd_free_entry
+pd_free_entry:
+	stmfd	sp!, {r0-r11}
+	mov	r0, sp
+	bl	free_entry
+	cmp	r0, #1
+	ldmfd	sp!, {r0-r11}
+	ldmfd	sp!, {pc}
+
+@ ResourceFS's call to re-register our files (Service_ResourceFSStarting):
+@ void call_resourcefs(void *code, void *ws, const void *files)
+	.global	call_resourcefs
+call_resourcefs:
+	stmfd	sp!, {r4-r12, lr}
+	mov	r12, r1
+	mov	r3, r0
+	mov	r0, r2
+	mov	lr, pc
+	mov	pc, r3
+	ldmfd	sp!, {r4-r12, pc}
+
+@ The ResourceFS block (tools/mksprites.py): Resources.PDFS.Sprites
+	.global	resource_files
+	.align	2
+resource_files:
+	.incbin	"out/obj/resources.bin"
+	.align	2
 
 @ *commands
 commands:
@@ -133,8 +180,17 @@ commands:
 	.word	syn_ext - module_start
 	.word	help_ext - module_start
 
+	.asciz	"Desktop_PDFSFiler"
+	.align	2
+	.word	cm_command_6 - module_start
+	.word	0x00000000
+	.word	syn_desk - module_start
+	.word	help_desk - module_start
+
 	.word	0
 
+help_desk:	.asciz	"*Desktop_PDFSFiler starts PDFS's icon bar filer. The desktop starts it; after loading PDFS in the desktop, use *WimpTask Desktop_PDFSFiler."
+syn_desk:	.asciz	"Syntax: *Desktop_PDFSFiler"
 help_ext:	.asciz	"*PDFSExtensions sets how names with a filetype extension are shown: hide (the default) shows Letter.txt as Letter, a Text file; show shows it as Letter/txt. Files saved from RISC OS always get the extension for their type, or ,xxx if it has none."
 syn_ext:	.asciz	"Syntax: *PDFSExtensions [show|hide]"
 help_pdfs:	.asciz	"*PDFS selects the Portable Device Filing System as the current filing system."
@@ -157,3 +213,4 @@ syn_log:	.asciz	"Syntax: *PDFSLog [on|off|trace]"
 	CM_COMMAND 3
 	CM_COMMAND 4
 	CM_COMMAND 5
+	CM_COMMAND 6

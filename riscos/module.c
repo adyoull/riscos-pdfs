@@ -5,12 +5,17 @@
 #include "cmodule.h"
 #include "../core/pdfs.h"
 #include "../core/plat.h"
+#include "filer.h"
 
 #define OS_Word                 0x07
 #define OS_FSControl            0x29
 #define OS_ReadMonotonicTime    0x42
 #define XReport_Text0           (0x20000 | 0x54C80)
 #define OS_SWINumberFromString  0x39
+#define Wimp_StartTask          0x400DE
+#define Wimp_ReadSysInfo        0x400F2
+#define ResourceFS_RegisterFiles   0x41B40
+#define ResourceFS_DeregisterFiles 0x41B41
 #define Socket_Creat            0x41200
 #define Socket_Connect          0x41204
 #define Socket_Recv             0x41205
@@ -20,6 +25,12 @@
 
 extern char module_start[], fs_info_block[];
 static void *private_word;
+
+
+/* in header.s */
+extern const char resource_files[];
+void call_resourcefs (void *code, void *ws, const void *files);
+
 
 /* --- memory ---------------------------------------------------------------------- */
 
@@ -222,6 +233,7 @@ typedef struct
 ERROR_BLOCK (err_connect, 0x1FAC0, "Can't connect to the simulated device");
 ERROR_BLOCK (err_syntax, 0x1FAC1, "Give an address as a.b.c.d:port");
 ERROR_BLOCK (err_nomem, 0x1FAB8, "Not enough memory");
+ERROR_BLOCK (err_desktop, 0x1FAC3, "Use *Desktop to start the PDFS filer");
 ERROR_BLOCK (err_ext_syntax, 0x1FAC2, "Syntax: *PDFSExtensions [show|hide]");
 
 static int
@@ -390,13 +402,34 @@ mod_init (const char *tail, int instance, void *pw)
   if (!swix_regs (OS_SWINumberFromString, &s))
     mimemap_translate = s.r[0];
   pd_log ("PDFS " PDFS_VERSION " started");
-  return add_fs ();
+  oserror *e = add_fs ();
+  if (e)
+    return e;
+  regs rf = {{ (unsigned) resource_files }};
+  swix_regs (ResourceFS_RegisterFiles, &rf);
+  /* Loaded by a task in the desktop (*RMLoad in a task window, say): start
+     the filer now. In other contexts the Wimp refuses; then it starts with
+     the desktop (Service_StartWimp) or *WimpTask Desktop_PDFSFiler. */
+  regs w = {{ 3 }};
+  if (!swix_regs (Wimp_ReadSysInfo, &w) && w.r[0])
+    {
+      filer_prepare (private_word);
+      filer_task = -1;
+      regs st = {{ (unsigned) "Desktop_PDFSFiler" }};
+      swix_regs (Wimp_StartTask, &st);
+      if (filer_task == -1)     /* it didn't start: the module isn't linked in yet, say */
+        filer_task = 0;
+    }
+  return 0;
 }
 
 oserror *
 mod_final (int fatal)
 {
   (void) fatal;
+  filer_finalise ();
+  regs rf = {{ (unsigned) resource_files }};
+  swix_regs (ResourceFS_DeregisterFiles, &rf);
   pdfs_finish ();
   regs r = {{ 16, (unsigned) "PDFS" }};
   swix_regs (OS_FSControl, &r);
@@ -414,9 +447,32 @@ mod_swi (unsigned number, regs *r)
 void
 mod_service (regs *r)
 {
-  if (r->r[1] == 0x40)            /* Service_FSRedeclare */
-    add_fs ();
+  switch (r->r[1])
+    {
+    case 0x40:                      /* Service_FSRedeclare */
+      add_fs ();
+      break;
+    case 0x49:                      /* Service_StartWimp */
+      if (filer_task == 0 && !filer_prepare (private_word))
+        {
+          filer_task = -1;
+          r->r[0] = (unsigned) "Desktop_PDFSFiler";
+          r->r[1] = 0;
+        }
+      break;
+    case 0x4A:                      /* Service_StartedWimp */
+      if (filer_task == -1)
+        filer_task = 0;
+      break;
+    case 0x27:                      /* Service_Reset */
+      filer_task = 0;
+      break;
+    case 0x60:                      /* Service_ResourceFSStarting */
+      call_resourcefs ((void *) r->r[2], (void *) r->r[3], resource_files);
+      break;
+    }
 }
+
 
 static void
 line (const char *s)
@@ -489,6 +545,18 @@ mod_command (int index, const char *tail, int argc)
           newline ();
         }
       return 0;
+    case 6:                         /* *Desktop_PDFSFiler */
+      {
+        /* from Service_StartWimp (-1), or *WimpTask Desktop_PDFSFiler
+           in the desktop when it isn't running */
+        regs w = {{ 3 }};
+        if (filer_task > 0 || (filer_task == 0 && (swix_regs (Wimp_ReadSysInfo, &w) || !w.r[0])))
+          return ERR (err_desktop);
+        filer_prepare (private_word);
+        filer_task = -1;
+        regs r = {{ 2, (unsigned) "PDFS", (unsigned) tail }};
+        return swix_regs (OS_Module, &r);
+      }
     case 4:                         /* *PDFSLog */
       if (argc && word_is (tail, "on"))
         logging = 1;

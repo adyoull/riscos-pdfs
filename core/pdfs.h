@@ -30,6 +30,8 @@ const pd_error *pdfs_mount (pd_transport *tr);      /* takes ownership of tr */
 const pd_error *pdfs_dismount (const char *disc);   /* disc name, or "" for all */
 int pdfs_disc_count (void);
 const char *pdfs_disc_name (int i);                 /* NULL past the end */
+const char *pdfs_disc_desc (int i);
+const pd_error *pdfs_free_space (const char *disc, uint64_t *size, uint64_t *free);                 /* the storage's description ("SD card") */
 /* Write a description of the mounted devices, one line at a time. */
 void pdfs_describe (void (*line) (const char *s));
 /* Called now and then (from a callback or ticker on RISC OS): poll events. */
