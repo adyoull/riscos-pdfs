@@ -119,6 +119,8 @@ IF inticon%>=0 THEN
   SYS "Wimp_CreateMenu",,-1
 ENDIF
 REM unplug (the USB emulator's device handle is &9999)
+REM (the USB emulator: the output stream's first close fails, as on a Pi)
+OSCLI "Set PDFSEmu$CloseFails 1"
 SYS "OS_ServiceCall",,&79,&9999,"USB9"
 PROCwait(300)
 n%=0
@@ -128,6 +130,8 @@ FOR i%=0 TO 60
   IF (f% AND 1)=0 THEN IF (b%!24 AND &101)=&101 THEN IF FNstr(b%!32)="Spdfs_dev" THEN n%+=1
 NEXT
 PROClog("icons after unplug: "+STR$n%)
+SYS "XOS_ReadVarVal","PDFSEmu$Open",b%,64,0,0 TO ,,l%;f%
+IF (f% AND 1)=0 THEN b%?l%=13:PROClog("streams open after unplug: "+FNstr(b%))
 OSCLI "TBShot"
 PROClog("done")
 CLOSE#log%

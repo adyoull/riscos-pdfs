@@ -35,6 +35,7 @@
 typedef struct
 {
   int used, output, ep;
+  int close_failed;         /* PDFSEmu$CloseFails: its first close failed */
   unsigned flags;           /* Get/Set Options: bit 1 'short' */
   unsigned cap, len;        /* buffer size and bytes in it */
   uint8_t *buf;
@@ -237,6 +238,7 @@ open_fake (const char *path, int output)
         if (!s->buf)
           return -1;
         s->used = 1;
+        s->close_failed = 0;
         s->flags = 0;
         s->output = output;
         s->len = 0;
@@ -317,8 +319,23 @@ usbemu_swix (unsigned swi, regs *r)
     case OS_Find:
       if (r->r[0] == 0 && (s = fake (r->r[1])))
         {
+          /* PDFSEmu$CloseFails set: an output stream's first close fails, as
+             FileSwitch's does for a written-to DeviceFS stream whose device
+             has just gone (the stream stays open) */
+          regs v = {{ (unsigned) "PDFSEmu$CloseFails", 0, (unsigned) -1, 0, 0 }};
+          swix_regs (0x23, &v);
+          if ((int) v.r[2] < 0 && s->output && !s->close_failed)
+            {
+              static const struct { int n; char m[32]; } err = { 0x819C00, "USB transfer failed: IO Error" };
+              s->close_failed = 1;
+              return (oserror *) &err;
+            }
           pd_free (s->buf);
           s->used = 0;
+          int open = 0;
+          for (int i = 0; i < NSTREAM; i++)
+            open += streams[i].used;
+          set_count ("PDFSEmu$Open", (unsigned) open);
           return 0;
         }
       if (r->r[0] != 0)
@@ -329,6 +346,15 @@ usbemu_swix (unsigned swi, regs *r)
               r->r[0] = (unsigned) h;
               return 0;
             }
+        }
+      break;
+
+    case 0x09:                                   /* OS_Args 254: a fake is on DeviceFS (53) */
+      if (r->r[0] == 254 && (s = fake (r->r[1])))
+        {
+          r->r[0] = 0;
+          r->r[2] = 53;
+          return 0;
         }
       break;
 
