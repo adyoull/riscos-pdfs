@@ -100,6 +100,7 @@ E (err_badhandle, 0xDE, "Channel");
 static pd_error err_device;    /* a response code from the device, with its number */
 
 static const char hexd[] = "0123456789ABCDEF";
+static char *cat_num (char *o, uint64_t v);
 
 static const pd_error *
 rc_error (int rc)
@@ -1498,7 +1499,9 @@ read_dir_entries (pd_regs *r, int info)
       count++;
     }
   r->r[3] = count;
-  r->r[4] = c ? (pd_reg) idx : (pd_reg) -1;
+  /* FileSwitch (Util_ReadDirEntry, used by *Wipe and *Copy) ignores any
+     entries returned with R4 = -1: say "end" only on a call that reads none */
+  r->r[4] = (c || count) ? (pd_reg) idx : (pd_reg) -1;
   return 0;
 }
 
@@ -1695,21 +1698,68 @@ poll_events (void)
     }
 }
 
+int pdfs_trace = 0;
+
+/* One log line per call that names an object: "File 6 :disc.$.a -> error" */
+static void
+trace (int entry, pd_regs *r, const pd_regs *out, const pd_error *e)
+{
+  static const char names[][6] = { "Open", "Get", "Put", "Args", "Close", "File", "Func" };
+  char b[200], *p = b;
+  if (!pdfs_trace || entry == PD_GETBYTES || entry == PD_PUTBYTES)
+    return;
+  for (const char *q = names[entry]; *q; q++)
+    *p++ = *q;
+  *p++ = ' ';
+  unsigned v = (unsigned) r->r[0];
+  if (entry == PD_ARGS || entry == PD_CLOSE)
+    v = entry == PD_ARGS ? v : 0;
+  p = cat_num (p, v);
+  if (entry == PD_OPEN || entry == PD_FILE || (entry == PD_FUNC && v != 23))
+    {
+      const char *path = (const char *) r->r[1];
+      *p++ = ' ';
+      for (int i = 0; path && path[i] >= ' ' && p < b + 150; i++)
+        *p++ = path[i];
+    }
+  if (!e && entry == PD_FUNC && (v == 14 || v == 15))
+    {
+      *p++ = ' '; *p++ = 'n'; *p++ = '=';
+      p = cat_num (p, (unsigned) out->r[3]);
+      *p++ = ' '; *p++ = 'o'; *p++ = '=';
+      p = cat_num (p, (unsigned) out->r[4]);
+    }
+  if (e)
+    {
+      const char *m = " -> ";
+      while (*m)
+        *p++ = *m++;
+      for (int i = 0; e->errmess[i] && p < b + sizeof b - 1; i++)
+        *p++ = e->errmess[i];
+    }
+  *p = 0;
+  pd_log (b);
+}
+
 const pd_error *
 pdfs_fs_entry (int entry, pd_regs *r)
 {
+  const pd_error *e;
+  pd_regs in = *r;
   poll_events ();
   switch (entry)
     {
-    case PD_OPEN: return fs_open (r);
-    case PD_GETBYTES: return fs_getbytes (r);
-    case PD_PUTBYTES: return fs_putbytes (r);
-    case PD_ARGS: return fs_args (r);
-    case PD_CLOSE: return fs_close (r);
-    case PD_FILE: return fs_file (r);
-    case PD_FUNC: return fs_func (r);
+    case PD_OPEN: e = fs_open (r); break;
+    case PD_GETBYTES: e = fs_getbytes (r); break;
+    case PD_PUTBYTES: e = fs_putbytes (r); break;
+    case PD_ARGS: e = fs_args (r); break;
+    case PD_CLOSE: e = fs_close (r); break;
+    case PD_FILE: e = fs_file (r); break;
+    case PD_FUNC: e = fs_func (r); break;
+    default: e = &err_unsupported;
     }
-  return &err_unsupported;
+  trace (entry, &in, r, e);
+  return e;
 }
 
 void

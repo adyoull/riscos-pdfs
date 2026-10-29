@@ -491,6 +491,8 @@ main (int argc, char **argv)
     }
   if (getenv ("PDFS_TIMEOUT_CS"))
     pdfs_timeout_cs = (unsigned) atoi (getenv ("PDFS_TIMEOUT_CS"));
+  if (getenv ("PDFS_TRACE"))
+    pdfs_trace = 1;
   pd_transport *t = tcp_open (argv[1]);
   if (!t)
     {
