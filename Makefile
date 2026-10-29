@@ -2,12 +2,18 @@
 #
 #   make              out/PDFS,ffa (the RISC OS module) and out/pdfs-host
 #   make check        host tests against the simulator (tests/host_test.py)
+#   make dist         out/PDFS-$(VERSION).zip, for RISC OS (filetypes kept)
 #
-# RISCOS_TOOLCHAIN: riscos-crossdev's toolchain (default ../riscos-crossdev/toolchain/env)
+# RCD_DIR: riscos-crossdev (default ../riscos-crossdev); RISCOS_TOOLCHAIN:
+# its toolchain (default $(RCD_DIR)/toolchain/env). Both are set in
+# riscos-crossdev's container image.
 #
 # Copyright 2026 Andrew Youll. Licensed under the Apache License, Version 2.0.
 
-RISCOS_TOOLCHAIN ?= $(abspath ../riscos-crossdev/toolchain/env)
+RCD_DIR ?= $(abspath ../riscos-crossdev)
+RISCOS_TOOLCHAIN ?= $(RCD_DIR)/toolchain/env
+RELEASE_SUFFIX ?= -beta
+VERSION := $(shell sed -n 's/^\#define PDFS_VERSION "\(.*\)"/\1/p' core/pdfs.h)$(RELEASE_SUFFIX)
 T := $(RISCOS_TOOLCHAIN)/bin/arm-riscos-gnueabihf-
 CC := $(T)gcc
 AS := $(T)as
@@ -94,7 +100,19 @@ $(OUT)/pdfs-host: host/host.c $(CORE) core/*.h
 check: $(OUT)/pdfs-host
 	python3 tests/host_test.py $(OUT)/pdfs-host
 
+# The release zip: the module, the README, the licence and the Pi testing notes
+dist: $(OUT)/PDFS,ffa
+	rm -rf $(OUT)/dist && mkdir -p $(OUT)/dist/PDFS
+	cp $(OUT)/PDFS,ffa $(OUT)/dist/PDFS/PDFS,ffa
+	cp README.md CHANGELOG.md $(OUT)/dist/PDFS/
+	cp LICENSE $(OUT)/dist/PDFS/LICENSE,fff
+	cp docs/TESTING-ON-A-PI.md $(OUT)/dist/PDFS/Testing.md
+	cp docs/REFERENCES.md $(OUT)/dist/PDFS/References.md
+	rm -f $(OUT)/PDFS-$(VERSION).zip
+	python3 $(RCD_DIR)/package/rozip.py $(OUT)/PDFS-$(VERSION).zip -C $(OUT)/dist PDFS
+	@echo "made $(OUT)/PDFS-$(VERSION).zip"
+
 clean:
 	rm -rf $(OUT)
 
-.PHONY: all check clean
+.PHONY: all check clean dist

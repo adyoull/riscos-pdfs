@@ -1,5 +1,5 @@
 REM PDFS desktop test: Filer windows on a simulated phone, copy with Filer_Action
-log%=0:icon%=-1:maxgap%=0
+log%=0:icon%=-1:inticon%=-1:maxgap%=0
 ON ERROR PROClog("Error: "+REPORT$+" at line "+STR$ERL):END
 DIM b% 1024, n% 256
 SYS "Wimp_Initialise",310,&4B534154,"PDFS test",0 TO ,me%
@@ -64,6 +64,7 @@ FOR i%=0 TO 60
   IF (f% AND 1)=0 THEN
     IF (b%!24 AND &101)=&101 THEN
       IF FNstr(b%!32)="Spdfs_dev" THEN PROClog("icon "+STR$i%+": "+FNstr(b%!28)):IF FNstr(b%!28)="SD card" THEN icon%=i%
+      IF FNstr(b%!32)="Spdfs_dev" AND FNstr(b%!28)="Internal" THEN inticon%=i%
     ENDIF
   ENDIF
 NEXT
@@ -108,6 +109,15 @@ SYS "XOS_CLI","ShowFree -fs PDFS SimPhone-Internal" TO e%;f%
 IF f% AND 1 THEN PROClog("ShowFree: "+FNstr(e%+4)) ELSE PROClog("ShowFree ok")
 PROCwait(200)
 OSCLI "TBShot"
+REM the icon's menu (MENU on Internal): a screenshot
+IF inticon%>=0 THEN
+  b%!0=120:b%!4=40:b%!8=2:b%!12=-2:b%!16=inticon%
+  SYS "Wimp_SendMessage",6,b%,-2,inticon%
+  PROCwait(100)
+  OSCLI "TBShot"
+  PROClog("shot: icon menu")
+  SYS "Wimp_CreateMenu",,-1
+ENDIF
 REM unplug (the USB emulator's device handle is &9999)
 SYS "OS_ServiceCall",,&79,&9999,"USB9"
 PROCwait(300)

@@ -5,12 +5,33 @@ MTP (Media Transfer Protocol). A connected device's storages show up as
 discs, such as `PDFS::Pixel-Internal.$`, and work with the Filer, `*Copy`,
 BASIC's OPENIN/OPENOUT and every program that uses FileSwitch.
 
-Status: **0.13.** USB (the RISC OS 5 USB stack), the icon bar filer and
-filetype extensions are done. It's tested against a simulated device, over
-TCP and through an emulation of USBDriver and DeviceFS; it still has to be
-tried with more real devices (see docs/TESTING-ON-A-PI.md).
+Status: **0.14 beta.** It works with an Android phone (a Pixel) on a
+Raspberry Pi with RISC OS 5: browsing, copying both ways with the Filer,
+big files and unplugging. It's tested against a simulated device
+too, over TCP and through an emulation of USBDriver and DeviceFS. Reports
+from other devices (tablets, cameras, media players) and machines are
+welcome: see docs/TESTING-ON-A-PI.md.
 
-Licence: Apache 2.0 (see LICENSE). It contains no GPL code.
+Licence: Apache 2.0 (see LICENSE). What it was written from (specifications,
+RISC OS documentation and sources read): docs/REFERENCES.md.
+
+![A device's storages on the icon bar, and Filer windows on them](docs/images/devices.png)
+
+## Screenshots
+
+From riscos-linux-testbed (RISC OS 5 for Linux) with the simulated device
+(`sim/mtpsim.py`), as the desktop test takes them.
+
+| | |
+|---|---|
+| ![Filer_Action copying a folder to the device](docs/images/copying.png) | ![The icon's menu, and the Free window](docs/images/menu-and-free.png) |
+| Filer_Action copying a folder to the device: its own window counts the bytes down as the device takes them | The icon's menu (Open, Free, Eject, Eject all) and the Free window |
+
+## Installing
+
+Unzip `PDFS-0.14-beta.zip` (from the GitHub release) and double-click
+`PDFS` to load it, or put `RMLoad <path>.PDFS` in a boot file. RISC OS 5
+with its USB stack is needed for devices on USB.
 
 ## Layout
 
@@ -26,16 +47,29 @@ Licence: Apache 2.0 (see LICENSE). It contains no GPL code.
 | `tools/mksprites.py` | draws the drive icon and makes the ResourceFS block |
 | `host/host.c` | `pdfs-host`: the same core on Linux, driven from the command line, for tests |
 | `sim/mtpsim.py` | a simulated MTP device over TCP; host folders are its storages |
-| `tests/host_test.py` | 163 host tests against four kinds of device and a stalled one |
+| `tests/host_test.py` | 307 host tests against several kinds of simulated device |
 | `tests/rol/` | tests in RISC OS for Linux (riscos-linux-testbed): CLI and desktop, over TCP or emulated USB (`usbemu.c`) |
 
 ## Building
 
-Needs riscos-crossdev's toolchain (`RISCOS_TOOLCHAIN`, default
-`../riscos-crossdev/toolchain/env`) and gcc for the host build.
+Needs riscos-crossdev (`RCD_DIR`, default `../riscos-crossdev`; its
+toolchain, `RISCOS_TOOLCHAIN`, default `$RCD_DIR/toolchain/env`), and gcc
+and Python 3 for the host build and tests.
 
     make            # out/PDFS,ffa and out/pdfs-host
     make check      # host tests
+    make dist       # out/PDFS-<version>-beta.zip, filetypes kept
+
+Or in riscos-crossdev's container image:
+
+    docker run --rm -v "$PWD":/src -w /src ghcr.io/adyoull/riscos-crossdev:1.8.2 make all check dist
+
+## Building on GitHub
+
+`.github/workflows/riscos-build.yml` builds, runs the host tests and keeps
+the zip for every push and pull request, in riscos-crossdev's image (the
+version in `.riscos-deps`). `riscos-deps-update.yml` checks each day for a
+newer riscos-crossdev and opens a pull request when one builds.
 
 ## Using it
 
@@ -64,6 +98,7 @@ Outside the desktop:
 | `*PDFSDismount [<disc>]` | disconnect at once |
 | `*PDFSExtensions [show\|hide]` | how names with a type extension are shown |
 | `*PDFSLog [on\|off\|trace]` | the log; trace logs every FileSwitch call (also to Reporter) |
+| `*PDFSBackground [on\|off]` | send big new files in the background, after the program has written them (off) |
 
 Paths are `PDFS::<Model>-<Storage>.$.…`, e.g. `PDFS::Pixel_7-Internal.$.DCIM`.
 
