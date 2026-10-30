@@ -135,6 +135,7 @@ static pd_error err_device;    /* a response code from the device, with its numb
 static const char hexd[] = "0123456789ABCDEF";
 static char *cat_num (char *o, uint64_t v);
 static char *cat (char *o, const char *s);
+extern int pdfs_trace;
 
 static const pd_error *
 rc_error (int rc)
@@ -1043,12 +1044,47 @@ list_dir (node *dir)
       pd_free (got);
     }
 
-  /* 4. into the directory cache */
+  /* 4. into the directory cache. Never a folder inside itself or inside
+     one of its own children (whatever the device says): an object that's
+     this folder or one above it, or that says its parent is another
+     folder, is left out (and logged) */
   {
     static unsigned seq;
     uint32_t mark = ++seq;
+    if (pdfs_trace)
+      {
+        char b[120], *q = cat (b, "list ");
+        q = cat_num (q, dir->handle);
+        q = cat (q, ": ");
+        q = cat_num (q, nh);
+        q = cat (q, have_handles ? " handles, " : " (no handle list), ");
+        q = cat_num (q, (uint64_t) ne);
+        cat (q, " objects");
+        pd_log (b);
+      }
     for (int i = 0; i < ne; i++)
-      apply_entry (dir, &es[i], mark);
+      {
+        entry *x = &es[i];
+        int bad = 0;
+        for (node *a = dir; a && !bad; a = a->parent)
+          bad = a != &st->root && a->handle == x->handle;
+        if (!root && x->parent && x->parent != 0xFFFFFFFFu && x->parent != dir->handle)
+          bad = 1;
+        if (bad)
+          {
+            char b[340], *q = cat (b, "list: left out ");
+            q = cat_num (q, x->handle);
+            q = cat (q, " '");
+            q = cat (q, x->name);
+            q = cat (q, "', parent ");
+            q = cat_num (q, x->parent);
+            q = cat (q, ", in ");
+            cat_num (q, dir->handle);
+            pd_log (b);
+            continue;
+          }
+        apply_entry (dir, x, mark);
+      }
     pd_free (es);
     /* names shown with their suffixes because of a clash: check again */
     for (node *c = dir->child; c; c = c->next)

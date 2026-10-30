@@ -18,6 +18,8 @@ Options for testing PDFS's behaviour:
                       lists the folder itself among its children, and leaves
                       out every child after the first two (GetObjectHandles
                       is still right)
+    --loop-handles    a folder's GetObjectHandles and property list include
+                      the folder itself and the folder above it
     --zlp-strict N    fail data phases that are a multiple of N bytes (USB
                       without zero-length packets)
     --delay-ms N      sleep N ms before each response (a slow device)
@@ -251,6 +253,12 @@ class Device:
                 if d is None:
                     return INVALID_PARENT, [], None
                 hs += self.children(sid, d)
+                if self.args.loop_handles and P[2] not in (0, 0xFFFFFFFF):
+                    # the folder itself, and the folder above it, among its children
+                    hs = [P[2]] + hs
+                    up = os.path.dirname(d)
+                    if up in self.paths:
+                        hs.append(self.paths[up])
             if code == OP["GetNumObjects"]:
                 return OK, [len(hs)], None
             return OK, [], struct.pack("<I", len(hs)) + b"".join(struct.pack("<I", h) for h in hs)
@@ -276,6 +284,8 @@ class Device:
                     objs = self.children(v[0], v[1])
                     if self.args.odd_proplist:
                         objs = [h] + objs[:2]
+                    if self.args.loop_handles:
+                        objs = [h] + objs
             else:
                 return DEPTH_UNSUPPORTED, [], None
             els = []
@@ -495,6 +505,7 @@ def main():
     ap.add_argument("--no-edit", action="store_true")
     ap.add_argument("--no-rename", action="store_true")
     ap.add_argument("--odd-proplist", action="store_true")
+    ap.add_argument("--loop-handles", action="store_true")
     ap.add_argument("--zlp-strict", type=int, default=0, metavar="N")
     ap.add_argument("--delay-ms", type=int, default=0)
     ap.add_argument("--rate", type=int, default=0, metavar="KB/S", help="receive this fast")

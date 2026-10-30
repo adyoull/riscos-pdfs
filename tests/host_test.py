@@ -419,6 +419,24 @@ def odd():
         s.stop()
 
 
+def loops():
+    print("== a device that lists a folder, or the folder above it, among its children")
+    s = Sim("--loop-handles")
+    try:
+        d = local(s, "Files by Google", "Inner")
+        os.makedirs(d)
+        open(os.path.join(d, "x.txt"), "w").write("x")
+        nb = "Files\xa0by\xa0Google"
+        r = s.run(["ls", D + "." + nb], ["ls", D + "." + nb + ".Inner"])
+        parts = r.stdout.split("entries")
+        ok(r.returncode == 0 and len(parts) >= 3
+           and "Files" not in parts[0] and "Inner" in parts[0]
+           and "Inner" not in parts[1] and "Files" not in parts[1] and " x " in parts[1],
+           "a folder never shows itself or the folder above it")
+    finally:
+        s.stop()
+
+
 def main():
     random.seed(1)
     if not os.path.exists(HOST):
@@ -430,6 +448,7 @@ def main():
     suite(["--no-rename"])
     suite(["--odd-proplist"])
     odd()
+    loops()
     recovery()
     zlp()
     big()
