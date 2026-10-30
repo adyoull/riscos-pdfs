@@ -24,6 +24,10 @@ Task Manager, start the filer with `*WimpTask Desktop_PDFSFiler`.
 
 - Android: plug it in, pull down the notification "Charging this device via
   USB" and choose **File transfer**. The phone reconnects as an MTP device.
+  Set to *Charging only*, a phone may show an MTP interface that never
+  answers: PDFS gives up on it after 3 seconds (*PDFSLog says "the device
+  isn't taking anything in") and mounts it once it's switched to File
+  transfer.
 - iPhone: unlock it and choose Trust (PTP only: photos, read-only).
 - Cameras: switch them to PTP/MTP or "PC connection".
 

@@ -5,9 +5,10 @@ MTP (Media Transfer Protocol). A connected device's storages show up as
 discs, such as `PDFS::Pixel-Internal.$`, and work with the Filer, `*Copy`,
 BASIC's OPENIN/OPENOUT and every program that uses FileSwitch.
 
-Status: **0.14 beta.** It works with an Android phone (a Pixel) on a
+Status: **0.15 beta.** It works with an Android phone (a Pixel) on a
 Raspberry Pi with RISC OS 5: browsing, copying both ways with the Filer,
-big files and unplugging. It's tested against a simulated device
+big files, unplugging, and switching the phone between charging and file
+transfer. It's tested against a simulated device
 too, over TCP and through an emulation of USBDriver and DeviceFS. Reports
 from other devices (tablets, cameras, media players) and machines are
 welcome: see docs/TESTING-ON-A-PI.md.
@@ -35,8 +36,11 @@ From riscos-linux-testbed (RISC OS 5 for Linux) with the simulated device
 
 ## Installing
 
-Unzip `PDFS-0.14-beta.zip` (from the GitHub release) and double-click
-`PDFS` to load it, or put `RMLoad <path>.PDFS` in a boot file. RISC OS 5
+With PackMan: add the source https://adyoull.github.io/riscos-packages/pkg/index
+and install **PDFS**. It goes in !Boot's PreDesk, so it's loaded at start-up.
+
+Or unzip `PDFS-0.15-beta.zip` (from the GitHub release) and double-click
+`PDFS` to load it, or put it in `!Boot.Choices.Boot.PreDesk`. RISC OS 5
 with its USB stack is needed for devices on USB.
 
 ## Layout
@@ -53,7 +57,7 @@ with its USB stack is needed for devices on USB.
 | `tools/mksprites.py` | draws the drive icon and makes the ResourceFS block |
 | `host/host.c` | `pdfs-host`: the same core on Linux, driven from the command line, for tests |
 | `sim/mtpsim.py` | a simulated MTP device over TCP; host folders are its storages |
-| `tests/host_test.py` | 307 host tests against several kinds of simulated device |
+| `tests/host_test.py` | 358 host tests against several kinds of simulated device |
 | `tests/rol/` | tests in RISC OS for Linux (riscos-linux-testbed): CLI and desktop, over TCP or emulated USB (`usbemu.c`) |
 
 ## Building
@@ -62,7 +66,7 @@ Needs riscos-crossdev (`RCD_DIR`, default `../riscos-crossdev`; its
 toolchain, `RISCOS_TOOLCHAIN`, default `$RCD_DIR/toolchain/env`), and gcc
 and Python 3 for the host build and tests.
 
-    make            # out/PDFS,ffa and out/pdfs-host
+    make            # out/PDFS,ffa, out/PDFS-usbemu,ffa (for the tests) and out/pdfs-host
     make check      # host tests
     make dist       # out/PDFS-<version>-beta.zip, filetypes kept
 
@@ -115,7 +119,8 @@ and `*PDFSMount 127.0.0.1:7015`.
 
     TB=../riscos-linux-testbed RCD_DIR=../riscos-crossdev tests/rol/run.sh
     TB=... RCD_DIR=... ROL_HARDDISC=.../HardDisc4 tests/rol/run.sh --desktop
-    make out/PDFS-usbemu,ffa && TB=... tests/rol/run.sh --usbemu [--old-usbdriver] [--desktop]
+    TB=... tests/rol/run.sh --usbemu [--old-usbdriver] [--desktop]
+    TB=... ROL_HARDDISC=... tests/rol/run.sh --charging|--charging-only [--irisram]
 
 `--usbemu` uses a test build whose USB transport talks to an emulation of
 USBDriver and DeviceFS (tests/rol/usbemu.c): a fake MTP device, USB9, bridged to
@@ -128,6 +133,17 @@ The desktop test opens Filer windows on the simulated device, copies a folder to
 and a photo back with Filer_Action, saves 12 MB with one OS_File call, and
 saves screenshots; it measures the longest pause in the desktop during each
 (`PDFS_SIM_RATE=3000` makes the simulated device take 3 MB/s).
+
+`--charging` plays a phone plugged in set to charging only and then switched
+to file transfer, as on a Pi: it takes nothing in, drops off the bus,
+Service_DeviceDead comes, and it's back as a new USB device. The emulation
+counts what crashed or hung USBDriver on a Pi (a close that would wait for
+ever, a close that frees a gone device's transfer, a synchronous request to
+a gone device, calls after Service_DeviceDead), and the test checks none
+happen, that the phone is then mounted, and that the desktop isn't held.
+`--charging-only` never switches it; `--irisram` runs !IrisRAM copying Iris
+to the RAM disc meanwhile, as at a Pi's boot (`IRIS_HARDDISC`: a HardDisc4
+with !IrisRAM and an !Iris that fits a 128 MB RAM disc).
 
 ## Names and types
 
