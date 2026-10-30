@@ -133,6 +133,7 @@ sys.exit(not (len(d)==12582912 and all(struct.unpack_from(\"<I\",d,i)[0]==i for 
   check 'grep -q "scrap directory type [02], files left: 0" "$T/w/results"' "no scrap files left"
   if [ $USBEMU = 1 ]; then
     check 'grep -q "icons after unplug: 0" "$T/w/results"' "unplugging the phone removes its icons"
+    check 'grep -q "streams open after unplug: 0" "$T/w/results"' "no USB stream is left open after unplugging (its buffer purged, so its close works)"
   fi
   echo "screenshots: $OUT/desktop*.png"
 fi

@@ -36,6 +36,7 @@ typedef struct
 {
   int used, output, ep;
   int close_failed;         /* PDFSEmu$CloseFails: its first close failed */
+  int purged;               /* its buffer was purged (nothing left to send) */
   unsigned flags;           /* Get/Set Options: bit 1 'short' */
   unsigned cap, len;        /* buffer size and bytes in it */
   uint8_t *buf;
@@ -239,6 +240,7 @@ open_fake (const char *path, int output)
           return -1;
         s->used = 1;
         s->close_failed = 0;
+        s->purged = 0;
         s->flags = 0;
         s->output = output;
         s->len = 0;
@@ -324,7 +326,7 @@ usbemu_swix (unsigned swi, regs *r)
              has just gone (the stream stays open) */
           regs v = {{ (unsigned) "PDFSEmu$CloseFails", 0, (unsigned) -1, 0, 0 }};
           swix_regs (0x23, &v);
-          if ((int) v.r[2] < 0 && s->output && !s->close_failed)
+          if ((int) v.r[2] < 0 && s->output && !s->close_failed && !s->purged)
             {
               static const struct { int n; char m[32]; } err = { 0x819C00, "USB transfer failed: IO Error" };
               s->close_failed = 1;
@@ -399,7 +401,7 @@ usbemu_swix (unsigned swi, regs *r)
         case 0x80000007u:                        /* GetHandles2 */
           if ((s = fake (r->r[2])))
             {
-              r->r[3] = 0;
+              r->r[3] = r->r[2] + 0x200;         /* the "buffer handle" */
               r->r[4] = 0;
               r->r[5] = r->r[2] + 0x100;
               r->r[6] = 0x9999;
@@ -441,4 +443,14 @@ usbemu_swix (unsigned swi, regs *r)
       break;
     }
   return swix_regs (swi, r);
+}
+
+/* CnpV purge of a stream's buffer ("buffer handle" = handle + 0x200): with
+   nothing left to send, a CloseFails stream closes */
+void
+usbemu_purge (unsigned buffer)
+{
+  stream *s = fake (buffer - 0x200);
+  if (s)
+    s->purged = 1;
 }

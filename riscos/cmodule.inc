@@ -124,6 +124,23 @@ swix_regs:
 	movvc	r0, #0
 	ldmfd	sp!, {r1, r4-r11, pc}
 
+@ void buffer_purge(unsigned buffer): empties a buffer manager buffer
+@ through the buffer manager's own routine, as DeviceFS and USBDriver do:
+@ Buffer_InternalInfo, then reason 8 (purge) with R1 = its private id and
+@ R12 = its workspace.
+	.global	buffer_purge
+buffer_purge:
+	stmfd	sp!, {r4-r11, lr}
+	swi	0x62949				@ XBuffer_InternalInfo
+	bvs	1f
+	mov	r12, r2
+	mov	r3, r1
+	mov	r1, r0
+	mov	r0, #8				@ BufferReason_PurgeBuffer
+	mov	lr, pc
+	mov	pc, r3
+1:	ldmfd	sp!, {r4-r11, pc}
+
 	.pushsection .data.got_base, "aw"
 	.align	2
 got_base:

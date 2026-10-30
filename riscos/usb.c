@@ -35,7 +35,11 @@
 
 #ifdef USB_EMU                   /* the test build: tests/rol/usbemu.c */
 oserror *usbemu_swix (unsigned swi, regs *r);
+void usbemu_purge (unsigned buffer);
 #define swix_regs usbemu_swix
+#define buffer_purge usbemu_purge
+#else
+void buffer_purge (unsigned buffer);
 #endif
 
 #define OS_GBPB                 0x0C
@@ -66,6 +70,7 @@ typedef struct usbt
   usb_iface c;
   int h_in, h_out, h_int;       /* FileSwitch handles of the streams */
   unsigned s_in, s_out;         /* USBDriver's stream handles (GetHandles2 R5) */
+  unsigned b_out;               /* the output stream's buffer (GetHandles2 R3) */
   unsigned devhandle;           /* DeviceFS device handle (R6), for DeviceDead */
   char name[48];
 } usbt;
@@ -279,12 +284,14 @@ wake (usbt *u, unsigned call, unsigned stream, unsigned bytes)
 }
 
 static int
-handles (usbt *u, int h, unsigned *stream)
+handles (usbt *u, int h, unsigned *stream, unsigned *buffer)
 {
   regs r = {{ DFS_GET_HANDLES2, (unsigned) u->c.dev, (unsigned) h, 0, 0, 0, 0 }};
   if (swix_regs (DeviceFS_CallDevice, &r) || !r.r[5] || !r.r[6])
     return -1;
   *stream = r.r[5];
+  if (buffer)
+    *buffer = r.r[3];
   u->devhandle = r.r[6];
   return 0;
 }
@@ -303,10 +310,21 @@ gbpb (int h, void *buf, unsigned len, int write)
 static void
 close_streams (usbt *u)
 {
+  /* Whatever is still waiting to be sent is dropped first: by now nothing
+     more is wanted from the device (the last command has been answered,
+     or it failed, or the device has gone). Otherwise, after a failed
+     transfer, DeviceFS's close waits for it to go, USBDriver reports
+     the failed transfer, the close fails, and FileSwitch keeps the stream:
+     a DeviceFS stream on a device whose records are freed, which later
+     gave "Device not found" at *ShutDown, or USBDriver aborts (freeing a
+     transfer whose device has gone) when it was closed after all. */
+  if (u->h_out && u->b_out)
+    buffer_purge (u->b_out);
   close_stream (&u->h_in);
   close_stream (&u->h_out);
   close_stream (&u->h_int);
   u->s_in = u->s_out = 0;
+  u->b_out = 0;
 }
 
 static int
@@ -316,7 +334,7 @@ open_streams (usbt *u)
   u->h_out = open_stream (&u->c, u->c.ep_out, "bulk", BULK_BUFFER, 1);
   if (u->c.ep_int)
     u->h_int = open_stream (&u->c, u->c.ep_int, "interrupt", EVENT_BUFFER, 0);
-  if (!u->h_in || !u->h_out || handles (u, u->h_in, &u->s_in) || handles (u, u->h_out, &u->s_out))
+  if (!u->h_in || !u->h_out || handles (u, u->h_in, &u->s_in, 0) || handles (u, u->h_out, &u->s_out, &u->b_out))
     {
       close_streams (u);
       return -1;
@@ -484,9 +502,11 @@ usb_reset (pd_transport *t, uint32_t tid, int level)
       drain (u, 20);
       return 1;
     }
+  if (u->h_out && u->b_out)
+    buffer_purge (u->b_out);      /* the failed command: see close_streams */
   close_stream (&u->h_out);
   u->h_out = open_stream (&u->c, u->c.ep_out, "bulk", BULK_BUFFER, 1);
-  if (!u->h_out || handles (u, u->h_out, &u->s_out))
+  if (!u->h_out || handles (u, u->h_out, &u->s_out, &u->b_out))
     return t->gone = 1, PDT_GONE;
   drain (u, 30);
   return 0;
