@@ -71,6 +71,8 @@ typedef struct usbt
   unsigned s_in, s_out;         /* USBDriver's stream handles (GetHandles2 R5) */
   unsigned b_out;               /* the output stream's buffer (GetHandles2 R3) */
   int out_failed;               /* the output stream's transfer failed */
+  int out_stuck;                /* a transfer didn't finish in time (the device NAKs it) */
+  int parked;                   /* given up, but its streams can't be closed yet */
   unsigned devhandle;           /* DeviceFS device handle (R6), for DeviceDead */
   char name[48];
 } usbt;
@@ -375,7 +377,7 @@ out_idle (usbt *u, unsigned timeout_cs)
       if (status < 0)
         return u->out_failed = 1, PDT_IO;   /* failed (stalled, or the device has gone) */
       if (used == 0 && status != 0)
-        return 0;
+        return u->out_stuck = 0, 0;
       /* the buffer has emptied: don't wait long for a status that may
          never say "complete" */
       if (used == 0)
@@ -388,7 +390,7 @@ out_idle (usbt *u, unsigned timeout_cs)
       else
         wake (u, DEVCALL_WAKEUP_TX, u->s_out, 0);
       if (now_cs () - start > timeout_cs)
-        return PDT_TIMEOUT;
+        return u->out_stuck = 1, PDT_TIMEOUT;
     }
 }
 
@@ -499,6 +501,8 @@ usb_reset (pd_transport *t, uint32_t tid, int level)
   usbt *u = (usbt *) t;
   if (t->gone)
     return PDT_GONE;
+  if (u->out_stuck)
+    return PDT_IO;              /* its streams can't be closed: see usb_close */
   /* MTP Cancel (class request &64): code &4001, then the transaction id */
   uint8_t cancel[6] = { 0x01, 0x40, (uint8_t) tid, (uint8_t) (tid >> 8),
                         (uint8_t) (tid >> 16), (uint8_t) (tid >> 24) };
@@ -535,6 +539,19 @@ static void
 usb_close (pd_transport *t)
 {
   usbt *u = (usbt *) t;
+  if (u->out_stuck && !t->gone)
+    {
+      /* A transfer the device never took (a phone set to charging only
+         NAKs it) is still on the bus, and closing the output stream would
+         wait for it to finish: for ever, until the phone is unplugged or
+         switched to file transfer (0.15 test 10 held a Pi's boot like
+         that, and USBDriver then aborted). So the streams stay open, and
+         are closed when the device goes (Service_DeviceDead). Meanwhile
+         usb_is_open keeps the device from being tried again. */
+      u->parked = 1;
+      pd_log ("usb: the device isn't taking anything in (set to charging only?): its streams stay open until it goes");
+      return;
+    }
   close_streams (u);
   for (int i = 0; i < MAX_OPEN; i++)
     if (open_list[i] == u)
@@ -615,6 +632,11 @@ usb_device_dead (const char *name)
                *ShutDown) or worse */
             open_list[i]->t.gone = 1;
             close_streams (open_list[i]);
+            if (open_list[i]->parked)
+              {
+                pd_free (open_list[i]);
+                open_list[i] = 0;
+              }
           }
       }
 }
@@ -628,5 +650,10 @@ usb_dying (void)
       {
         open_list[i]->t.gone = 1;
         close_streams (open_list[i]);
+        if (open_list[i]->parked)
+          {
+            pd_free (open_list[i]);
+            open_list[i] = 0;
+          }
       }
 }

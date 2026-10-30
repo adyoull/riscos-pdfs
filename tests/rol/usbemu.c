@@ -43,6 +43,7 @@ typedef struct
   int purged;               /* its buffer was purged (nothing left to send) */
   int gen;                  /* which enumeration of the phone it's on */
   int failed;               /* its transfer failed when the device went */
+  int inflight;             /* a transfer the charging phone NAKs is on the bus */
   unsigned flags;           /* Get/Set Options: bit 1 'short' */
   unsigned cap, len;        /* buffer size and bytes in it */
   uint8_t *buf;
@@ -220,9 +221,10 @@ make_record (uint8_t *next, const char *name, int addr, const uint8_t *desc, uns
      *ShutDown, or an abort once the memory is reused);
    - a control request (ClearStall, class requests) on a device that has
      gone: USBDriver makes them synchronously;
-   - a close of an output stream holding a command that the phone, set to
-     charging, hasn't taken: DeviceFS's close waits for the buffer to
-     empty, for ever (0.15 test 9 stopped the Pi in !IrisRAM's banner).
+   - a close of an output stream whose transfer the phone, set to
+     charging, hasn't taken (it's on the bus, NAKed; emptying the buffer
+     doesn't stop it): DeviceFS's close waits for it, for ever (0.15 tests
+     9 and 10 stopped the Pi in !IrisRAM's banner until it was unplugged).
    A close of an output stream with a failed transfer still in its buffer
    fails ("USB transfer failed: IO Error") and the stream is kept, as
    DeviceFS and FileSwitch do; PDFSEmu$Leftover counts those (each is a
@@ -371,7 +373,8 @@ run_events (void)
       gone_at[phone_gen] = emu_now () | 1;
       phone_present = 0;
       for (int i = 0; i < NSTREAM; i++)
-        if (streams[i].used && streams[i].gen == phone_gen && streams[i].output && streams[i].len)
+        if (streams[i].used && streams[i].gen == phone_gen && streams[i].output
+            && (streams[i].len || streams[i].inflight))
           streams[i].failed = 1;
       schedule (2, dead_after);
       break;
@@ -491,6 +494,7 @@ open_fake (const char *path, int output)
         s->len = 0;
         s->gen = phone_gen;
         s->failed = 0;
+        s->inflight = 0;
         if (gone_at[phone_gen])
           hazard_note ("a stream opened on a device that has gone (before its Service_DeviceDead)");
         if (s->ep == 1 && !output && !charging_gen (s->gen) && connect_sim ())
@@ -575,11 +579,11 @@ usbemu_swix (unsigned swi, regs *r)
           static const struct { int n; char m[32]; } ioerr = { 0x819C00, "USB transfer failed: IO Error" };
           if (stream_dead (s, "a stream closed after its device's Service_DeviceDead: DeviceFS's records are freed (Device not found, or an abort)"))
             return (oserror *) &err_notfound;
-          if (!gone_at[s->gen] && charging_gen (s->gen) && s->output && s->len)
-            hazard ("a close of a stream holding a command the phone set to charging hasn't taken: DeviceFS's close waits for it to go, for ever (the desktop hangs)");
+          if (!gone_at[s->gen] && charging_gen (s->gen) && s->output && (s->len || s->inflight))
+            hazard ("a close of a stream whose transfer the phone set to charging hasn't taken (NAKed on the bus): DeviceFS's close waits for it, for ever (the desktop hangs until the phone is unplugged)");
           if (gone_at[s->gen] && s->output && s->failed)
             {
-              if (s->len)
+              if (s->len || s->inflight)
                 {
                   /* DeviceFS's flush gets the failed transfer: the close
                      fails, and FileSwitch keeps the stream */
@@ -691,7 +695,7 @@ usbemu_swix (unsigned swi, regs *r)
             {
               if (s->failed)
                 r->r[3] = (unsigned) -1;         /* failed */
-              else if (charging_gen (s->gen) && s->len)
+              else if (charging_gen (s->gen) && (s->len || s->inflight))
                 r->r[3] = 0;                     /* NAKed: still going */
             }
           return 0;
@@ -719,7 +723,9 @@ usbemu_swix (unsigned swi, regs *r)
             {
               if (gone_at[s->gen])
                 s->failed = 1;                   /* off the bus */
-              else if (scenario == 1 && !switch_armed)
+              else
+                s->inflight = 1;                 /* on the bus, NAKed: purging the buffer doesn't stop it */
+              if (!gone_at[s->gen] && scenario == 1 && !switch_armed)
                 {
                   /* charging only: the pipe is NAKed; the owner switches
                      the phone to file transfer a little later */
