@@ -309,16 +309,13 @@ gbpb (int h, void *buf, unsigned len, int write)
 static void
 close_streams (usbt *u)
 {
-  /* Whatever is still waiting to be sent is dropped first: by now nothing
-     more is wanted from the device (the last command has been answered,
-     or it failed, or the device has gone). Otherwise, after a failed
-     transfer, DeviceFS's close waits for it to go, USBDriver reports
-     the failed transfer, the close fails, and FileSwitch keeps the stream:
-     a DeviceFS stream on a device whose records are freed, which later
-     gave "Device not found" at *ShutDown, or USBDriver aborts (freeing a
-     transfer whose device has gone) when it was closed after all. */
-  if (u->h_out && u->b_out)
-    buffer_purge (u->b_out);
+  /* What's still waiting to be sent isn't dropped first (0.15 tests 7
+     and 8 did, so that the close of a stream whose transfer had failed
+     succeeded): with a phone dropping off the bus as it switches from
+     charging to file transfer, that close ended in a data abort in
+     USBDriver (usbd_free_buffer). As in 0.14, such a close fails and
+     FileSwitch keeps the stream. Tests 2 to 4 (trying the close again)
+     crashed the same way. */
   close_stream (&u->h_in);
   close_stream (&u->h_out);
   close_stream (&u->h_int);
@@ -493,9 +490,9 @@ usb_reset (pd_transport *t, uint32_t tid, int level)
      No ClearStall (DeviceFS_CallDevice &80000005): USBDriver does it as a
      synchronous control request (usbd_do_request), and a failed transfer
      usually means the device is going (a phone switching from charging to
-     file transfer drops off the bus). When it went during the request,
-     USBDriver freed the request's transfer after its device had been freed:
-     a data abort in USBDriver (usbd_free_buffer, 0.15 test 7 on a Pi). */
+     file transfer drops off the bus), which a synchronous request can't
+     cope with. (Taken out in 0.15 test 8; the crash then turned out to
+     come from closing, see close_streams.) */
   if (level >= 2)
     {
       close_streams (u);
@@ -504,8 +501,6 @@ usb_reset (pd_transport *t, uint32_t tid, int level)
       drain (u, 20);
       return 1;
     }
-  if (u->h_out && u->b_out)
-    buffer_purge (u->b_out);      /* the failed command: see close_streams */
   close_stream (&u->h_out);
   u->h_out = open_stream (&u->c, u->c.ep_out, "bulk", BULK_BUFFER, 1);
   if (!u->h_out || handles (u, u->h_out, &u->s_out, &u->b_out))
