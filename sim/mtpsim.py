@@ -14,6 +14,10 @@ Options for testing PDFS's behaviour:
     --no-partial64    don't support Android's GetPartialObject64
     --no-edit         don't support Android's edit operations
     --no-rename       don't support SetObjectPropValue (renaming)
+    --odd-proplist    as some Android SD cards: GetObjectPropList at depth 1
+                      lists the folder itself among its children, and leaves
+                      out every child after the first two (GetObjectHandles
+                      is still right)
     --zlp-strict N    fail data phases that are a multiple of N bytes (USB
                       without zero-length packets)
     --delay-ms N      sleep N ms before each response (a slow device)
@@ -270,6 +274,8 @@ class Device:
                     if v is None or not os.path.isdir(v[1]):
                         return INVALID_HANDLE, [], None
                     objs = self.children(v[0], v[1])
+                    if self.args.odd_proplist:
+                        objs = [h] + objs[:2]
             else:
                 return DEPTH_UNSUPPORTED, [], None
             els = []
@@ -488,6 +494,7 @@ def main():
     ap.add_argument("--no-partial64", action="store_true")
     ap.add_argument("--no-edit", action="store_true")
     ap.add_argument("--no-rename", action="store_true")
+    ap.add_argument("--odd-proplist", action="store_true")
     ap.add_argument("--zlp-strict", type=int, default=0, metavar="N")
     ap.add_argument("--delay-ms", type=int, default=0)
     ap.add_argument("--rate", type=int, default=0, metavar="KB/S", help="receive this fast")

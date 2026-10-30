@@ -851,6 +851,46 @@ parse_objectinfo (const uint8_t *p, uint32_t len, entry *e)
   return 0;
 }
 
+/* Sort handles (shell sort: no C library) and find one */
+static void
+sort_handles (uint32_t *h, uint32_t n)
+{
+  for (uint32_t gap = n / 2; gap; gap /= 2)
+    for (uint32_t i = gap; i < n; i++)
+      for (uint32_t j = i; j >= gap && h[j - gap] > h[j]; j -= gap)
+        {
+          uint32_t t = h[j];
+          h[j] = h[j - gap];
+          h[j - gap] = t;
+        }
+}
+
+static int
+has_handle (const uint32_t *h, uint32_t n, uint32_t x)
+{
+  uint32_t lo = 0, hi = n;
+  while (lo < hi)
+    {
+      uint32_t mid = lo + (hi - lo) / 2;
+      if (h[mid] < x)
+        lo = mid + 1;
+      else
+        hi = mid;
+    }
+  return lo < n && h[lo] == x;
+}
+
+/* List a directory from the device.
+
+   GetObjectHandles (this storage, this parent) says which objects are in
+   it; GetObjectPropList at depth 1 gives their names, sizes and dates in
+   one go. Not every device's property list can be trusted on its own: on
+   some Android SD cards it lists the folder itself among its children (so
+   a folder seemed to contain itself, and opening it went round in a loop)
+   and leaves children out. So the handles decide what's there, and any
+   the property list missed are asked about one at a time (GetObjectInfo).
+   Big folders on slow cards can take the device a while to answer, so
+   listing allows it 30 seconds. */
 static const pd_error *
 list_dir (node *dir)
 {
@@ -859,7 +899,47 @@ list_dir (node *dir)
   entry *es = 0;
   int ne = 0, rc;
   int root = dir == &st->root;
+  uint32_t parent = root ? 0xFFFFFFFFu : dir->handle;
+  uint32_t *hs = 0, nh = 0;
+  int have_handles = 0;
+  const pd_error *err = 0;
+  unsigned saved_timeout = m->timeout_cs;
+  if (m->timeout_cs < 3000)
+    m->timeout_cs = 3000;
 
+  /* 1. what's in it */
+  {
+    uint32_t p[3] = { st->id, 0, parent };
+    mtp_data in = { 0, 0, 0 };
+    rc = mtp_transaction (m, OP_GetObjectHandles, p, 3, 0, 0, &in, 0);
+    if (rc < 0)
+      {
+        pd_free (in.buf);
+        err = rc_error (rc);
+        goto out;
+      }
+    if (rc == RC_OK)
+      {
+        uint32_t n = in.len >= 4 ? get32 (in.buf) : 0;
+        if (in.len < 4 + 4 * (uint64_t) n || !(hs = pd_alloc (4 * (size_t) (n ? n : 1))))
+          {
+            pd_free (in.buf);
+            err = in.len < 4 + 4 * (uint64_t) n ? &err_proto : &err_nomem;
+            goto out;
+          }
+        for (uint32_t i = 0; i < n; i++)
+          {
+            uint32_t h = get32 (in.buf + 4 + 4 * i);
+            if (h != dir->handle || root)
+              hs[nh++] = h;
+          }
+        sort_handles (hs, nh);
+        have_handles = 1;
+      }
+    pd_free (in.buf);
+  }
+
+  /* 2. their names, sizes and dates, all at once if the device can */
   if (mtp_supports (m, OP_GetObjectPropList))
     {
       uint32_t p[5] = { root ? 0u : dir->handle, 0, 0xFFFFFFFFu, 0, 1 };
@@ -870,63 +950,100 @@ list_dir (node *dir)
           int e = parse_proplist (in.buf, in.len, &es, &ne);
           pd_free (in.buf);
           if (e < 0)
-            return &err_proto;
-          /* Root lists may hold every storage's objects: keep this one's.
-             (Objects that don't say which storage they're on are kept.) */
+            {
+              err = &err_proto;
+              goto out;
+            }
+          /* Keep this folder's children: by the handle list when there is
+             one; otherwise by what each says of itself (not the folder,
+             this storage, this parent). */
           int k = 0;
           for (int i = 0; i < ne; i++)
-            if (!es[i].have_name)
-              continue;
-            else if (!root || es[i].storage == 0 || es[i].storage == st->id)
-              es[k++] = es[i];
+            {
+              entry *x = &es[i];
+              int keep;
+              if (!x->have_name || (!root && x->handle == dir->handle))
+                keep = 0;
+              else if (have_handles)
+                keep = has_handle (hs, nh, x->handle);
+              else
+                keep = (x->storage == 0 || x->storage == st->id)
+                       && (root || x->parent == 0 || x->parent == dir->handle);
+              if (keep)
+                es[k++] = *x;
+            }
           ne = k;
-          goto apply;
         }
-      pd_free (in.buf);
-      if (rc < 0)
-        return rc_error (rc);
-      /* Refused: fall back to handles + object info, as older devices need */
+      else
+        {
+          pd_free (in.buf);
+          if (rc < 0)
+            {
+              err = rc_error (rc);
+              goto out;
+            }
+          ne = 0;                         /* refused: object info for each */
+        }
     }
-  {
-    uint32_t p[3] = { st->id, 0, root ? 0xFFFFFFFFu : dir->handle };
-    mtp_data in = { 0, 0, 0 };
-    rc = mtp_transaction (m, OP_GetObjectHandles, p, 3, 0, 0, &in, 0);
-    if (rc != RC_OK)
-      {
-        pd_free (in.buf);
-        return rc_error (rc);
-      }
-    uint32_t n = in.len >= 4 ? get32 (in.buf) : 0;
-    if (in.len < 4 + 4 * n)
-      {
-        pd_free (in.buf);
-        return &err_proto;
-      }
-    es = pd_alloc (sizeof (entry) * (n ? n : 1));
-    if (!es)
-      {
-        pd_free (in.buf);
-        return &err_nomem;
-      }
-    for (uint32_t i = 0; i < n; i++)
-      {
-        uint32_t h = get32 (in.buf + 4 + 4 * i);
-        mtp_data oi = { 0, 0, 0 };
-        rc = mtp_transaction (m, OP_GetObjectInfo, &h, 1, 0, 0, &oi, 0);
-        if (rc == RC_OK && parse_objectinfo (oi.buf, oi.len, &es[ne]) == 0)
-          es[ne++].handle = h;
-        pd_free (oi.buf);
-        if (rc < 0)
-          {
-            pd_free (in.buf);
-            pd_free (es);
-            return rc_error (rc);
-          }
-      }
-    pd_free (in.buf);
-  }
+  else if (!have_handles)
+    {
+      err = rc_error (rc);
+      goto out;
+    }
 
-apply:
+  /* 3. any the property list didn't give: one at a time */
+  if (have_handles)
+    {
+      /* which handles are covered (es is in the device's order) */
+      uint32_t *got = pd_alloc (4 * (size_t) (ne ? ne : 1));
+      if (!got)
+        {
+          err = &err_nomem;
+          goto out;
+        }
+      for (int i = 0; i < ne; i++)
+        got[i] = es[i].handle;
+      sort_handles (got, (uint32_t) ne);
+      int nprop = ne;             /* got[] covers these; ne grows below */
+      uint32_t missing = 0;
+      for (uint32_t i = 0; i < nh; i++)
+        missing += !has_handle (got, (uint32_t) ne, hs[i]);
+      if (missing)
+        {
+          entry *n2 = pd_realloc (es, sizeof (entry) * (size_t) (ne + missing));
+          if (!n2)
+            {
+              pd_free (got);
+              err = &err_nomem;
+              goto out;
+            }
+          es = n2;
+          for (uint32_t i = 0; i < nh; i++)
+            {
+              if (has_handle (got, (uint32_t) nprop, hs[i]))
+                continue;
+              uint32_t h = hs[i];
+              mtp_data oi = { 0, 0, 0 };
+              rc = mtp_transaction (m, OP_GetObjectInfo, &h, 1, 0, 0, &oi, 0);
+              memset (&es[ne], 0, sizeof (entry));
+              if (rc == RC_OK && parse_objectinfo (oi.buf, oi.len, &es[ne]) == 0)
+                {
+                  es[ne].handle = h;
+                  ne++;
+                }
+              pd_free (oi.buf);
+              if (rc < 0)
+                {
+                  pd_free (got);
+                  err = rc_error (rc);
+                  goto out;
+                }
+            }
+        }
+      pd_free (got);
+    }
+
+  /* 4. into the directory cache */
   {
     static unsigned seq;
     uint32_t mark = ++seq;
@@ -949,8 +1066,13 @@ apply:
       }
     dir->listed = 1;
     dir->listed_at = pd_time_cs ();
+    es = 0;
   }
-  return 0;
+out:
+  m->timeout_cs = saved_timeout;
+  pd_free (es);
+  pd_free (hs);
+  return err;
 }
 
 static const pd_error *

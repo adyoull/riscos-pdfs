@@ -86,7 +86,7 @@
 #define MTP_EAGAIN   (-13)        /* no response yet (mtp_stream_result) */
 #define MTP_EPROTO   (-10)        /* the device sent something malformed */
 #define MTP_ENOMEM   (-11)
-#define MTP_ETOOBIG  (-12)        /* more data than the caller's buffer */
+#define MTP_ETOOBIG  (-14)        /* more data than the caller's buffer (was -12, the same as MTP_EBUSY) */
 
 typedef int (*mtp_fill_fn) (void *ctx, uint8_t *dst, uint64_t off, uint32_t len);
 

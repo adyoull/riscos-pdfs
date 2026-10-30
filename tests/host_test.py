@@ -399,6 +399,26 @@ def background():
             shutil.rmtree(scrap, ignore_errors=True)
 
 
+def odd():
+    print("== a folder's property list that lists the folder itself, and not all its children")
+    s = Sim("--odd-proplist")
+    try:
+        cam = local(s, "DCIM", "Camera")
+        os.makedirs(cam)
+        names = ["IMG_%04d.jpg" % k for k in range(12)]
+        for n in names:
+            open(os.path.join(cam, n), "wb").write(n.encode())
+        r = s.run(["ls", D + ".DCIM"], ["ls", D + ".DCIM.Camera"],
+                  ["get", D + ".DCIM.Camera.IMG_0011/jpg", tmp := tmpfile(b"")])
+        dcim = r.stdout.split("Camera", 1)[0]
+        ok(r.returncode == 0 and "DCIM" not in re.sub(r"SimPhone-Internal.\$\.DCIM", "", dcim)
+           and all(n[:-4] in r.stdout for n in names) and open(tmp, "rb").read() == b"IMG_0011.jpg",
+           "DCIM lists only Camera, and Camera lists all 12 photos")
+        os.unlink(tmp)
+    finally:
+        s.stop()
+
+
 def main():
     random.seed(1)
     if not os.path.exists(HOST):
@@ -408,6 +428,8 @@ def main():
     suite(["--no-partial64", "--no-edit"])
     suite(["--no-proplist", "--no-partial64", "--no-edit", "--delay-ms", "2"])
     suite(["--no-rename"])
+    suite(["--odd-proplist"])
+    odd()
     recovery()
     zlp()
     big()
