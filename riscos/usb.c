@@ -70,6 +70,7 @@ typedef struct usbt
   int h_in, h_out, h_int;       /* FileSwitch handles of the streams */
   unsigned s_in, s_out;         /* USBDriver's stream handles (GetHandles2 R5) */
   unsigned b_out;               /* the output stream's buffer (GetHandles2 R3) */
+  int out_failed;               /* the output stream's transfer failed */
   unsigned devhandle;           /* DeviceFS device handle (R6), for DeviceDead */
   char name[48];
 } usbt;
@@ -306,21 +307,40 @@ gbpb (int h, void *buf, unsigned len, int write)
   return (int) (len - r.r[3]);
 }
 
+/* Before the output stream is closed: what's still in its buffer.
+
+   - A phone set to charging only can enumerate and then take nothing in
+     (the pipe is NAKed): a command stays in the buffer, and DeviceFS's
+     close waits for it to go, for ever (0.15 test 9: a Pi stopped in
+     !IrisRAM's banner at boot). So it's dropped first.
+   - But not when the transfer has failed or the device has gone (a phone
+     switching to file transfer drops off the bus): then a close that
+     succeeds has USBDriver free the transfer of a device that has gone,
+     and it aborts (0.15 tests 2-4 and 7-8 made that close succeed). Left
+     alone, the close fails as in 0.14, and FileSwitch keeps the stream
+     ("Device not found" at *ShutDown).
+   tests/rol/run.sh --charging and --charging-only play both. */
+static void
+drop_unsent (usbt *u)
+{
+  if (!u->h_out || !u->b_out || u->t.gone || u->out_failed)
+    return;
+  regs ti = {{ DFS_TRANSFER_INFO, (unsigned) u->c.dev, u->s_out, 0, 0 }};
+  if (swix_regs (DeviceFS_CallDevice, &ti) || (int) ti.r[3] < 0)
+    return;                     /* failed, or the device has gone */
+  buffer_purge (u->b_out);
+}
+
 static void
 close_streams (usbt *u)
 {
-  /* What's still waiting to be sent isn't dropped first (0.15 tests 7
-     and 8 did, so that the close of a stream whose transfer had failed
-     succeeded): with a phone dropping off the bus as it switches from
-     charging to file transfer, that close ended in a data abort in
-     USBDriver (usbd_free_buffer). As in 0.14, such a close fails and
-     FileSwitch keeps the stream. Tests 2 to 4 (trying the close again)
-     crashed the same way. */
+  drop_unsent (u);
   close_stream (&u->h_in);
   close_stream (&u->h_out);
   close_stream (&u->h_int);
   u->s_in = u->s_out = 0;
   u->b_out = 0;
+  u->out_failed = 0;
 }
 
 static int
@@ -353,7 +373,7 @@ out_idle (usbt *u, unsigned timeout_cs)
       regs ti = {{ DFS_TRANSFER_INFO, (unsigned) u->c.dev, u->s_out, 0, 0 }};
       int status = swix_regs (DeviceFS_CallDevice, &ti) ? 1 : (int) ti.r[3];
       if (status < 0)
-        return PDT_IO;          /* a stalled pipe: usb_reset clears it */
+        return u->out_failed = 1, PDT_IO;   /* failed (stalled, or the device has gone) */
       if (used == 0 && status != 0)
         return 0;
       /* the buffer has emptied: don't wait long for a status that may
@@ -501,7 +521,9 @@ usb_reset (pd_transport *t, uint32_t tid, int level)
       drain (u, 20);
       return 1;
     }
+  drop_unsent (u);
   close_stream (&u->h_out);
+  u->out_failed = 0;
   u->h_out = open_stream (&u->c, u->c.ep_out, "bulk", BULK_BUFFER, 1);
   if (!u->h_out || handles (u, u->h_out, &u->s_out, &u->b_out))
     return t->gone = 1, PDT_GONE;

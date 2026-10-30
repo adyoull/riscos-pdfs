@@ -12,6 +12,10 @@ REM load PDFS as double-clicking it does (*RMRun): its filer starts
 SYS "Wimp_StartTask","Run "+here$+".PDFS"
 PROCwait(100)
 OSCLI "PDFSMount 127.0.0.1:7015"
+REM over USB the filer mounts the phone by itself, 2 seconds after it starts
+w%=0:REPEAT:SYS "XOS_File",17,"PDFS::SimPhone-Internal.$" TO t%;f%:IF (f% AND 1) THEN t%=0
+IF t%<>2 THEN PROCwait(50):w%+=1
+UNTIL t%=2 OR w%>=20
 OSCLI "Filer_OpenDir PDFS::SimPhone-Internal.$ 60 1100 900 320"
 PROCwait(250)
 OSCLI "Filer_OpenDir PDFS::SimPhone-Internal.$.DCIM.Camera 60 560 900 440"

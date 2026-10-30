@@ -13,6 +13,10 @@
    fetches up to the bytes asked for into the input buffer; BufferSpace
    gives the size and free space. Everything else goes to the real SWI.
 
+   PDFSEmu$Scenario "charging" plays a phone being switched from charging
+   only to file transfer, as on a Pi (0.15 tests): see "the charging
+   scenario" below.
+
    Copyright 2026 Andrew Youll. Licensed under the Apache License, Version 2.0. */
 #include "cmodule.h"
 #include "../../core/plat.h"
@@ -37,6 +41,8 @@ typedef struct
   int used, output, ep;
   int close_failed;         /* PDFSEmu$CloseFails: its first close failed */
   int purged;               /* its buffer was purged (nothing left to send) */
+  int gen;                  /* which enumeration of the phone it's on */
+  int failed;               /* its transfer failed when the device went */
   unsigned flags;           /* Get/Set Options: bit 1 'short' */
   unsigned cap, len;        /* buffer size and bytes in it */
   uint8_t *buf;
@@ -184,6 +190,245 @@ make_record (uint8_t *next, const char *name, int addr, const uint8_t *desc, uns
   return b;
 }
 
+/* --- the charging scenario ---------------------------------------------------------------
+
+   PDFSEmu$Scenario "charging": the phone is plugged in set to charging only.
+   It enumerates with its MTP interface (as "USB9"), but takes nothing in
+   (a command stays in the output buffer: the pipe is NAKed) and answers
+   nothing. PDFSEmu$SwitchAfter centiseconds (default 300) after the first
+   command written to it, it is switched to file transfer: it drops off the
+   bus at once (its transfers fail; a command still in the output buffer is
+   a failed transfer), Service_DeviceDead comes PDFSEmu$DeadAfter cs later
+   (default 50), for USB9 and then two short-lived enumerations (USB10,
+   USB11), and PDFSEmu$BackAfter cs after that (default 150) it is back as
+   "USB12", in MTP mode (bridged to the simulator), with Service_USB 0
+   (Attach). "charging-only": it is never switched.
+
+   The events come asynchronously, as USBDriver's do: from a transient
+   callback (OS_CallAfter, then OS_AddCallBack), or, while PDFS is waiting on
+   the device (its BufferSpace, TransferInfo and WakeUp calls), there and
+   then, as the Pi's logs show Service_DeviceDead arriving in the middle of
+   PDFS's waits.
+
+   USBDriver's hazards, as seen on the Pi, are counted in PDFSEmu$Hazards
+   and logged ("usbemu: HAZARD ..."):
+   - a close that succeeds for an output stream whose transfer failed, on
+     a device that has gone (0.15 tests 2-4 and 7-8: data aborts in
+     USBDriver, usbd_free_xfer / usbd_free_buffer);
+   - any call on a stream after its device's Service_DeviceDead has been
+     and gone (DeviceFS has freed its records: "Device not found" at
+     *ShutDown, or an abort once the memory is reused);
+   - a control request (ClearStall, class requests) on a device that has
+     gone: USBDriver makes them synchronously;
+   - a close of an output stream holding a command that the phone, set to
+     charging, hasn't taken: DeviceFS's close waits for the buffer to
+     empty, for ever (0.15 test 9 stopped the Pi in !IrisRAM's banner).
+   A close of an output stream with a failed transfer still in its buffer
+   fails ("USB transfer failed: IO Error") and the stream is kept, as
+   DeviceFS and FileSwitch do; PDFSEmu$Leftover counts those (each is a
+   "Device not found" at *ShutDown). */
+
+#define MAX_GEN 4
+static const struct { int n; char m[20]; } err_notfound = { 0x100C6, "Device not found" };
+static int scenario = -1;        /* -1: not read yet; 0 normal; 1 charging; 2 charging only */
+static int phone_gen;            /* 0: charging (USB9); 1: file transfer (USB12) */
+static int phone_present = 1;    /* listed by Service_USB 1 */
+static unsigned gone_at[MAX_GEN];   /* off the bus since (0: still there) */
+static int dead_done[MAX_GEN];   /* its Service_DeviceDead has been */
+static unsigned hazards, leftovers;
+static unsigned switch_after = 300, dead_after = 50, back_after = 150;
+static unsigned next_event_at;   /* monotonic time, 0: none */
+static int next_event;           /* 1 switch, 2 dead, 3 back */
+static int switch_armed;
+static int delivering;
+
+static const char gen_name[MAX_GEN][6] = { "USB9", "USB12", "USB13", "USB14" };
+
+static unsigned
+emu_now (void)
+{
+  regs r = {{ 0 }};
+  swix_regs (0x42, &r);
+  return r.r[0];
+}
+
+static int
+str_is (const char *a, const char *b)
+{
+  while (*a && *a == *b)
+    a++, b++;
+  return *a == *b;
+}
+
+static unsigned
+read_num (const char *var, unsigned dflt)
+{
+  char b[16];
+  regs r = {{ (unsigned) var, (unsigned) b, sizeof b - 1, 0, 0 }};
+  if (swix_regs (0x23, &r))
+    return dflt;
+  unsigned v = 0;
+  for (unsigned i = 0; i < r.r[2] && b[i] >= '0' && b[i] <= '9'; i++)
+    v = v * 10 + (unsigned) (b[i] - '0');
+  return v;
+}
+
+static void
+read_scenario (void)
+{
+  if (scenario >= 0)
+    return;
+  char b[24];
+  regs r = {{ (unsigned) "PDFSEmu$Scenario", (unsigned) b, sizeof b - 1, 0, 0 }};
+  scenario = 0;
+  if (!swix_regs (0x23, &r))
+    {
+      b[r.r[2]] = 0;
+      if (str_is (b, "charging"))
+        scenario = 1;
+      else if (str_is (b, "charging-only"))
+        scenario = 2;
+    }
+  switch_after = read_num ("PDFSEmu$SwitchAfter", switch_after);
+  dead_after = read_num ("PDFSEmu$DeadAfter", dead_after);
+  back_after = read_num ("PDFSEmu$BackAfter", back_after);
+}
+
+static int
+charging_gen (int gen)
+{
+  read_scenario ();
+  return scenario > 0 && gen == 0;
+}
+
+static void
+hazard (const char *what)
+{
+  char m[200] = "usbemu: HAZARD ";
+  unsigned k = 15;
+  for (const char *q = what; *q && k < sizeof m - 1; q++)
+    m[k++] = *q;
+  m[k] = 0;
+  pd_log (m);
+  set_count ("PDFSEmu$Hazards", ++hazards);
+}
+
+static void
+hazard_note (const char *what)
+{
+  char m[200] = "usbemu: note: ";
+  unsigned k = 14;
+  for (const char *q = what; *q && k < sizeof m - 1; q++)
+    m[k++] = *q;
+  m[k] = 0;
+  pd_log (m);
+}
+
+/* the device of this name is the phone as it is now, and can be opened */
+static int
+phone_open_ok (const char *name)
+{
+  read_scenario ();
+  const char *want = gen_name[phone_gen];
+  int i = 0;
+  while (want[i] && name[i] == want[i])
+    i++;
+  return !want[i] && (name[i] < '0' || name[i] > '9') && phone_present;
+}
+
+extern void usbemu_after (void);    /* the veneers, below */
+
+static void
+schedule (int event, unsigned cs)
+{
+  next_event = event;
+  next_event_at = (emu_now () + cs) | 1;
+  regs r = {{ cs ? cs : 1, (unsigned) usbemu_after, 0 }};
+  swix_regs (0x3B, &r);             /* OS_CallAfter */
+}
+
+static void service_dead (const char *name)
+{
+  regs r = {{ 0, 0x79, 0x9999, (unsigned) name }};
+  swix_regs (0x30, &r);             /* OS_ServiceCall */
+}
+
+/* Run the next event if it's due. From the callback, or from PDFS's own
+   calls while it waits on the device. */
+static void
+run_events (void)
+{
+  if (delivering || !next_event_at || (int) (emu_now () - next_event_at) < 0)
+    return;
+  delivering = 1;
+  int ev = next_event;
+  next_event = 0;
+  next_event_at = 0;
+  switch (ev)
+    {
+    case 1:                         /* switched: off the bus */
+      pd_log ("usbemu: the phone is switched to file transfer: it drops off the bus");
+      gone_at[phone_gen] = emu_now () | 1;
+      phone_present = 0;
+      for (int i = 0; i < NSTREAM; i++)
+        if (streams[i].used && streams[i].gen == phone_gen && streams[i].output && streams[i].len)
+          streams[i].failed = 1;
+      schedule (2, dead_after);
+      break;
+    case 2:                         /* USBDriver detaches it */
+      pd_log ("usbemu: Service_DeviceDead USB9 (and USB10, USB11)");
+      service_dead (gen_name[phone_gen]);
+      dead_done[phone_gen] = 1;
+      service_dead ("USB10");
+      service_dead ("USB11");
+      schedule (3, back_after);
+      break;
+    case 3:                         /* back, in MTP mode */
+      phone_gen = 1;
+      phone_present = 1;
+      pd_log ("usbemu: the phone is back as USB12 (file transfer): Service_USB 0");
+      {
+        regs r = {{ 0, 0xD2, 0 }};
+        swix_regs (0x30, &r);
+      }
+      break;
+    }
+  delivering = 0;
+}
+
+/* The callback (from OS_CallAfter's handler) */
+void
+usbemu_event (void)
+{
+  run_events ();
+}
+
+__asm__ (
+"	.text\n"
+"	.global	usbemu_after\n"
+"usbemu_after:\n"                   /* OS_CallAfter: SVC mode, IRQs off */
+"	stmfd	sp!, {r0-r1, lr}\n"
+"	adr	r0, usbemu_cb\n"
+"	mov	r1, r12\n"
+"	swi	0x20054\n"                  /* XOS_AddCallBack */
+"	ldmfd	sp!, {r0-r1, pc}\n"
+"usbemu_cb:\n"
+"	stmfd	sp!, {r0-r12, lr}\n"
+"	bl	usbemu_event\n"
+"	ldmfd	sp!, {r0-r12, pc}\n");
+
+/* A call PDFS makes on a stream: the device's state */
+static int
+stream_dead (stream *s, const char *what)
+{
+  if (dead_done[s->gen])
+    {
+      hazard (what);
+      return 1;
+    }
+  return 0;
+}
+
 /* --- streams --------------------------------------------------------------------------- */
 
 static int
@@ -225,7 +470,7 @@ open_fake (const char *path, int output)
   const char *colon = path;
   while (*colon && *colon != ':')
     colon++;
-  if (colon[1] != 'U' || colon[2] != 'S' || colon[3] != 'B' || colon[4] != '9')
+  if (!phone_open_ok (colon + 1))
     return -1;
   for (int i = 0; i < NSTREAM; i++)
     if (!streams[i].used)
@@ -244,7 +489,11 @@ open_fake (const char *path, int output)
         s->flags = 0;
         s->output = output;
         s->len = 0;
-        if (s->ep == 1 && !output && connect_sim ())
+        s->gen = phone_gen;
+        s->failed = 0;
+        if (gone_at[phone_gen])
+          hazard_note ("a stream opened on a device that has gone (before its Service_DeviceDead)");
+        if (s->ep == 1 && !output && !charging_gen (s->gen) && connect_sim ())
           {
             pd_free (s->buf);
             s->used = 0;
@@ -311,8 +560,10 @@ usbemu_swix (unsigned swi, regs *r)
         {
           oserror *e = swix_regs (swi, r);       /* anything real first */
           uint8_t *list = (uint8_t *) r->r[2];
+          read_scenario ();
           list = make_record (list, "USB8", 2, stick, sizeof stick);
-          list = make_record (list, "USB9", 3, phone, sizeof phone);
+          if (phone_present)
+            list = make_record (list, gen_name[phone_gen], 3 + phone_gen, phone, sizeof phone);
           r->r[2] = (unsigned) list;
           return e;
         }
@@ -321,6 +572,26 @@ usbemu_swix (unsigned swi, regs *r)
     case OS_Find:
       if (r->r[0] == 0 && (s = fake (r->r[1])))
         {
+          static const struct { int n; char m[32]; } ioerr = { 0x819C00, "USB transfer failed: IO Error" };
+          if (stream_dead (s, "a stream closed after its device's Service_DeviceDead: DeviceFS's records are freed (Device not found, or an abort)"))
+            return (oserror *) &err_notfound;
+          if (!gone_at[s->gen] && charging_gen (s->gen) && s->output && s->len)
+            hazard ("a close of a stream holding a command the phone set to charging hasn't taken: DeviceFS's close waits for it to go, for ever (the desktop hangs)");
+          if (gone_at[s->gen] && s->output && s->failed)
+            {
+              if (s->len)
+                {
+                  /* DeviceFS's flush gets the failed transfer: the close
+                     fails, and FileSwitch keeps the stream */
+                  if (!s->close_failed)
+                    set_count ("PDFSEmu$Leftover", ++leftovers);
+                  s->close_failed = 1;
+                  return (oserror *) &ioerr;
+                }
+              hazard ("a close that succeeded for an output stream whose transfer failed, on a phone that has gone: USBDriver frees the transfer of a freed device (usbd_free_xfer/usbd_free_buffer abort)");
+            }
+          if (s->close_failed && gone_at[s->gen])
+            set_count ("PDFSEmu$Leftover", --leftovers);
           /* PDFSEmu$CloseFails set: an output stream's first close fails, as
              FileSwitch's does for a written-to DeviceFS stream whose device
              has just gone (the stream stays open) */
@@ -363,6 +634,8 @@ usbemu_swix (unsigned swi, regs *r)
     case OS_GBPB:
       if ((s = fake (r->r[1])))
         {
+          if (stream_dead (s, "OS_GBPB on a stream after its device's Service_DeviceDead"))
+            return (oserror *) &err_notfound;
           uint8_t *p = (uint8_t *) r->r[2];
           unsigned n = r->r[3];
           if (r->r[0] == 2 && s->output)
@@ -391,8 +664,11 @@ usbemu_swix (unsigned swi, regs *r)
       switch (r->r[0])
         {
         case 0x80000002u:                        /* BufferSpace */
+          run_events ();
           if ((s = fake (r->r[2])))
             {
+              if (stream_dead (s, "BufferSpace on a stream after its device's Service_DeviceDead"))
+                return (oserror *) &err_notfound;
               r->r[3] = s->cap;
               r->r[4] = s->cap - s->len;
               return 0;
@@ -408,8 +684,16 @@ usbemu_swix (unsigned swi, regs *r)
               return 0;
             }
           break;
-        case 0x80000006u:                        /* TransferInfo: done */
-          r->r[3] = 1;
+        case 0x80000006u:                        /* TransferInfo */
+          run_events ();
+          r->r[3] = 1;                           /* done */
+          if ((s = fake_stream (r->r[2])))
+            {
+              if (s->failed)
+                r->r[3] = (unsigned) -1;         /* failed */
+              else if (charging_gen (s->gen) && s->len)
+                r->r[3] = 0;                     /* NAKed: still going */
+            }
           return 0;
         case 0x80000008u:                        /* Get/Set Options */
           if ((s = fake_stream (r->r[2])))
@@ -422,11 +706,29 @@ usbemu_swix (unsigned swi, regs *r)
             }
           break;
         case 0x80000005u:                        /* ClearStall */
-          return 0;
         case 0x80000000u:                        /* control request */
-          log_line ("usbemu: control request");
+          log_line (r->r[0] == 0x80000000u ? "usbemu: control request" : "usbemu: ClearStall");
+          read_scenario ();
+          if (scenario > 0 && (const char *) r->r[1] && !phone_present)
+            hazard ("a control request (synchronous in USBDriver) on a phone that has gone");
           return 0;
         case 2:                                  /* WakeUpTX: one transfer */
+          run_events ();
+          if ((s = fake_stream (r->r[2])) && s->output && s->len
+              && (gone_at[s->gen] || charging_gen (s->gen)))
+            {
+              if (gone_at[s->gen])
+                s->failed = 1;                   /* off the bus */
+              else if (scenario == 1 && !switch_armed)
+                {
+                  /* charging only: the pipe is NAKed; the owner switches
+                     the phone to file transfer a little later */
+                  switch_armed = 1;
+                  pd_log ("usbemu: a command for the phone set to charging: it isn't taken");
+                  schedule (1, switch_after);
+                }
+              return 0;
+            }
           if ((s = fake_stream (r->r[2])) && s->output && s->len)
             {
               usbemu_transfers++;
@@ -436,7 +738,8 @@ usbemu_swix (unsigned swi, regs *r)
             }
           return 0;
         case 3:                                  /* WakeUpRX */
-          if ((s = fake_stream (r->r[2])))
+          run_events ();
+          if ((s = fake_stream (r->r[2])) && !gone_at[s->gen] && !charging_gen (s->gen))
             fetch (s, r->r[3]);
           return 0;
         }
@@ -452,5 +755,8 @@ usbemu_purge (unsigned buffer)
 {
   stream *s = fake (buffer - 0x200);
   if (s)
-    s->purged = 1;
+    {
+      s->purged = 1;
+      s->len = 0;
+    }
 }

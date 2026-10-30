@@ -97,6 +97,7 @@ typedef struct
   uint32_t tid;                 /* last transaction ID used */
   int open;                     /* session open */
   int broken;                   /* a transfer failed: reset before next use */
+  int opening;                  /* mtp_open's first command: no recovery */
   unsigned timeout_cs;          /* per transfer: no progress for this long = stalled */
   uint16_t ops[160];            /* operations supported (from GetDeviceInfo) */
   int nops;

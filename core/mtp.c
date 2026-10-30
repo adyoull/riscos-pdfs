@@ -425,7 +425,7 @@ mtp_transaction (mtp_dev *d, uint16_t op, const uint32_t *params, int nparams,
         }
       /* Recover now, so the next call finds the device usable; the caller
          still sees this call's error. */
-      if (rc != PDT_GONE && mtp_recover (d, 1) < 0)
+      if (rc != PDT_GONE && !d->opening && mtp_recover (d, 1) < 0)
         mtp_recover (d, 2);
     }
   else if (rc == RC_SessionNotOpen && op != OP_OpenSession)
@@ -459,8 +459,20 @@ skip_array16 (const uint8_t **p, const uint8_t *end, uint16_t *keep, int *nkeep,
 int
 mtp_open (mtp_dev *d)
 {
+  /* A device that doesn't answer its first command isn't recovered and
+     tried again here: give up quickly, and the filer tries again later.
+     A phone set to charging only can enumerate and never answer, or drop
+     off the bus as it switches to file transfer; waiting for it (10
+     seconds, then recovering and waiting again) held up the desktop,
+     and reopening streams on a phone that was going crashed USBDriver. */
   mtp_data in = { 0, 0, 0 };
+  unsigned saved_timeout = d->timeout_cs;
+  if (d->timeout_cs > 300)
+    d->timeout_cs = 300;
+  d->opening = 1;
   int rc = mtp_transaction (d, OP_GetDeviceInfo, 0, 0, 0, 0, &in, 0);
+  d->opening = 0;
+  d->timeout_cs = saved_timeout;
   if (rc != RC_OK)
     {
       pd_free (in.buf);

@@ -33,7 +33,7 @@ LDFLAGS := -nostdlib -static -Wl,--no-dynamic-linker -Wl,-T,riscos/module.ld \
 CORE := core/fs.c core/mtp.c
 OBJS := $(OBJ)/header.o $(OBJ)/module.o $(OBJ)/filer.o $(OBJ)/sendwin.o $(OBJ)/usb.o $(OBJ)/cmodule.o $(OBJ)/fs.o $(OBJ)/mtp.o
 
-all: $(OUT)/PDFS,ffa $(OUT)/pdfs-host
+all: $(OUT)/PDFS,ffa $(OUT)/PDFS-usbemu,ffa $(OUT)/pdfs-host
 
 # Test build: USB through tests/rol/usbemu.c (a fake USB phone bridged to
 # the simulator), for tests/rol/run.sh --usbemu

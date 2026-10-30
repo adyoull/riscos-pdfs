@@ -11,6 +11,15 @@
 # a folder copied to it and a photo copied back with Filer_Action, and
 # screenshots (out/rol/desktop*.png).
 #
+# --charging: a phone (through the USB emulator) plugged in set to charging,
+# switched to file transfer as on a Pi (it takes nothing in, drops off the
+# bus, Service_DeviceDead, back as a new USB device); checks that none of
+# USBDriver's hazards seen on the Pi happen, that the phone is mounted after
+# the switch, and that PDFS doesn't hold the desktop. --charging-only: never
+# switched. Add --irisram to run !IrisRAM (copying Iris to the RAM disc) at
+# the same time, as at a Pi's boot (IRIS_HARDDISC, see below).
+# CHARGING_SWITCH=cs: when the phone is switched, after PDFS's first command.
+#
 # Copyright 2026 Andrew Youll. Licensed under the Apache License, Version 2.0.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -18,10 +27,16 @@ ROOT=$(cd "$HERE/../.." && pwd)
 : "${TB:?set TB to the riscos-linux-testbed directory}"
 MOD=$ROOT/out/PDFS,ffa
 [ -f "$MOD" ] || { echo "make first" >&2; exit 1; }
-DESKTOP=0 USBEMU=0 SIMFLAGS=
+DESKTOP=0 USBEMU=0 SIMFLAGS= CHARGING= IRISRAM=0
 for a in "$@"; do
   case "$a" in
     --desktop) DESKTOP=1 ;;
+    --charging|--charging-only)
+               # the USB emulator's phone, plugged in set to charging, then
+               # switched to file transfer (or never: --charging-only)
+               CHARGING=${a#--}; DESKTOP=1; USBEMU=1
+               MOD=$ROOT/out/PDFS-usbemu,ffa ;;
+    --irisram) IRISRAM=1 ;;
     --usbemu)  USBEMU=1
                MOD=$ROOT/out/PDFS-usbemu,ffa
                [ -f "$MOD" ] || { echo "make out/PDFS-usbemu,ffa first" >&2; exit 1; } ;;
@@ -61,7 +76,7 @@ w('w/big6,ffd', 6 * 1048576 + 3)  # over 4MB: written through a scrap file      
 open(os.path.join(t, 'w/local,fff'), 'w').write('a local text file\n')
 open(os.path.join(t, 'w/ToPhone/ReadMe,fff'), 'w').write('Written on RISC OS\nand copied by the Filer\n')
 PY
-for b in basic1 free desktop eject; do python3 "$ROOT/tools/bbcbasic.py" tok "$HERE/$b.bas" "$T/w/$b,ffb"; done
+for b in basic1 free desktop eject charging; do python3 "$ROOT/tools/bbcbasic.py" tok "$HERE/$b.bas" "$T/w/$b,ffb"; done
 mv "$T/w/desktop,ffb" "$T/w/desk,ffb"
 # PDFS is loaded as a double-click does: *RMRun (its start code runs too)
 cp "$MOD" "$T/w/PDFS,ffa"
@@ -111,6 +126,28 @@ if [ $DESKTOP = 0 ]; then
     check 'grep -q "PDFSEmu\$MissingZLP : 0" "$OUT/cli.txt"' "every container ends with a short or zero-length packet"
     check 'grep -q "USB8 .*08/06/50" "$OUT/cli.txt" && grep -q "PDFS test SimPhone (USB USB9)" "$OUT/cli.txt"' "the memory stick is listed but not mounted; the phone is, over USB"
   fi
+elif [ -n "$CHARGING" ]; then
+  # A phone plugged in set to charging and switched to file transfer, as on
+  # a Pi at boot; with --irisram, while !IrisRAM copies Iris to the RAM
+  # disc. IRIS_HARDDISC: a HardDisc4 with !IrisRAM in Documents.Iris.IrisRAMv2
+  # and an !Iris small enough for the test bed's RAM disc (128MB at most).
+  HD=$ROL_HARDDISC
+  if [ $IRISRAM = 1 ]; then HD=${IRIS_HARDDISC:-/tmp/claude-0/piimg/hd-irisram/HardDisc4}; fi
+  : "${HD:?set ROL_HARDDISC to a HardDisc4 (desktop mode)}"
+  # CHARGING_WATCH: how long to watch (cs); CHARGING_SWITCH: when the phone
+  # is switched, in cs after PDFS's first command to it (default 300)
+  printf '%s\n%s\n%s\n%s\n' "$CHARGING" "$IRISRAM" "${CHARGING_WATCH:-6000}" "${CHARGING_SWITCH:-}" > "$T/w/opts,fff"
+  ROL_HARDDISC=$HD "$TB/bin/rol-run" ${ROL_VERBOSE:+-v} -t 300 -w 240 -s "$OUT/charging.png" -C "$T/w" -c 'Run charging' || true
+  cat "$T/w/results" || true
+  echo "--- *PDFSLog"; cat "$T/w/pdfslog" 2>/dev/null | tr -d '\r' || true
+  check 'grep -q "^hazards: 0" "$T/w/results"' "none of USBDriver's hazards (seen on a Pi) happen"
+  if [ "$CHARGING" = charging ]; then
+    check 'grep -q "^icons: 2" "$T/w/results" && grep -q "Download" "$T/w/cat"' "after the switch the phone is mounted and can be read"
+  fi
+  # (with !IrisRAM, its copy holds the desktop itself)
+  [ $IRISRAM = 0 ] && check 'awk "/longest time the desktop was held/ {exit !(\$NF+0 < 500)}" "$T/w/results"' "PDFS never holds the desktop for 5 seconds or more"
+  [ $IRISRAM = 1 ] && check 'grep -q "^iris in RAM disc: yes" "$T/w/results"' "!IrisRAM copied Iris to the RAM disc"
+  grep "^leftover streams" "$T/w/results" || true
 else
   : "${ROL_HARDDISC:?set ROL_HARDDISC to a HardDisc4 (desktop mode)}"
   ROL_HARDDISC=$ROL_HARDDISC "$TB/bin/rol-run" ${ROL_VERBOSE:+-v} -t 180 -w 120 -s "$OUT/desktop.png" -C "$T/w" -c 'Run desk' || true
