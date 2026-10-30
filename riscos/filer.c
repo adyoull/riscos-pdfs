@@ -581,9 +581,13 @@ filer_main (void)
   for (int k = 0; k < MAX_ICONS; k++)
     icons[k].used = 0;
   poll_errors = 0;
-  oscli ("PDFSMount -auto", 0, 0);  /* devices already plugged in */
-  refresh ();
-  unsigned next = 0;
+  /* Devices already plugged in are mounted from the first poll on, not
+     here: a task that doesn't poll holds up the desktop starting, and a
+     phone that doesn't answer kept the machine on the boot screen */
+  usb_attached = 1;
+  regs t0 = {{ 0 }};
+  swix_regs (0x42, &t0);                            /* OS_ReadMonotonicTime */
+  unsigned next = t0.r[0] + 200;
   for (;;)
     {
       regs t = {{ 0 }};
