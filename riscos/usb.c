@@ -216,15 +216,6 @@ open_stream (const usb_iface *c, int ep, const char *type, unsigned size, int ou
   return (int) r.r[0];
 }
 
-/* Is this FileSwitch handle still open on DeviceFS? (OS_Args 254: R2's
-   bottom byte is the filing system number; DeviceFS is 53) */
-static int
-still_devicefs (int handle)
-{
-  regs r = {{ 254, (unsigned) handle, 0 }};
-  return !swix_regs (OS_Args, &r) && (r.r[2] & 0xFF) == 53;
-}
-
 static void
 log_close (const char *what, int handle, const oserror *e)
 {
@@ -245,12 +236,12 @@ log_close (const char *what, int handle, const oserror *e)
   pd_log (m);
 }
 
-/* Close a stream. When the device has just gone, the first close can fail
-   (DeviceFS reports the failed transfer as it flushes the output), and
-   FileSwitch keeps a handle that has been written to if its close fails:
-   then *ShutDown closes it again, after DeviceFS has forgotten the device,
-   and reports "Device not found". So while the handle is still open on
-   DeviceFS, the close is tried again (the error has been reported). */
+/* Close a stream, once. When the device has just gone, the close can fail
+   (DeviceFS reports the failed transfer as it flushes the output); the
+   error is logged. 0.15 tests 2 to 4 tried the close again inside
+   Service_DeviceDead, while USBDriver is detaching the device, and a Pi
+   then stopped with an abort on instruction fetch when a phone was switched
+   from charging to file transfer: so it isn't tried again. */
 static void
 close_stream (int *h)
 {
@@ -258,21 +249,10 @@ close_stream (int *h)
   *h = 0;                       /* first: a service call may close it meanwhile */
   if (!handle)
     return;
-  for (int attempt = 0; attempt < 4; attempt++)
-    {
-      regs r = {{ 0, (unsigned) handle }};
-      oserror *e = swix_regs (OS_Find, &r);
-      if (!e)
-        {
-          if (attempt)
-            log_close ("usb: closed at last, handle ", handle, 0);
-          return;
-        }
-      log_close ("usb: closing handle ", handle, e);
-      if (!still_devicefs (handle))
-        return;                 /* FileSwitch let it go anyway */
-    }
-  log_close ("usb: couldn't close handle ", handle, 0);
+  regs r = {{ 0, (unsigned) handle }};
+  oserror *e = swix_regs (OS_Find, &r);
+  if (e)
+    log_close ("usb: closing handle ", handle, e);
 }
 
 /* R3 = buffer size, R4 = free bytes */
