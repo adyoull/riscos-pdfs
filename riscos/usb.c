@@ -51,7 +51,6 @@ void buffer_purge (unsigned buffer);
 
 #define DFS_USB_REQUEST         0x80000000u
 #define DFS_BUFFER_SPACE        0x80000002u
-#define DFS_CLEAR_STALL         0x80000005u
 #define DFS_TRANSFER_INFO       0x80000006u
 #define DFS_GET_HANDLES2        0x80000007u
 #define DEVCALL_WAKEUP_TX       2u
@@ -488,14 +487,17 @@ usb_reset (pd_transport *t, uint32_t tid, int level)
                         (uint8_t) (tid >> 16), (uint8_t) (tid >> 24) };
   class_request (u, 0x64, cancel, 6, 0);
   /* What a failed write left in the output buffer mustn't go out before the
-     next command: clear any stall and reopen the output stream (level 1),
-     or all the pipes (level 2: the session starts again) */
-  regs cs = {{ DFS_CLEAR_STALL, (unsigned) u->c.dev, (unsigned) u->h_out }};
-  swix_regs (DeviceFS_CallDevice, &cs);
+     next command: reopen the output stream (level 1), or all the pipes
+     (level 2: the session starts again).
+
+     No ClearStall (DeviceFS_CallDevice &80000005): USBDriver does it as a
+     synchronous control request (usbd_do_request), and a failed transfer
+     usually means the device is going (a phone switching from charging to
+     file transfer drops off the bus). When it went during the request,
+     USBDriver freed the request's transfer after its device had been freed:
+     a data abort in USBDriver (usbd_free_buffer, 0.15 test 7 on a Pi). */
   if (level >= 2)
     {
-      regs ci = {{ DFS_CLEAR_STALL, (unsigned) u->c.dev, (unsigned) u->h_in }};
-      swix_regs (DeviceFS_CallDevice, &ci);
       close_streams (u);
       if (open_streams (u))
         return t->gone = 1, PDT_GONE;
