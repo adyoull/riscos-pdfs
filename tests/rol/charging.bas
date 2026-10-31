@@ -1,6 +1,8 @@
 REM PDFS desktop test: a phone plugged in set to charging, switched to file
 REM transfer a few seconds later (the USB emulator's "charging" scenario),
-REM optionally while !IrisRAM copies Iris to the RAM disc (as at a Pi's boot)
+REM optionally while !IrisRAM copies Iris to the RAM disc (as at a Pi's boot);
+REM or ("allow") a tablet that asks its owner to allow access to its data
+REM (the simulator's --needs-allow)
 log%=0:maxgap%=0:ON ERROR PROClog("Error: "+REPORT$+" at line "+STR$ERL):PROCfinish:END
 DIM b% 1024, n% 256
 SYS "Wimp_Initialise",310,&4B534154,"PDFS charging test",0 TO ,me%
@@ -9,7 +11,8 @@ here$=FNstr(n%)
 log%=OPENOUT(here$+".results")
 f%=OPENIN(here$+".opts"):scen$=GET$#f%:iris%=VAL GET$#f%:limit%=VAL GET$#f%:sw$=GET$#f%:CLOSE#f%
 PROClog("scenario "+scen$+", IrisRAM "+STR$iris%+", watching for "+STR$(limit%DIV100)+"s")
-OSCLI "Set PDFSEmu$Scenario "+scen$
+IF LEFT$(scen$,5)<>"allow" THEN OSCLI "Set PDFSEmu$Scenario "+scen$
+IF scen$="allow-reconnect" THEN OSCLI "Set PDFSEmu$Scenario reconnect"
 IF sw$<>"" THEN OSCLI "Set PDFSEmu$SwitchAfter "+sw$:PROClog("the phone is switched "+sw$+"cs after PDFS's first command")
 SYS "OS_ReadMonotonicTime" TO t0%
 REM PDFS as at boot: its filer starts with the desktop, and mounts what's plugged in

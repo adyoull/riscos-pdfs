@@ -24,6 +24,7 @@ Options for testing PDFS's behaviour:
                       without zero-length packets)
     --delay-ms N      sleep N ms before each response (a slow device)
     --stall-op CODE   never answer the first command with this code
+    --stall-skip N    (answering the first N of them)
                       (tests time-outs and recovery)
     --once            exit when the first connection closes
 
@@ -50,7 +51,7 @@ OK, GENERAL, NOT_OPEN, NOT_SUPPORTED, INVALID_STORAGE, INVALID_HANDLE = \
     0x2001, 0x2002, 0x2003, 0x2005, 0x2008, 0x2009
 WRITE_PROTECTED, ACCESS_DENIED, INVALID_PARENT, INVALID_PARAM, ALREADY_OPEN = \
     0x200D, 0x200F, 0x201A, 0x201D, 0x201E
-NO_VALID_INFO, PARAM_NOT_SUPPORTED = 0x2015, 0x2006
+NO_VALID_INFO, PARAM_NOT_SUPPORTED, DEVICE_BUSY = 0x2015, 0x2006, 0x2019
 DEPTH_UNSUPPORTED = 0xA808
 
 # Object formats and properties
@@ -76,7 +77,17 @@ def read_str(b, o):
     return s, o + 2 * n
 
 
+DATE_ZONE = None   # --date-zone: dates sent as local time in that zone, with the suffix
+
+
 def mtp_date(t):
+    if DATE_ZONE:
+        off = 0
+        if DATE_ZONE != "Z":
+            sign = -1 if DATE_ZONE[0] == "-" else 1
+            off = sign * (int(DATE_ZONE[1:3]) * 3600 + int(DATE_ZONE[-2:]) * 60)
+        return datetime.datetime.fromtimestamp(t + off, datetime.timezone.utc).strftime(
+            "%Y%m%dT%H%M%S") + ".0" + DATE_ZONE
     return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y%m%dT%H%M%S")
 
 
@@ -106,14 +117,21 @@ class Device:
         self.ops = set(OP.values())
         if args.no_proplist:
             self.ops.discard(OP["GetObjectPropList"])
-        if args.no_partial64:
+        if args.no_partial64 or args.no_partial:
             self.ops.discard(OP["GetPartialObject64"])
+        if args.no_partial:
+            self.ops.discard(OP["GetPartialObject"])
         if args.no_rename:
             self.ops.discard(OP["SetObjectPropValue"])
         if args.no_edit:
             for k in ("SendPartialObject", "TruncateObject", "BeginEditObject", "EndEditObject"):
                 self.ops.discard(OP[k])
         self.lock = threading.Lock()
+        # --needs-allow: Android asking "Allow access to device data?" for a
+        # session; until the owner taps Allow, no storages (or access denied)
+        self.allowed = not args.needs_allow
+        self.prompt_at = None                 # when the open prompt was shown
+        self.prompts = 0
 
     # --- handles ---------------------------------------------------------
     def handle_for(self, sid, path):
@@ -169,7 +187,8 @@ class Device:
     # --- datasets ----------------------------------------------------------
     def device_info(self):
         ops = sorted(self.ops)
-        b = struct.pack("<HIH", 100, 6, 100) + mtp_str("microsoft.com: 1.0; android.com: 1.0;")
+        ext = "microsoft.com: 1.0; android.com: 1.0;" if self.args.android else "microsoft.com: 1.0;"
+        b = struct.pack("<HIH", 100, 6, 100) + mtp_str(ext)
         b += struct.pack("<H", 0)
         b += struct.pack("<I", len(ops)) + b"".join(struct.pack("<H", o) for o in ops)
         ev = [0x4002, 0x4003, 0x4004, 0x4005, 0x4007, 0x400C]
@@ -219,6 +238,32 @@ class Device:
         return out
 
     # --- operations ----------------------------------------------------------
+    # --- the "Allow access" prompt (--needs-allow) ----------------------------
+    # Android shows it when a session is opened and the owner hasn't allowed
+    # access yet. The owner taps Allow --allow-after seconds later; if the
+    # session has gone by then, the tap is lost (that session's prompt is
+    # gone), and the next session shows a new prompt. Once allowed, it stays
+    # allowed while the device is plugged in (this run of the simulator).
+    def show_prompt(self):
+        if self.allowed or self.prompt_at is not None:
+            return
+        self.prompts += 1
+        self.prompt_at = time.time()
+        log("PROMPT %d: the device asks to allow access" % self.prompts)
+
+    def dismiss_prompt(self, why):
+        self.check_allowed()
+        if self.prompt_at is not None and not self.allowed:
+            log("PROMPT %d gone before it was answered (%s)" % (self.prompts, why))
+        self.prompt_at = None
+
+    def check_allowed(self):
+        if (not self.allowed and self.prompt_at is not None
+                and time.time() - self.prompt_at >= self.args.allow_after):
+            self.allowed = True
+            self.prompt_at = None
+            log("ALLOWED: the owner tapped Allow (prompt %d)" % self.prompts)
+
     def run(self, code, params, data_in):
         """Returns (response code, response params, data to send or None)."""
         a = self.args
@@ -231,12 +276,21 @@ class Device:
             if self.session:
                 return ALREADY_OPEN, [], None
             self.session = P[0]
+            self.show_prompt()
             return OK, [], None
         if code == OP["CloseSession"]:
+            self.dismiss_prompt("CloseSession")
             self.session = 0
             return OK, [], None
         if not self.session:
             return NOT_OPEN, [], None
+        self.check_allowed()
+        if not self.allowed:
+            if a.needs_allow == "empty" and code == OP["GetStorageIDs"]:
+                return OK, [], struct.pack("<I", 0)
+            if a.needs_allow == "busy":
+                return DEVICE_BUSY, [], None
+            return ACCESS_DENIED, [], None
         if code == OP["GetStorageIDs"]:
             ids = [s[0] for s in self.storages]
             return OK, [], struct.pack("<I", len(ids)) + b"".join(struct.pack("<I", i) for i in ids)
@@ -446,7 +500,14 @@ class Device:
         return ctype, code, tid, payload
 
     def send_container(self, s, ctype, code, tid, payload):
-        s.sendall(struct.pack("<IHHI", 12 + len(payload), ctype, code, tid) + payload)
+        b = struct.pack("<IHHI", 12 + len(payload), ctype, code, tid) + payload
+        if not self.args.send_rate or len(b) <= 65536:
+            s.sendall(b)
+            return
+        # as slowly as a device that sends --send-rate KB/s
+        for i in range(0, len(b), 65536):
+            s.sendall(b[i:i + 65536])
+            time.sleep(65536 / 1024 / self.args.send_rate)
 
     def serve(self, s):
         self.session = 0
@@ -471,7 +532,13 @@ class Device:
                     self.zlp_violations += 1
                     self.send_container(s, RESP, GENERAL, tid, b"")
                     continue
+            if self.args.proplist_hang and code == OP["GetObjectPropList"] and params[2:3] == [0xFFFFFFFF]:
+                log("GetObjectPropList (all properties): answered %g s late" % self.args.proplist_hang)
+                time.sleep(self.args.proplist_hang)
             if self.args.stall_op is not None and code == self.args.stall_op and not self.stalled:
+                self.stall_seen = getattr(self, "stall_seen", 0) + 1
+            if (self.args.stall_op is not None and code == self.args.stall_op and not self.stalled
+                    and self.stall_seen > self.args.stall_skip):
                 self.stalled = True
                 log("stalling op %04x (tid %d): no response" % (code, tid))
                 continue
@@ -483,6 +550,10 @@ class Device:
                     rc, rparams, data = GENERAL, [], None
             if self.args.delay_ms:
                 time.sleep(self.args.delay_ms / 1000)
+            for sl in self.args.slow or []:
+                op, ms = sl.split("=")
+                if int(op, 0) == code:
+                    time.sleep(int(ms) / 1000)
             if data is not None and rc == OK:
                 self.send_container(s, DATA, code, tid, data)
             self.send_container(s, RESP, rc, tid,
@@ -502,18 +573,36 @@ def main():
     ap.add_argument("--model", default="SimPhone")
     ap.add_argument("--no-proplist", action="store_true")
     ap.add_argument("--no-partial64", action="store_true")
+    ap.add_argument("--no-partial", action="store_true", help="no partial reads at all (GetObject only)")
     ap.add_argument("--no-edit", action="store_true")
     ap.add_argument("--no-rename", action="store_true")
     ap.add_argument("--odd-proplist", action="store_true")
+    ap.add_argument("--android", action="store_true", help="say android.com in the vendor extensions")
+    ap.add_argument("--proplist-hang", type=float, default=0, metavar="S",
+                    help="GetObjectPropList for all properties: answered S seconds late (an Amazon Fire)")
     ap.add_argument("--loop-handles", action="store_true")
     ap.add_argument("--zlp-strict", type=int, default=0, metavar="N")
     ap.add_argument("--delay-ms", type=int, default=0)
     ap.add_argument("--rate", type=int, default=0, metavar="KB/S", help="receive this fast")
+    ap.add_argument("--send-rate", type=int, default=0, metavar="KB/S", help="send file data this fast")
     ap.add_argument("--stall-op", type=lambda x: int(x, 0))
+    ap.add_argument("--date-zone", metavar="+HHMM|-HHMM|Z",
+                    help="send dates as local time in this zone, with the zone (and tenths)")
+    ap.add_argument("--stall-skip", type=int, default=0, metavar="N",
+                    help="answer the first N commands with that code before stalling one")
+    ap.add_argument("--slow", action="append", metavar="OP=MS",
+                    help="answer operation OP (e.g. 0x1005) MS milliseconds late")
     ap.add_argument("--once", action="store_true")
+    ap.add_argument("--needs-allow", choices=("empty", "denied", "busy"),
+                    help="ask to allow access for each session; until allowed, no storages "
+                         "(empty), or AccessDenied / DeviceBusy for everything after OpenSession")
+    ap.add_argument("--allow-after", type=float, default=4.0, metavar="S",
+                    help="the owner taps Allow this long after the prompt appears")
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("storage", nargs="+", help="NAME=DIR")
     args = ap.parse_args()
+    global DATE_ZONE
+    DATE_ZONE = args.date_zone
     dev = Device(args)
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -532,6 +621,9 @@ def main():
             dev.serve(c)
         except (EOFError, ConnectionResetError, BrokenPipeError):
             pass
+        with dev.lock:
+            dev.dismiss_prompt("the connection closed")
+            dev.session = 0
         c.close()
         log("connection closed")
         if args.once:

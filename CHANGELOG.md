@@ -1,5 +1,62 @@
 # Changes
 
+## 0.16 beta (31 October 2026)
+
+Android devices that ask for access, Amazon Fire tablets and Motorola
+phones in file transfer mode, and answers lost on the way in. Still a beta:
+use it at your own risk, with devices whose data you have backed up (see
+the README and LICENSE).
+
+- Answers lost on the way in are asked for again. Now and then RISC OS's
+  USB driver fails an input transfer (an Amazon Fire on a Pi), and starts
+  no more until the pipe is cleared: the device seemed to stop answering,
+  and the Filer gave up after 30 seconds. PDFS now notices at once, logs
+  why the transfer failed, clears the pipe, drops what's left of the
+  answer, and asks again if the request only reads something (a folder, a
+  file's details, part of a file); otherwise it waits on for the answer.
+  *PDFSDevices counts the answers asked for again.
+- "Allow access to device data?": until it's answered, Android shows no
+  storages. PDFS now waits in the same session (closing it and trying again
+  opened a new session each time, which asked again, so the owner's Allow
+  never reached a session still there), and mounts the storages once
+  they're there, including when the device reconnects after Allow (an
+  Amazon Fire does) or answers slowly at first.
+- Android's vendor-specific MTP interface (class FF/FF/00 with an
+  interrupt endpoint: Amazon Fire tablets, Motorola phones in File
+  transfer mode) is recognised as MTP and mounted by itself. ADB's
+  interface isn't.
+- Android devices: folders are listed an object at a time
+  (GetObjectHandles, then GetObjectInfo for each), not with
+  GetObjectPropList, which some (an Amazon Fire) never answer for a big
+  folder; libmtp doesn't use it on Android either. On other devices, a
+  property list that takes over 5 seconds switches the device to the same.
+- The session is opened as the MTP specification says: OpenSession first,
+  as transaction 0, with a random session ID, then GetDeviceInfo in the
+  session. Transaction IDs wrap past &FFFFFFFF to 1.
+- Events are read one container at a time, by the length in its header
+  (several waiting could be misread). Dates with a time zone (`Z`,
+  `+hhmm`) are read as UTC.
+- An Android device is left 5 seconds after its session opens before it's
+  asked about its storages, from the filer without holding the desktop;
+  then 1/100 second between an answer and its next request (`PDFS$Gap`).
+- From a device that can only send whole files (no GetPartialObject), a
+  file being read is received in the background, between the desktop's
+  polls, and reads wait only for what hasn't arrived yet.
+- *PDFSDevices: how files are read and folders listed, the data received
+  and sent and how fast, and the longest wait for one request.
+- `*PDFSLog trace` also logs every MTP request (with the time), each
+  container that comes back, and the USB pipes' state when an answer
+  doesn't come.
+- The Free window doesn't wait for a device that has stopped answering:
+  it shows the last figures known.
+- System variables, read when a device is mounted: `PDFS$Gap` (cs between
+  an answer and the next request to an Android device; 0 for none) and
+  `PDFS$Events 0` (leave the event pipe closed).
+- Tests: Android's Allow prompt (with the device reconnecting, or slow);
+  an Amazon Fire's descriptors; an input transfer failing in the USB
+  emulation, with the answer held or lost; Android devices; events of
+  mixed lengths; transaction ID wrap; time zones; 499 host tests.
+
 ## 0.15 beta (30 October 2026)
 
 Fixes for phones that are switched between charging only and file transfer,

@@ -6,6 +6,7 @@ different device behaviours and check the results in the simulator's folders.
 
 Copyright 2026 Andrew Youll. Licensed under the Apache License, Version 2.0.
 """
+import struct
 import os, random, re, shutil, signal, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -209,8 +210,20 @@ def suite(flags):
 
 
 def recovery():
-    print("== recovery: the device ignores one GetObjectPropList")
+    print("== recovery: the device ignores one GetObjectPropList (falls back)")
     s = Sim("--stall-op", "0x9805")
+    try:
+        open(local(s, "Download", "a.txt"), "w").write("a")
+        r = s.run(["ls", D + ".Download"], ["ls", D + ".Download"], ["discs"],
+                  env={"PDFS_TIMEOUT_CS": "150"}, expect=None)
+        ok("lists folders: an object at a time" in r.stdout, "a proplist stall falls back to listing an object at a time")
+        ok("F a " in r.stdout, "the listing still works")
+        r = s.run(["discs"])
+        ok(r.returncode == 0, "device still usable")
+    finally:
+        s.stop()
+    print("== recovery: the device ignores one GetObjectHandles")
+    s = Sim("--stall-op", "0x1007")
     try:
         open(local(s, "Download", "a.txt"), "w").write("a")
         r = s.run(["ls", D + ".Download"], ["ls", D + ".Download"],
@@ -221,6 +234,121 @@ def recovery():
         ok(r.returncode == 0, "device still usable")
     finally:
         s.stop()
+
+
+def trace_and_free():
+    print("== *PDFSLog trace: every request, and what arrived; the Free window after no answer")
+    s = Sim("--android", "--stall-op", "0x1008")
+    try:
+        open(local(s, "Download", "a.txt"), "w").write("a")
+        r = s.run(["ls", D + ".Download"],
+                  env={"PDFS_TRACE": "", "PDFS_VERBOSE": "1", "PDFS_TIMEOUT_CS": "150"}, expect=None)
+        out = r.stdout + r.stderr
+        ok("mtp> &1007" in out and "mtp< data &1007" in out and "mtp< response &2001" in out,
+           "the trace shows the requests and the containers that came back")
+        ok("mtp: &1008 failed, error 1" in out and "nothing more arrived" in out,
+           "and where an answer didn't come")
+    finally:
+        s.stop()
+    s = Sim("--stall-op", "0x1005", "--stall-skip", "2")
+    try:
+        disc = D.split(".")[0]
+        t = time.time()
+        r = s.run(["freewin", disc, "4"], env={"PDFS_TIMEOUT_CS": "150"}, expect=None)
+        lines = [l for l in r.stdout.splitlines() if l.startswith("freewin")]
+        ok(len(lines) == 4 and all(" size 0 " not in l for l in lines),
+           "the Free window shows the last known figures when the device doesn't answer")
+        ok(time.time() - t < 8, "and doesn't wait for the device each time (%.1f s)" % (time.time() - t))
+    finally:
+        s.stop()
+
+
+def open_like_openmtp():
+    print("== opening: the session first (transaction 0), then the device info; Android left to settle")
+    s = Sim("--android")
+    try:
+        t = time.time()
+        r = s.run(["discs"], env={"PDFS_TRACE": "", "PDFS_VERBOSE": "1", "PDFS_SETTLE_CS": "150"})
+        cmds = [l.split("mtp> ")[1] for l in r.stderr.splitlines() if "mtp> " in l]
+        ok(cmds[:2] and cmds[0].startswith("&1002 t0 (") and cmds[1].startswith("&1001 t1"),
+           "OpenSession (t0) comes first, then GetDeviceInfo (t1): %s" % cmds[:2])
+        sid = int(cmds[0].split("(")[1].rstrip(")"), 16)
+        ok(sid & 1 and sid != 0xFFFFFFFF, "the session id is odd (%08X)" % sid)
+        ok("leaving it 1.5 s to settle" in r.stderr and time.time() - t >= 1.5
+           and "SimPhone-Internal" in r.stdout, "an Android device is left 1.5 s, then mounted")
+    finally:
+        s.stop()
+
+
+def spec_details():
+    print("== events read one at a time (several waiting, of different lengths)")
+    s = Sim()
+    try:
+        def ev(code, *params):
+            b = struct.pack("<IHHI", 12 + 4 * len(params), 4, code, 0) + b"".join(
+                struct.pack("<I", p) for p in params)
+            return b.hex()
+        # ObjectAdded (16), StorageInfoChanged (16), DevicePropChanged (12),
+        # ObjectInfoChanged (16), a 3-parameter one (24), StoreAdded (16)
+        fake = ev(0x4002, 5) + ev(0x400C, 0x10001) + ev(0x4006) + ev(0x4007, 9) \
+            + ev(0x4008, 1, 2, 3) + ev(0x4004, 0x20001)
+        r = s.run(["discs"], ["tick"], env={"PDFS_FAKE_EVENTS": fake, "PDFS_VERBOSE": "1"})
+        got = [l.split("&")[1] for l in r.stderr.splitlines() if l.startswith("pdfs: event")]
+        ok([int(g, 16) for g in got] == [0x4002, 0x400C, 0x4006, 0x4007, 0x4008, 0x4004],
+           "six events, each read whole and in order: %s" % got)
+        r = s.run(["discs"], ["tick"], ["tick"], env={"PDFS_FAKE_EVENTS": "0000" + ev(0x4002, 5),
+                                                     "PDFS_VERBOSE": "1"})
+        ok("out of step" in r.stderr, "an event channel out of step is dropped, not read wrongly")
+    finally:
+        s.stop()
+    print("== transaction IDs wrap past &FFFFFFFF to 1")
+    s = Sim()
+    try:
+        r = s.run(["ls", D], ["ls", D + ".Download"],
+                  env={"PDFS_TRACE": "", "PDFS_VERBOSE": "1", "PDFS_TID_START": "FFFFFFFD"})
+        tids = [l.split(" t")[1].split()[0] for l in r.stderr.splitlines() if "mtp> " in l]
+        i = tids.index("4294967294") if "4294967294" in tids else -1
+        ok(i >= 0 and tids[i + 1] == "1" and "4294967295" not in tids,
+           "&FFFFFFFE, then 1 (never &FFFFFFFF): %s" % tids[max(i, 0):i + 3])
+        ok(r.returncode == 0, "and the device carries on")
+    finally:
+        s.stop()
+    print("== dates with a time zone (and tenths) are read as UTC")
+    infos = []
+    for zone in (None, "+0130", "-0800", "Z"):
+        s = Sim(*(["--date-zone", zone] if zone else []))
+        try:
+            p = local(s, "Download", "z.txt")
+            open(p, "w").write("z")
+            os.utime(p, (1700000000, 1700000000))
+            r = s.run(["info", D + ".Download.z/txt"])
+            infos.append(r.stdout.strip())
+        finally:
+            s.stop()
+    ok(len(set(infos)) == 1 and "load" in infos[0], "the same time whatever the zone: %s" % infos)
+
+
+def android_gap():
+    print("== an Android device: a gap between an answer and the next request")
+    for gap, want in ((None, 1), ("3", 3), ("0", 0)):
+        s = Sim("--android")
+        try:
+            for i in range(6):
+                open(local(s, "Download", "f%d.txt" % i), "w").write("x")
+            env = {"PDFS_TRACE": "", "PDFS_VERBOSE": "1"}
+            if gap is not None:
+                env["PDFS_GAP_CS"] = gap
+            r = s.run(["ls", D + ".Download"], ["discs"], env=env)
+            ts = [int(l.split(" mtp>")[0]) for l in r.stderr.splitlines() if " mtp> &1008" in l]
+            steps = [b - a for a, b in zip(ts, ts[1:])]
+            line = ("leaves %d cs between" % want) in r.stdout
+            if want:
+                ok(len(ts) >= 6 and min(steps) >= want and line,
+                   "gap %s: requests %d cs or more apart (%s), and *PDFSDevices says so" % (gap, want, steps))
+            else:
+                ok(len(ts) >= 6 and "cs between" not in r.stdout, "gap 0: none (%s)" % steps)
+        finally:
+            s.stop()
 
 
 def zlp():
@@ -437,6 +565,86 @@ def loops():
         s.stop()
 
 
+def stats():
+    print("== *PDFSDevices: how files are read, and the transfer figures")
+    for flags, want in (([], "reads files: in parts"), (["--no-partial"], "reads files: whole")):
+        s = Sim(*flags)
+        try:
+            data = bytes(random.randrange(256) for _ in range(3 * 65536 + 5))
+            open(local(s, "Download", "v.txt"), "wb").write(data)
+            out = os.path.join(s.dir, "v.out")
+            r = s.run(["get", D + ".Download.v", out], ["discs"])
+            ok(r.returncode == 0 and open(out, "rb").read() == data, "%s: read back" % (flags or "parts"))
+            ok(want in r.stdout and "received 0.1 MB" in r.stdout and "longest wait" in r.stdout,
+               "%s: *PDFSDevices says how it reads, and what it received" % (flags or "parts"))
+        finally:
+            s.stop()
+
+
+def background_read():
+    print("== a device that can't send part of a file: received in the background")
+    s = Sim("--no-partial", "--send-rate", "20000")
+    try:
+        data = bytes(random.randrange(256) for _ in range(3 * 1048576 + 333))
+        open(local(s, "Download", "w.txt"), "wb").write(data)
+        open(local(s, "Download", "small.txt"), "wb").write(b"small")
+        out = os.path.join(s.dir, "w.out")
+        out2 = os.path.join(s.dir, "w2.out")
+        r = s.run(["getbg", D + ".Download.w", out],
+                  ["getbg", D + ".Download.w", out2, D + ".Download"],
+                  ["get", D + ".Download.small", os.path.join(s.dir, "s.out")], ["discs"])
+        ok(r.returncode == 0 and open(out, "rb").read() == data, "read whole, with the background between reads")
+        m = re.findall(r"background steps with more to do: (\d+)", r.stdout)
+        ok(m and int(m[0]) > 0, "the background received some of it (%s)" % m)
+        ok(open(out2, "rb").read() == data, "another request half way: the rest is taken first, nothing lost")
+        ok(open(os.path.join(s.dir, "s.out"), "rb").read() == b"small", "and the next file after it")
+        ok("received " in r.stdout and "reads files: whole" in r.stdout, "*PDFSDevices")
+    finally:
+        s.stop()
+
+
+def slow_proplist():
+    print("== GetObjectPropList answered late (8 s): folders listed an object at a time instead")
+    s = Sim("--proplist-hang", "8")
+    try:
+        open(local(s, "Download", "a.txt"), "w").write("a")
+        t = time.time()
+        r = s.run(["ls", D + ".Download"], ["ls", D + ".Download"], ["discs"], env={"PDFS_TRACE": ""})
+        ok(r.returncode == 0 and r.stdout.count(" a ") >= 1, "the folder is listed")
+        ok("lists folders: an object at a time" in r.stdout, "and from then on an object at a time")
+        ok(time.time() - t < 20, "without waiting for the late answer each time (%.1f s)" % (time.time() - t))
+    finally:
+        s.stop()
+    print("== an Android device: listed an object at a time")
+    s = Sim("--android", "--proplist-hang", "30")
+    try:
+        open(local(s, "Download", "a.txt"), "w").write("a")
+        t = time.time()
+        r = s.run(["ls", D + ".Download"], ["discs"])
+        ok(r.returncode == 0 and " a " in r.stdout and "an object at a time (Android)" in r.stdout
+           and time.time() - t < 5, "no GetObjectPropList asked (%.1f s)" % (time.time() - t))
+    finally:
+        s.stop()
+
+
+def allow():
+    for mode in ("empty", "denied", "busy"):
+        print("== a device that asks to allow access to its data (%s until allowed)" % mode)
+        s = Sim("--needs-allow", mode, "--allow-after", "2.5")
+        try:
+            open(local(s, "Download", "a.txt"), "w").write("a")
+            r = s.run(["discs"], ["waitdiscs", "10"], ["discs"], ["ls", D + ".Download"])
+            log = open(s.log.name).read()
+            ok(r.returncode == 0, "%s: mounted while waiting" % mode)
+            ok("waiting: allow access" in r.stdout.split("discs:")[0], "%s: said to be waiting" % mode)
+            ok("discs: 2" in r.stdout and " a " in r.stdout.split("discs:")[1],
+               "%s: the storages appear once allowed, and can be read" % mode)
+            ok(log.count("PROMPT") == 1 and "ALLOWED" in log and "gone before" not in log,
+               "%s: asked once, and the Allow reached the session" % mode)
+        finally:
+            s.stop()
+
+
 def main():
     random.seed(1)
     if not os.path.exists(HOST):
@@ -447,8 +655,18 @@ def main():
     suite(["--no-proplist", "--no-partial64", "--no-edit", "--delay-ms", "2"])
     suite(["--no-rename"])
     suite(["--odd-proplist"])
+    suite(["--no-partial", "--no-edit"])   # whole objects only (GetObject), read a piece at a time
+    suite(["--android"])                   # Android: no GetObjectPropList, an object at a time
     odd()
     loops()
+    allow()
+    slow_proplist()
+    trace_and_free()
+    open_like_openmtp()
+    spec_details()
+    android_gap()
+    stats()
+    background_read()
     recovery()
     zlp()
     big()

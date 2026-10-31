@@ -51,6 +51,21 @@ PROCsend(fa%,&405,28+LEN here$+1)
 PROCwait(400)
 SYS "OS_File",17,here$+".IMG_20261029_0910/jpg" TO t%,,l%,,len%
 PROClog("photo copied back: type "+STR$t%+" length "+STR$len%+" filetype "+STR$~((l%>>>8)AND&FFF))
+REM a big file from the phone (Filer_Action reads it in blocks): the desktop
+REM must keep going, and Filer_Action's window must show it
+SYS "Wimp_StartTask","Filer_Action" TO fa%
+PROCmsg(fa%,&403,"PDFS::SimPhone-Internal.$.Download")
+PROCmsg(fa%,&404,"bigvideo/mp4 ")
+b%!20=0:b%!24=0:$(b%+28)=here$:b%?(28+LEN here$)=0
+PROCsend(fa%,&405,28+LEN here$+1)
+maxgap%=0:w%=0
+REPEAT
+  PROCwait(100):w%+=1
+  SYS "XOS_File",17,here$+".bigvideo/mp4" TO t%,,,,len%
+  IF w%=3 THEN OSCLI "TBShot":PROClog("shot: copying a big file from the phone")
+UNTIL (t%=1 AND len%=24*1048576+7 AND w%>3) OR w%>=60
+PROClog("big file copied back: type "+STR$t%+" length "+STR$len%+" after about "+STR$w%+"s")
+PROClog("longest pause in the desktop while a big file came from the phone: "+STR$maxgap%+"cs")
 SYS "XOS_File",17,"PDFS::SimPhone-Internal.$.Documents.ToPhone.ReadMe" TO t%,,,,len%
 PROClog("ReadMe on phone: type "+STR$t%+" length "+STR$len%)
 OSCLI "TBShot"

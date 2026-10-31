@@ -5,10 +5,10 @@ MTP (Media Transfer Protocol). A connected device's storages show up as
 discs, such as `PDFS::Pixel-Internal.$`, and work with the Filer, `*Copy`,
 BASIC's OPENIN/OPENOUT and every program that uses FileSwitch.
 
-Status: **0.15 beta.** It works with an Android phone (a Pixel) on a
-Raspberry Pi with RISC OS 5: browsing, copying both ways with the Filer,
-big files, unplugging, and switching the phone between charging and file
-transfer. It's tested against a simulated device
+Status: **0.16 beta.** It works with an Android phone (a Pixel) and an
+Amazon Fire 7 tablet on a Raspberry Pi with RISC OS 5: browsing, copying
+both ways with the Filer, big files, unplugging, switching the phone between
+charging and file transfer, and Android's "Allow access" prompt. It's tested against a simulated device
 too, over TCP and through an emulation of USBDriver and DeviceFS. Reports
 from other devices (tablets, cameras, media players) and machines are
 welcome: see docs/TESTING-ON-A-PI.md.
@@ -39,7 +39,7 @@ From riscos-linux-testbed (RISC OS 5 for Linux) with the simulated device
 With PackMan: add the source https://adyoull.github.io/riscos-packages/pkg/index
 and install **PDFS**. It goes in !Boot's PreDesk, so it's loaded at start-up.
 
-Or unzip `PDFS-0.15-beta.zip` (from the GitHub release) and double-click
+Or unzip `PDFS-0.16-beta.zip` (from the GitHub release) and double-click
 `PDFS` to load it, or put it in `!Boot.Choices.Boot.PreDesk`. RISC OS 5
 with its USB stack is needed for devices on USB.
 
@@ -57,7 +57,7 @@ with its USB stack is needed for devices on USB.
 | `tools/mksprites.py` | draws the drive icon and makes the ResourceFS block |
 | `host/host.c` | `pdfs-host`: the same core on Linux, driven from the command line, for tests |
 | `sim/mtpsim.py` | a simulated MTP device over TCP; host folders are its storages |
-| `tests/host_test.py` | 358 host tests against several kinds of simulated device |
+| `tests/host_test.py` | 499 host tests against several kinds of simulated device |
 | `tests/rol/` | tests in RISC OS for Linux (riscos-linux-testbed): CLI and desktop, over TCP or emulated USB (`usbemu.c`) |
 
 ## Building
@@ -107,8 +107,15 @@ Outside the desktop:
 | `*PDFSEject <disc> [all]` | eject a storage, or (all) the whole device, safely |
 | `*PDFSDismount [<disc>]` | disconnect at once |
 | `*PDFSExtensions [show\|hide]` | how names with a type extension are shown |
-| `*PDFSLog [on\|off\|trace]` | the log; trace logs every FileSwitch call (also to Reporter) |
+| `*PDFSLog [on\|off\|trace]` | the log; trace logs every FileSwitch call and MTP request (also to Reporter) |
 | `*PDFSBackground [on\|off]` | send big new files in the background, after the program has written them (off) |
+
+System variables, read when a device is mounted:
+
+| Variable | What |
+|---|---|
+| `PDFS$Gap` | cs between an answer from an Android device and the next request (1 if unset; 0 for none) |
+| `PDFS$Events` | `0`: leave the device's event pipe closed |
 
 Paths are `PDFS::<Model>-<Storage>.$.…`, e.g. `PDFS::Pixel_7-Internal.$.DCIM`.
 
@@ -121,6 +128,14 @@ and `*PDFSMount 127.0.0.1:7015`.
     TB=... RCD_DIR=... ROL_HARDDISC=.../HardDisc4 tests/rol/run.sh --desktop
     TB=... tests/rol/run.sh --usbemu [--old-usbdriver] [--desktop]
     TB=... ROL_HARDDISC=... tests/rol/run.sh --charging|--charging-only [--irisram]
+    TB=... ROL_HARDDISC=... tests/rol/run.sh --allow=empty|denied|busy
+    TB=... tests/rol/run.sh --usbemu --fire
+
+Environment for these: `PDFS_SIM_FLAGS` (more simulator options, e.g.
+`--android`), `PDFS_TRACE=1` (print a trace of the first listing),
+`EMU_IN_HALT=N` (the Nth input transfer fails in the emulation) with
+`EMU_IN_DROP=1` (the answer it held is lost), `ALLOW_RECONNECT=1` and
+`ALLOW_SLOW=1` (a device that reconnects after Allow, and answers slowly).
 
 `--usbemu` uses a test build whose USB transport talks to an emulation of
 USBDriver and DeviceFS (tests/rol/usbemu.c): a fake MTP device, USB9, bridged to
@@ -211,6 +226,10 @@ Technologies' Bluetooth-RISCOS32 (BSD-2-Clause) findings:
   followed by an edit that adds it.
 - Control requests aren't used (some USB drivers do them synchronously);
   `*PDFSUSB control on` allows MTP's Cancel request for testing.
+- An input transfer that fails isn't restarted by USBDriver (every read is
+  refused until ClearStall), and TransferInfo says only -1: PDFS checks it
+  while waiting, logs the reason (MonitorRX's error), clears the pipe with
+  ClearStall, and asks again for an answer that was lost.
 
 (0.04-0.06 tried USBDriver's 'short' flag and pipelined writes, written to
 ROOL's documentation; on the Pi they didn't work, so they were taken out.)

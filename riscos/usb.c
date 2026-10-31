@@ -4,8 +4,9 @@
    Finding devices: Service_USB 1 lists the connected devices, each record
    holding its device and configuration descriptors. An MTP interface is
    class 6 (still image), subclass 1, protocol 1 with a bulk IN, a bulk OUT
-   and an interrupt IN endpoint. Others (vendor-specific ones on older
-   Androids) can be named with *PDFSMount USB<n>.
+   and an interrupt IN endpoint; so is Android's older vendor-specific form,
+   FF/FF/00 with the same endpoints (Amazon Fire tablets). Others can be
+   named with *PDFSMount USB<n>.
 
    Talking to one: each endpoint is a DeviceFS stream,
      devices#interface<i>;alternate<a>;endpoint<e>;bulk;nopad;size<n>:USB<n>
@@ -18,8 +19,8 @@
    Not used: USB control requests. USBDriver 1.31 does them synchronously
    and they have frozen machines (see RISC OS Technologies' Bluetooth
    findings). The MTP class requests (Cancel, Get Device Status) are only
-   for recovery, which here drains and reopens the pipes instead; *PDFSUSB
-   control on turns them on for testing.
+   for recovery, which here clears stalls and drains the pipes instead
+   (usb_reset); *PDFSUSB control on turns them on for testing.
 
    The DeviceFS stream can't end a transfer that's a whole number of packets
    with a zero-length packet, so the transport says no_zlp and the MTP layer
@@ -51,6 +52,7 @@ void buffer_purge (unsigned buffer);
 
 #define DFS_USB_REQUEST         0x80000000u
 #define DFS_BUFFER_SPACE        0x80000002u
+#define DFS_CLEAR_STALL         0x80000005u
 #define DFS_TRANSFER_INFO       0x80000006u
 #define DFS_GET_HANDLES2        0x80000007u
 #define DEVCALL_WAKEUP_TX       2u
@@ -61,6 +63,7 @@ void buffer_purge (unsigned buffer);
 #define MAX_OPEN                4
 
 int usb_control_requests;       /* *PDFSUSB control on */
+int usb_no_events;              /* PDFS$Events 0: the event (interrupt) pipe isn't opened */
 volatile int usb_attached;      /* Service_USB Attach seen: the filer mounts */
 
 typedef struct usbt
@@ -71,9 +74,14 @@ typedef struct usbt
   unsigned s_in, s_out;         /* USBDriver's stream handles (GetHandles2 R5) */
   unsigned b_out;               /* the output stream's buffer (GetHandles2 R3) */
   int out_failed;               /* the output stream's transfer failed */
+  unsigned out_failed_at;       /* when (now_cs) */
   int out_stuck;                /* a transfer didn't finish in time (the device NAKs it) */
   int parked;                   /* given up, but its streams can't be closed yet */
   unsigned devhandle;           /* DeviceFS device handle (R6), for DeviceDead */
+  unsigned unconfirmed;         /* sends whose transfer never said "complete" */
+  unsigned last_in;             /* when input last arrived (now_cs), for the trace */
+  unsigned in_bytes;            /* input so far, for the trace */
+  unsigned in_clears;           /* times the input pipe was found failed and cleared */
   char name[48];
 } usbt;
 
@@ -170,7 +178,14 @@ decode_record (const uint8_t *rec, usb_iface *out, int n, int max, int all)
           else if (type == 3 && (addr & 0x80) && !cur.ep_int)
             cur.ep_int = (uint8_t) (addr & 15);
           cur.usable = cur.ep_in && cur.ep_out;
-          cur.mtp = cur.usable && cur.cls == 6 && cur.sub == 1 && cur.proto == 1;
+          /* MTP: still image class (6/1/1), or Android's older form,
+             vendor-specific FF/FF/00 with a bulk IN, a bulk OUT and an
+             interrupt IN (the kernel's f_mtp; Amazon's Fire tablets, for
+             one). Android's other vendor interfaces differ (ADB is FF/42/01
+             with no interrupt endpoint). */
+          cur.mtp = cur.usable
+                    && ((cur.cls == 6 && cur.sub == 1 && cur.proto == 1)
+                        || (cur.cls == 0xFF && cur.sub == 0xFF && cur.proto == 0 && cur.ep_int));
         }
       p += p[0];
     }
@@ -350,7 +365,7 @@ open_streams (usbt *u)
 {
   u->h_in = open_stream (&u->c, u->c.ep_in, "bulk", BULK_BUFFER, 0);
   u->h_out = open_stream (&u->c, u->c.ep_out, "bulk", BULK_BUFFER, 1);
-  if (u->c.ep_int)
+  if (u->c.ep_int && !usb_no_events)
     u->h_int = open_stream (&u->c, u->c.ep_int, "interrupt", EVENT_BUFFER, 0);
   if (!u->h_in || !u->h_out || handles (u, u->h_in, &u->s_in, 0) || handles (u, u->h_out, &u->s_out, &u->b_out))
     {
@@ -375,7 +390,11 @@ out_idle (usbt *u, unsigned timeout_cs)
       regs ti = {{ DFS_TRANSFER_INFO, (unsigned) u->c.dev, u->s_out, 0, 0 }};
       int status = swix_regs (DeviceFS_CallDevice, &ti) ? 1 : (int) ti.r[3];
       if (status < 0)
-        return u->out_failed = 1, PDT_IO;   /* failed (stalled, or the device has gone) */
+        {
+          if (!u->out_failed)
+            u->out_failed_at = now_cs ();
+          return u->out_failed = 1, PDT_IO;   /* failed (stalled, or the device has gone) */
+        }
       if (used == 0 && status != 0)
         return u->out_stuck = 0, 0;
       /* the buffer has emptied: don't wait long for a status that may
@@ -385,7 +404,7 @@ out_idle (usbt *u, unsigned timeout_cs)
           if (!empty_since)
             empty_since = now_cs () | 1;
           else if (now_cs () - empty_since > 50)
-            return 0;
+            return u->unconfirmed++, 0;
         }
       else
         wake (u, DEVCALL_WAKEUP_TX, u->s_out, 0);
@@ -427,6 +446,8 @@ usb_write (pd_transport *t, const void *buf, uint32_t len, unsigned timeout_cs)
   return out_idle (u, timeout_cs);
 }
 
+static void drain (usbt *u, unsigned cs);
+
 static int
 usb_read (pd_transport *t, void *buf, uint32_t max, unsigned timeout_cs)
 {
@@ -441,6 +462,8 @@ usb_read (pd_transport *t, void *buf, uint32_t max, unsigned timeout_cs)
       if (used)
         {
           int k = gbpb (u->h_in, buf, used < max ? used : max, 0);
+          if (k > 0)
+            u->last_in = now_cs (), u->in_bytes += (unsigned) k;
           return k < 0 ? PDT_IO : k;
         }
       /* ask for a transfer: as much as the buffer has room for, in whole
@@ -450,7 +473,35 @@ usb_read (pd_transport *t, void *buf, uint32_t max, unsigned timeout_cs)
       want &= ~(mps - 1);
       if (want)
         wake (u, DEVCALL_WAKEUP_RX, u->s_in, want);
-      if (now_cs () - start > timeout_cs)
+      /* Has the input transfer failed? USBDriver doesn't start another
+         after a failure (every read is refused until ClearStall), so
+         nothing more would come in, and the answer on its way is lost:
+         an Amazon Fire's, now and then (0.16 tests 5 to 11; it answers
+         the next request at once). Clear it, say why it failed, and let
+         the MTP layer ask again (PDT_LOST). */
+      unsigned waited = now_cs () - start;
+      regs ti = {{ DFS_TRANSFER_INFO, (unsigned) u->c.dev, u->s_in, 0, 0 }};
+      if (!swix_regs (DeviceFS_CallDevice, &ti) && (int) ti.r[3] < 0 && !t->gone)
+        {
+          char b[160], *q = put_str (b, "usb: an input transfer failed (");
+          regs mr = {{ 13 /* DeviceCall_MonitorRX */, (unsigned) u->c.dev, u->s_in }};
+          const oserror *e = swix_regs (DeviceFS_CallDevice, &mr);
+          const char *why = e ? e->errmess : "no reason given";
+          for (int i = 0; why[i] && i < 80; i++)
+            *q++ = why[i];
+          q = put_str (q, ") after ");
+          q = put_dec (q, waited);
+          put_str (q, " cs: clearing the input pipe");
+          pd_log (b);
+          regs ci = {{ DFS_CLEAR_STALL, (unsigned) u->c.dev, (unsigned) u->h_in }};
+          swix_regs (DeviceFS_CallDevice, &ci);
+          u->in_clears++;
+          /* what's left of the answer (if the device sends it after all)
+             is dropped, so a request asked again is read in step */
+          drain (u, 30);
+          return PDT_LOST;
+        }
+      if (waited > timeout_cs)
         return PDT_TIMEOUT;
     }
 }
@@ -460,7 +511,8 @@ usb_event (pd_transport *t, void *buf, uint32_t max)
 {
   usbt *u = (usbt *) t;
   unsigned used, free;
-  if (!u->h_int || t->gone || buffer_space (u, u->h_int, &used, &free) || used < 12)
+  if (!u->h_int || t->gone || buffer_space (u, u->h_int, &used, &free) || !used
+      || (used < 12 && max >= 12))
     return 0;
   int k = gbpb (u->h_int, buf, used < max ? used : max, 0);
   return k < 0 ? 0 : k;
@@ -481,18 +533,79 @@ class_request (usbt *u, unsigned request, void *data, unsigned len, int in)
 static void
 drain (usbt *u, unsigned cs)
 {
-  uint8_t junk[512];
-  unsigned start = now_cs (), used, free;
+  uint8_t junk[512], first[16];
+  unsigned start = now_cs (), used, free, total = 0;
   unsigned want = u->c.mps > 512 ? u->c.mps : 512;   /* whole packets */
   while (now_cs () - start < cs)
     {
       if (u->t.gone || buffer_space (u, u->h_in, &used, &free))
-        return;
+        break;
       if (used)
-        gbpb (u->h_in, junk, used < sizeof junk ? used : sizeof junk, 0);
+        {
+          int k = gbpb (u->h_in, junk, used < sizeof junk ? used : sizeof junk, 0);
+          for (int i = 0; i < k && total + (unsigned) i < 16; i++)
+            first[total + (unsigned) i] = junk[i];
+          if (k > 0)
+            total += (unsigned) k;
+        }
       else if (free >= want)
         wake (u, DEVCALL_WAKEUP_RX, u->s_in, want);
     }
+  if (total)
+    {
+      /* something came late: say what (a late answer, or something else?) */
+      char b[120], *q = put_str (b, "usb: ");
+      q = put_dec (q, total);
+      q = put_str (q, " bytes came late and were dropped:");
+      for (unsigned i = 0; i < total && i < 16; i++)
+        {
+          *q++ = ' ';
+          *q++ = "0123456789ABCDEF"[first[i] >> 4];
+          *q++ = "0123456789ABCDEF"[first[i] & 15];
+        }
+      *q = 0;
+      pd_log (b);
+    }
+}
+
+/* For the trace: the pipes' state */
+static void
+usb_state (pd_transport *t, char *b, int max)
+{
+  usbt *u = (usbt *) t;
+  unsigned used = 0, free = 0, iu = 0, ifr = 0, eu = 0, ef = 0;
+  (void) max;                   /* (well under 200 bytes) */
+  buffer_space (u, u->h_out, &used, &free);
+  regs ti = {{ DFS_TRANSFER_INFO, (unsigned) u->c.dev, u->s_out, 0, 0 }};
+  int status = swix_regs (DeviceFS_CallDevice, &ti) ? 999 : (int) ti.r[3];
+  buffer_space (u, u->h_in, &iu, &ifr);
+  regs tin = {{ DFS_TRANSFER_INFO, (unsigned) u->c.dev, u->s_in, 0, 0 }};
+  int in_status = swix_regs (DeviceFS_CallDevice, &tin) ? 999 : (int) tin.r[3];
+  if (u->h_int)
+    buffer_space (u, u->h_int, &eu, &ef);
+  char *q = put_str (b, "usb: out ");
+  q = put_dec (q, used);
+  q = put_str (q, " waiting, status ");
+  if (status < 0)
+    q = put_str (q, "-"), status = -status;
+  q = put_dec (q, (unsigned) status);
+  q = put_str (q, ", unconfirmed ");
+  q = put_dec (q, u->unconfirmed);
+  q = put_str (q, "; in ");
+  q = put_dec (q, iu);
+  q = put_str (q, " waiting, status ");
+  if (in_status < 0)
+    q = put_str (q, "-"), in_status = -in_status;
+  q = put_dec (q, (unsigned) in_status);
+  q = put_str (q, ", cleared ");
+  q = put_dec (q, u->in_clears);
+  q = put_str (q, ", ");
+  q = put_dec (q, u->in_bytes);
+  q = put_str (q, " so far, last ");
+  q = put_dec (q, now_cs () - u->last_in);
+  q = put_str (q, " cs ago; events ");
+  q = put_dec (q, u->h_int ? eu : 9999);
+  q = put_str (q, " waiting");
 }
 
 static int
@@ -507,32 +620,37 @@ usb_reset (pd_transport *t, uint32_t tid, int level)
   uint8_t cancel[6] = { 0x01, 0x40, (uint8_t) tid, (uint8_t) (tid >> 8),
                         (uint8_t) (tid >> 16), (uint8_t) (tid >> 24) };
   class_request (u, 0x64, cancel, 6, 0);
-  /* What a failed write left in the output buffer mustn't go out before the
-     next command: reopen the output stream (level 1), or all the pipes
-     (level 2: the session starts again).
+  /* Recovery doesn't open pipes again: a pipe opened again starts at DATA0
+     while the device carries on with its data toggle, so the device drops
+     the next packet, and the next command is lost (a Fire tablet stopped
+     answering that way after a timeout, in 0.16 test 2). Only ClearStall
+     resets the device's toggle, and USBDriver makes it synchronously.
 
-     No ClearStall (DeviceFS_CallDevice &80000005): USBDriver does it as a
-     synchronous control request (usbd_do_request), and a failed transfer
-     usually means the device is going (a phone switching from charging to
-     file transfer drops off the bus), which a synchronous request can't
-     cope with. (Taken out in 0.15 test 8; the crash then turned out to
-     come from closing, see close_streams.) */
-  if (level >= 2)
+     After a failed transfer the device has usually gone (a phone switching
+     to file transfer drops off the bus; Service_DeviceDead follows): the
+     pipes are left alone. If it's still there 2 seconds later, it was a
+     stall: then ClearStall, on both bulk pipes (it resets both ends'
+     toggles), and the session starts again.
+
+     Otherwise (a timeout): what's left in the output buffer is dropped,
+     and what the device sends late is read and dropped. */
+  if (u->out_failed)
     {
-      close_streams (u);
-      if (open_streams (u))
-        return t->gone = 1, PDT_GONE;
+      if (now_cs () - u->out_failed_at < 200)
+        return PDT_IO;
+      pd_log ("usb: a transfer failed and the device is still there: clearing the stall");
+      regs co = {{ DFS_CLEAR_STALL, (unsigned) u->c.dev, (unsigned) u->h_out }};
+      regs ci = {{ DFS_CLEAR_STALL, (unsigned) u->c.dev, (unsigned) u->h_in }};
+      if (swix_regs (DeviceFS_CallDevice, &co) || swix_regs (DeviceFS_CallDevice, &ci))
+        return PDT_IO;
+      u->out_failed = 0;
+      buffer_purge (u->b_out);
       drain (u, 20);
       return 1;
     }
   drop_unsent (u);
-  close_stream (&u->h_out);
-  u->out_failed = 0;
-  u->h_out = open_stream (&u->c, u->c.ep_out, "bulk", BULK_BUFFER, 1);
-  if (!u->h_out || handles (u, u->h_out, &u->s_out, &u->b_out))
-    return t->gone = 1, PDT_GONE;
-  drain (u, 30);
-  return 0;
+  drain (u, level >= 2 ? 50 : 30);
+  return level >= 2 ? 1 : 0;
 }
 
 static void
@@ -598,6 +716,7 @@ usb_mount (const usb_iface *c)
       return &err_open;
     }
   u->t.write = usb_write;
+  u->t.state = usb_state;
   u->t.read = usb_read;
   u->t.event = usb_event;
   u->t.reset = usb_reset;

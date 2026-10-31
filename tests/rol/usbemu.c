@@ -44,7 +44,9 @@ typedef struct
   int gen;                  /* which enumeration of the phone it's on */
   int failed;               /* its transfer failed when the device went */
   int inflight;             /* a transfer the charging phone NAKs is on the bus */
+  unsigned toggle;          /* host side: packets sent since the pipe was opened (or ClearStall) */
   unsigned flags;           /* Get/Set Options: bit 1 'short' */
+  int halted;               /* PDFSEmu$InHaltAfter: this input pipe has failed on the host's side */
   unsigned cap, len;        /* buffer size and bytes in it */
   uint8_t *buf;
 } stream;
@@ -160,6 +162,21 @@ static const uint8_t phone[] = {
   7, 5, 0x82, 3, 28, 0, 6,            /* interrupt IN 2 */
 };
 
+/* PDFSEmu$Phone "fire": an Amazon Fire tablet (VID 1949), whose MTP
+   interface is Android's older vendor-specific one (FF/FF/00), with an ADB
+   interface (FF/42/01) that mustn't be taken for MTP */
+static const uint8_t fire[] = {
+  18, 1, 0x00, 0x02, 0, 0, 0, 64, 0x49, 0x19, 0x81, 0x05, 0x00, 0x02, 1, 2, 3, 1,
+  9, 2, 62, 0, 2, 1, 0, 0x80, 250,
+  9, 4, 0, 0, 3, 0xFF, 0xFF, 0x00, 4,  /* MTP, vendor-specific */
+  7, 5, 0x81, 2, 0x00, 0x02, 0,
+  7, 5, 0x01, 2, 0x00, 0x02, 0,
+  7, 5, 0x82, 3, 28, 0, 6,
+  9, 4, 1, 0, 2, 0xFF, 0x42, 0x01, 5,  /* ADB */
+  7, 5, 0x83, 2, 0x00, 0x02, 0,
+  7, 5, 0x02, 2, 0x00, 0x02, 0,
+};
+
 static const uint8_t stick[] = {
   18, 1, 0x00, 0x02, 0, 0, 0, 64, 0x81, 0x07, 0x51, 0x55, 0x00, 0x01, 1, 2, 3, 1,
   9, 2, 32, 0, 1, 1, 0, 0x80, 100,
@@ -203,7 +220,14 @@ make_record (uint8_t *next, const char *name, int addr, const uint8_t *desc, uns
    (default 50), for USB9 and then two short-lived enumerations (USB10,
    USB11), and PDFSEmu$BackAfter cs after that (default 150) it is back as
    "USB12", in MTP mode (bridged to the simulator), with Service_USB 0
-   (Attach). "charging-only": it is never switched.
+   (Attach). "charging-only": it is never switched. "reconnect": the phone
+   answers from the start (bridged), and drops off and comes back the same
+   way PDFSEmu$SwitchAfter cs after the first command, as a Fire tablet
+   does after its owner taps Allow.
+
+   USB's data toggle is modelled for the output pipes: a pipe opened again
+   starts at DATA0 while the device carries on, until ClearStall; out of
+   step, the device drops the next packet (a hazard).
 
    The events come asynchronously, as USBDriver's do: from a transient
    callback (OS_CallAfter, then OS_AddCallBack), or, while PDFS is waiting on
@@ -242,6 +266,7 @@ static unsigned switch_after = 300, dead_after = 50, back_after = 150;
 static unsigned next_event_at;   /* monotonic time, 0: none */
 static int next_event;           /* 1 switch, 2 dead, 3 back */
 static int switch_armed;
+static unsigned dev_toggle[MAX_GEN][16];  /* device side: OUT packets taken since its last ClearStall */
 static int delivering;
 
 static const char gen_name[MAX_GEN][6] = { "USB9", "USB12", "USB13", "USB14" };
@@ -275,6 +300,11 @@ read_num (const char *var, unsigned dflt)
   return v;
 }
 
+/* PDFSEmu$InHaltAfter N: the Nth input transfer fails on the host's side
+   (its TransferInfo says failed, and nothing more comes in) while the
+   device holds its answer, until ClearStall */
+static unsigned in_delivered, in_halt_after, in_halt_done, in_halt_drop;
+
 static void
 read_scenario (void)
 {
@@ -290,7 +320,13 @@ read_scenario (void)
         scenario = 1;
       else if (str_is (b, "charging-only"))
         scenario = 2;
+      else if (str_is (b, "reconnect"))
+        scenario = 3;
     }
+  in_halt_after = read_num ("PDFSEmu$InHaltAfter", 0);
+  /* PDFSEmu$InHaltDrop 1: the answer held is lost when the pipe is cleared
+     (as an Amazon Fire's was) */
+  in_halt_drop = read_num ("PDFSEmu$InHaltDrop", 0);
   switch_after = read_num ("PDFSEmu$SwitchAfter", switch_after);
   dead_after = read_num ("PDFSEmu$DeadAfter", dead_after);
   back_after = read_num ("PDFSEmu$BackAfter", back_after);
@@ -300,7 +336,7 @@ static int
 charging_gen (int gen)
 {
   read_scenario ();
-  return scenario > 0 && gen == 0;
+  return (scenario == 1 || scenario == 2) && gen == 0;
 }
 
 static void
@@ -369,7 +405,14 @@ run_events (void)
   switch (ev)
     {
     case 1:                         /* switched: off the bus */
-      pd_log ("usbemu: the phone is switched to file transfer: it drops off the bus");
+      pd_log (scenario == 3 ? "usbemu: the device drops off the bus, to come back (as after Allow on a Fire)"
+                            : "usbemu: the phone is switched to file transfer: it drops off the bus");
+      if (sock >= 0)
+        {
+          regs cl = {{ (unsigned) sock }};
+          swix_regs (Socket_Close, &cl);
+          sock = -1;
+        }
       gone_at[phone_gen] = emu_now () | 1;
       phone_present = 0;
       for (int i = 0; i < NSTREAM; i++)
@@ -495,6 +538,7 @@ open_fake (const char *path, int output)
         s->gen = phone_gen;
         s->failed = 0;
         s->inflight = 0;
+        s->toggle = 0;
         if (gone_at[phone_gen])
           hazard_note ("a stream opened on a device that has gone (before its Service_DeviceDead)");
         if (s->ep == 1 && !output && !charging_gen (s->gen) && connect_sim ())
@@ -527,6 +571,15 @@ fetch (stream *s, unsigned bytes)
 {
   if (sock < 0 || s->ep != 1)
     return;
+  read_scenario ();
+  if (in_halt_after && !in_halt_done && in_delivered + 1 >= in_halt_after)
+    {
+      in_halt_done = 1;
+      s->halted = 1;
+      log_line ("usbemu: the input pipe fails on the host's side (the device holds its answer)");
+    }
+  if (s->halted)
+    return;
   if (bytes > s->cap - s->len)
     bytes = s->cap - s->len;
   if (!bytes)
@@ -539,7 +592,10 @@ fetch (stream *s, unsigned bytes)
     return;
   regs r = {{ (unsigned) sock, (unsigned) (s->buf + s->len), bytes, 0 }};
   if (!swix_regs (Socket_Recv, &r) && (int) r.r[0] > 0)
-    s->len += r.r[0];
+    {
+      s->len += r.r[0];
+      in_delivered++;
+    }
 }
 
 /* --- the SWIs ---------------------------------------------------------------------------- */
@@ -567,7 +623,13 @@ usbemu_swix (unsigned swi, regs *r)
           read_scenario ();
           list = make_record (list, "USB8", 2, stick, sizeof stick);
           if (phone_present)
-            list = make_record (list, gen_name[phone_gen], 3 + phone_gen, phone, sizeof phone);
+            {
+              char b[8];
+              regs v = {{ (unsigned) "PDFSEmu$Phone", (unsigned) b, sizeof b - 1, 0, 0 }};
+              int is_fire = !swix_regs (0x23, &v) && v.r[2] == 4 && b[0] == 'f';
+              list = is_fire ? make_record (list, gen_name[phone_gen], 3 + phone_gen, fire, sizeof fire)
+                             : make_record (list, gen_name[phone_gen], 3 + phone_gen, phone, sizeof phone);
+            }
           r->r[2] = (unsigned) list;
           return e;
         }
@@ -693,12 +755,21 @@ usbemu_swix (unsigned swi, regs *r)
           r->r[3] = 1;                           /* done */
           if ((s = fake_stream (r->r[2])))
             {
-              if (s->failed)
+              if (s->failed || s->halted)
                 r->r[3] = (unsigned) -1;         /* failed */
               else if (charging_gen (s->gen) && (s->len || s->inflight))
                 r->r[3] = 0;                     /* NAKed: still going */
             }
           return 0;
+        case 13:                                 /* MonitorRX: why the transfer failed */
+          if ((s = fake_stream (r->r[2])))
+            {
+              static const struct { int n; char m[40]; } err = { 0x819C0D, "USB transfer failed: IO Error" };
+              if (s->halted || s->failed)
+                return (oserror *) &err;
+              return 0;
+            }
+          break;
         case 0x80000008u:                        /* Get/Set Options */
           if ((s = fake_stream (r->r[2])))
             {
@@ -712,6 +783,39 @@ usbemu_swix (unsigned swi, regs *r)
         case 0x80000005u:                        /* ClearStall */
         case 0x80000000u:                        /* control request */
           log_line (r->r[0] == 0x80000000u ? "usbemu: control request" : "usbemu: ClearStall");
+          if (r->r[0] == 0x80000005u && (s = fake (r->r[2])) && phone_present)
+            {
+              /* (toggles are per endpoint and direction: only the
+                 output pipe's are modelled) */
+              if (s->output)
+                dev_toggle[s->gen][s->ep & 15] = 0;
+              s->toggle = 0;
+              if (s->halted && in_halt_drop)
+                {
+                  /* the device's answer is lost: what the bridge has (or
+                     gets in the next 50 ms) is dropped */
+                  uint8_t junk[512];
+                  unsigned dropped = 0;
+                  for (int tries = 0; tries < 25; tries++)
+                    {
+                      uint32_t set[8] = { 0 };
+                      set[sock / 32] |= 1u << (sock % 32);
+                      uint32_t tv[2] = { 0, 2000 };
+                      regs sel = {{ (unsigned) sock + 1, (unsigned) set, 0, 0, (unsigned) tv }};
+                      if (swix_regs (Socket_Select, &sel) || sel.r[0] == 0)
+                        continue;
+                      regs rr = {{ (unsigned) sock, (unsigned) junk, sizeof junk, 0 }};
+                      if (swix_regs (Socket_Recv, &rr) || (int) rr.r[0] <= 0)
+                        break;
+                      dropped += rr.r[0];
+                    }
+                  log_line (dropped ? "usbemu: ClearStall on the failed input pipe: the answer it held is lost"
+                                    : "usbemu: ClearStall on the failed input pipe (nothing held)");
+                }
+              else if (s->halted)
+                log_line ("usbemu: ClearStall on the failed input pipe: it carries on");
+              s->halted = 0;
+            }
           read_scenario ();
           if (scenario > 0 && (const char *) r->r[1] && !phone_present)
             hazard ("a control request (synchronous in USBDriver) on a phone that has gone");
@@ -737,9 +841,32 @@ usbemu_swix (unsigned swi, regs *r)
             }
           if ((s = fake_stream (r->r[2])) && s->output && s->len)
             {
+              if (scenario == 3 && !switch_armed)
+                {
+                  switch_armed = 1;
+                  schedule (1, switch_after);
+                }
               usbemu_transfers++;
-              check_transfer (s->buf, s->len, (s->flags & 2) != 0);
-              send_all (s->buf, s->len);
+              unsigned packets = (s->len + 511) / 512 + ((s->len & 511) == 0 && (s->flags & 2) ? 1 : 0);
+              unsigned *dt = &dev_toggle[s->gen][s->ep & 15];
+              if ((s->toggle ^ *dt) & 1)
+                {
+                  /* USB's data toggle: a pipe opened again starts at DATA0,
+                     but the device carries on where it was (only ClearStall
+                     resets it). It takes the first packet for a repeat,
+                     ACKs it and drops it. */
+                  hazard ("the data toggle was out of step (the pipe was opened again without ClearStall): the device dropped a packet");
+                  if (s->len > 512)
+                    send_all (s->buf + 512, s->len - 512);
+                  *dt += packets - 1;
+                }
+              else
+                {
+                  check_transfer (s->buf, s->len, (s->flags & 2) != 0);
+                  send_all (s->buf, s->len);
+                  *dt += packets;
+                }
+              s->toggle += packets;
               s->len = 0;
             }
           return 0;

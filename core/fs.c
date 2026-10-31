@@ -9,6 +9,16 @@
 unsigned pdfs_dir_ttl_cs = 500;
 int pdfs_hide_ext = 1;
 unsigned pdfs_timeout_cs = 1000;
+/* An Android device is left alone this long after its session opens
+   before it's asked about its storages: an Amazon Fire just back on the
+   bus after Allow answered a few requests at once and then nothing more
+   (0.16 tests 5 to 7); OpenMTP, used seconds later, works. */
+unsigned pdfs_settle_cs = 500;
+/* The least time between an answer from an Android device and the next
+   request (see gap_wait in mtp.c); -1: the default. *PDFSMount sets it
+   from PDFS$Gap. */
+int pdfs_gap_cs = -1;
+#define ANDROID_GAP_CS 1
 
 #define MAX_DEVICES   4
 #define MAX_STORAGES  4
@@ -52,7 +62,9 @@ typedef struct storage
   uint64_t free, capacity;
   int readonly;
   int ejected;                /* *PDFSEject'ed: hidden until the device is mounted again */
+  int info_pending;           /* found, but not yet asked about (GetStorageInfo): hidden */
   unsigned info_at;           /* when free space was last read */
+  unsigned info_failed_at;    /* when the device last didn't answer that */
   node root;
 } storage;
 
@@ -62,7 +74,18 @@ typedef struct device
   mtp_dev mtp;
   storage st[MAX_STORAGES];
   int nst;
+  int waiting;                /* no storages yet: access not allowed on the device */
+  unsigned next_look;         /* when to ask for its storages again (pd_time_cs) */
+  int silent;                 /* looks in a row it didn't answer */
+  unsigned settle_until;      /* an Android device just opened: not asked about its storages before this */
 } device;
+
+/* A storage ejected on its own, or not yet asked about, isn't shown */
+static int
+st_hidden (const storage *st)
+{
+  return st->ejected || st->info_pending;
+}
 
 typedef struct ofile ofile;
 struct ofile
@@ -86,6 +109,10 @@ struct ofile
   uint32_t slen;              /* bytes in the SendObject (the last may follow by an edit) */
   uint8_t *tail;              /* while streaming: a bit for each 4K block written */
   uint8_t *rbuf;              /* read-ahead */
+  uint32_t rgen;              /* from a device without partial reads: which whole-object */
+  uint64_t rpos;              /* stream (mtp_rstream) is this file's, and how far it has got */
+  int fill;                   /* being received whole, into its storage, in the background */
+  uint64_t have;              /* bytes of it there so far */
   uint64_t roff;
   uint32_t rlen;
 };
@@ -97,6 +124,8 @@ static void f_free (ofile *f);
 
 static device devices[MAX_DEVICES];
 static ofile *files;
+static int fill_run (unsigned until_cs);
+#define FILL_SLICE 3            /* cs of receiving from a device per null event */
 static node *pending_create;   /* created by FSEntry_File 7, not yet sent */
 int pdfs_background;            /* the filer task sends big files in the background */
 int pdfs_background_option;     /* *PDFSBackground: whether it should (off by default) */
@@ -135,6 +164,7 @@ static pd_error err_device;    /* a response code from the device, with its numb
 static const char hexd[] = "0123456789ABCDEF";
 static char *cat_num (char *o, uint64_t v);
 static char *cat (char *o, const char *s);
+static char *cat_tenths (char *o, uint64_t v);
 extern int pdfs_trace;
 
 static const pd_error *
@@ -146,7 +176,8 @@ rc_error (int rc)
     {
     case PDT_TIMEOUT: return &err_timeout;
     case PDT_GONE: return &err_gone;
-    case PDT_IO: return &err_io;
+    case PDT_IO:
+    case PDT_LOST: return &err_io;
     case MTP_ENOMEM: return &err_nomem;
     case MTP_EBUSY: return &err_busy;
     case MTP_EPROTO: return &err_proto;
@@ -329,7 +360,26 @@ parse_mtp_date (const char *s)
           v[f] = v[f] * 10 + (*s - '0');
         }
     }
-  return days_from_civil (v[0], v[1], v[2]) * 86400u + (uint32_t) (v[3] * 3600 + v[4] * 60 + v[5]);
+  uint32_t t = days_from_civil (v[0], v[1], v[2]) * 86400u + (uint32_t) (v[3] * 3600 + v[4] * 60 + v[5]);
+  /* The MTP standard's optional parts: tenths (".s"), then the time zone:
+     "Z" (UTC) or +hhmm/-hhmm. Without one the zone isn't said, and the time
+     is taken as it stands (as PDFS writes its own); with one, it's UTC. */
+  if (*s == '.')
+    for (s++; *s >= '0' && *s <= '9'; s++)
+      ;
+  if ((*s == '+' || *s == '-') && s[1] >= '0' && s[1] <= '9' && s[2] >= '0' && s[2] <= '9')
+    {
+      int sign = *s == '-' ? -1 : 1;
+      int hh = (s[1] - '0') * 10 + (s[2] - '0'), mm = 0;
+      const char *q = s + 3;
+      if (*q == ':')
+        q++;
+      if (q[0] >= '0' && q[0] <= '9' && q[1] >= '0' && q[1] <= '9')
+        mm = (q[0] - '0') * 10 + (q[1] - '0');
+      if (hh <= 14 && mm < 60)
+        t -= (uint32_t) (sign * (hh * 3600 + mm * 60));
+    }
+  return t;
 }
 
 static void
@@ -941,11 +991,22 @@ list_dir (node *dir)
   }
 
   /* 2. their names, sizes and dates, all at once if the device can */
-  if (mtp_supports (m, OP_GetObjectPropList))
+  if (mtp_supports (m, OP_GetObjectPropList) && !m->no_proplist)
     {
       uint32_t p[5] = { root ? 0u : dir->handle, 0, 0xFFFFFFFFu, 0, 1 };
       mtp_data in = { 0, 0, 0 };
+      /* 5 seconds at most: a device that takes longer gets folders listed
+         an object at a time from now on */
+      unsigned listing_cs = m->timeout_cs;
+      if (have_handles && m->timeout_cs > 500)
+        m->timeout_cs = 500;
       rc = mtp_transaction (m, OP_GetObjectPropList, p, 5, 0, 0, &in, 0);
+      m->timeout_cs = listing_cs;
+      if (rc == PDT_TIMEOUT && have_handles)
+        {
+          pd_log ("pdfs: the device didn't answer GetObjectPropList: folders are listed an object at a time now");
+          m->no_proplist = 1;
+        }
       if (rc == RC_OK)
         {
           int e = parse_proplist (in.buf, in.len, &es, &ne);
@@ -978,12 +1039,12 @@ list_dir (node *dir)
       else
         {
           pd_free (in.buf);
-          if (rc < 0)
+          if (rc < 0 && !(rc == PDT_TIMEOUT && have_handles))
             {
               err = rc_error (rc);
               goto out;
             }
-          ne = 0;                         /* refused: object info for each */
+          ne = 0;                         /* refused (or too slow): object info for each */
         }
     }
   else if (!have_handles)
@@ -1143,7 +1204,7 @@ find_disc (const char *name, int len)
   for (int d = 0; d < MAX_DEVICES; d++)
     if (devices[d].used)
       for (int s = 0; s < devices[d].nst; s++)
-        if (!devices[d].st[s].ejected
+        if (!st_hidden (&devices[d].st[s])
             && (len < 0 ? 1 : name_eq (devices[d].st[s].disc, name, len)))
           return &devices[d].st[s];
   return 0;
@@ -1705,13 +1766,78 @@ load_whole (ofile *f)
       f->dirty = dirty;
       return e;
     }
-  /* No partial reads: the whole object at once, so only into memory */
-  if (f->spill)
-    return &err_unsupported;
+  /* No partial reads: the whole object comes as one data phase, received a
+     piece at a time (into memory or a scrap file, as big as it is) */
   uint32_t h = n->handle;
-  mtp_data in = { f->wbuf + HEADROOM, f->wcap, 0 };
-  int rc = mtp_transaction (m, OP_GetObject, &h, 1, 0, 0, &in, 0);
-  return rc_error (rc);
+  uint64_t total;
+  int rc = mtp_rstream_begin (m, OP_GetObject, &h, 1, &total);
+  if (rc != RC_OK)
+    return rc_error (rc);
+  uint8_t *tmp = pd_alloc (READAHEAD);
+  e = tmp ? 0 : &err_nomem;
+  for (uint64_t off = 0; !e && off < size; )
+    {
+      uint32_t want = size - off > READAHEAD ? READAHEAD : (uint32_t) (size - off);
+      int got = mtp_rstream_get (m, tmp, want);
+      if (got <= 0)
+        e = got < 0 ? rc_error (got) : &err_io;
+      else
+        {
+          e = f_write (f, off, tmp, (uint32_t) got);
+          off += (uint32_t) got;
+        }
+    }
+  pd_free (tmp);
+  rc = mtp_rstream_end (m);
+  if (!e && rc != RC_OK)
+    e = rc_error (rc);
+  f->dirty = dirty;
+  return e;
+}
+
+/* Read from a device that can't send part of an object: its whole object
+   comes as one data phase, received only as far as the reader has asked
+   (Filer_Action reads in blocks it times, so the desktop keeps going and
+   its window shows the copy). Reading on from there is cheap; going back
+   starts the object again. */
+static const pd_error *
+read_streamed (ofile *f, uint64_t off, uint8_t *dst, uint32_t len)
+{
+  mtp_dev *m = dev_of (f->n);
+  if (!(m->rstreaming && m->rgen == f->rgen) || off < f->rpos)
+    {
+      uint32_t h = f->n->handle;
+      uint64_t total;
+      int rc = mtp_rstream_begin (m, OP_GetObject, &h, 1, &total);
+      if (rc != RC_OK)
+        return rc_error (rc);
+      f->rgen = m->rgen;
+      f->rpos = 0;
+    }
+  while (f->rpos < off)
+    {
+      uint64_t skip = off - f->rpos;
+      int got = mtp_rstream_get (m, 0, skip > 0x100000 ? 0x100000 : (uint32_t) skip);
+      if (got <= 0)
+        return got < 0 ? rc_error (got) : &err_io;
+      f->rpos += (uint32_t) got;
+    }
+  while (len)
+    {
+      int got = mtp_rstream_get (m, dst, len);
+      if (got <= 0)
+        return got < 0 ? rc_error (got) : &err_io;
+      f->rpos += (uint32_t) got;
+      dst += got;
+      len -= (uint32_t) got;
+    }
+  if (m->rstreaming && m->rgen == f->rgen && m->rleft == 0)
+    {
+      int rc = mtp_rstream_end (m);
+      if (rc != RC_OK)
+        return rc_error (rc);
+    }
+  return 0;
 }
 
 static const pd_error *
@@ -2355,6 +2481,14 @@ int
 pdfs_bg_run (unsigned cs)
 {
   unsigned until = (pd_time_cs () + cs) | 1;
+  if (pdfs_reading ())
+    {
+      /* files coming from a device first: their readers wait. Short slices:
+         the reader (Filer_Action) gets its turn often */
+      unsigned short_until = (pd_time_cs () + (cs > FILL_SLICE ? FILL_SLICE : cs)) | 1;
+      if (fill_run (short_until))
+        return 1;
+    }
   if (bg_paused)
     return jobs != 0;
   while (jobs)
@@ -2502,6 +2636,173 @@ pdfs_bg_error (void)
   return &bg_err;
 }
 
+/* --- receiving a whole file in the background -------------------------------------
+
+   From a device that can't send part of a file, a file is one long data
+   phase. A read from FileSwitch can't let the desktop in, so instead of
+   receiving it in reads (Filer_Action's), it's received into the file's
+   storage (memory or a scrap file) a slice at a time from the filer's null
+   events (pdfs_bg_run), and a read waits only for what hasn't come yet.
+   Another request to the device while it's coming takes the rest first
+   (fill_busy), rather than drop it. A file closed before it has all come:
+   the rest is read and dropped in the background too (the device sends it
+   anyway). */
+
+static int fills;               /* files being received in the background */
+static uint8_t *fill_tmp;
+
+static int
+can_read_parts (mtp_dev *m)
+{
+  return mtp_supports (m, OP_GetPartialObject64) || mtp_supports (m, OP_GetPartialObject);
+}
+
+static const pd_error *
+fill_start (ofile *f)
+{
+  uint64_t size = f->size;
+  const pd_error *e;
+  if (!fill_tmp && !(fill_tmp = pd_alloc (READAHEAD)))
+    return &err_nomem;
+  f->size = 0;
+  if ((e = f_setsize (f, size)))
+    return e;
+  f->dirty = 0;
+  f->fill = 1;
+  f->have = 0;
+  f->rgen = 0;
+  fills++;
+  return 0;
+}
+
+static void
+fill_done (ofile *f)
+{
+  f->fill = 0;
+  f->loaded = 1;                /* all of it is in its storage now */
+  f->dirty = 0;
+  fills--;
+}
+
+/* Receive until there's up to bytes of it (or until the time until_cs, if
+   not 0) */
+static const pd_error *
+fill_more (ofile *f, uint64_t upto, unsigned until_cs)
+{
+  mtp_dev *m = dev_of (f->n);
+  if (upto > f->size)
+    upto = f->size;
+  if (!(m->rstreaming && m->rgen == f->rgen))
+    {
+      /* (again: the device was wanted for something it couldn't wait for) */
+      if (f->have)
+        pd_log_hex ("pdfs: a file coming whole from the device starts again; bytes to skip", (uint32_t) f->have);
+      uint32_t h = f->n->handle;
+      uint64_t total;
+      int rc = mtp_rstream_begin (m, OP_GetObject, &h, 1, &total);
+      if (rc != RC_OK)
+        return rc_error (rc);
+      f->rgen = m->rgen;
+      for (uint64_t skip = f->have; skip; )
+        {
+          int got = mtp_rstream_get (m, 0, skip > READAHEAD ? READAHEAD : (uint32_t) skip);
+          if (got <= 0)
+            return got < 0 ? rc_error (got) : &err_io;
+          skip -= (uint32_t) got;
+        }
+    }
+  while (f->have < upto)
+    {
+      uint32_t want = f->size - f->have > READAHEAD ? READAHEAD : (uint32_t) (f->size - f->have);
+      int got = mtp_rstream_get (m, fill_tmp, want);
+      if (got <= 0)
+        return got < 0 ? rc_error (got) : &err_io;
+      const pd_error *e = f_write (f, f->have, fill_tmp, (uint32_t) got);
+      f->dirty = 0;
+      if (e)
+        return e;
+      f->have += (uint32_t) got;
+      if (until_cs && (int) (pd_time_cs () - until_cs) >= 0)
+        break;
+    }
+  if (f->have >= f->size)
+    {
+      int rc = m->rstreaming && m->rgen == f->rgen ? mtp_rstream_end (m) : RC_OK;
+      fill_done (f);
+      if (rc != RC_OK)
+        return rc_error (rc);
+    }
+  return 0;
+}
+
+/* The device is wanted while a file is coming from it: take the rest of the
+   file first (or, if it's no one's now, let it be dropped) */
+static void
+fill_busy (void *d)
+{
+  for (ofile *f = files; f; f = f->next)
+    if (f->fill && &f->n->st->dev->mtp == d && ((mtp_dev *) d)->rgen == f->rgen)
+      {
+        pd_log_hex ("pdfs: the device is wanted while a file comes from it: taking the rest first, bytes",
+                    (uint32_t) (f->size - f->have));
+        fill_more (f, f->size, 0);
+        return;
+      }
+}
+
+/* A slice of background receiving: 1 if there's more to do */
+static int
+fill_run (unsigned until_cs)
+{
+  int more = 0;
+  for (ofile *f = files; f; f = f->next)
+    if (f->fill && !dev_of (f->n)->streaming)
+      {
+        const pd_error *e = fill_more (f, f->size, until_cs);
+        if (e)
+          {
+            /* failed: the reads will say so, receiving it in the foreground */
+            char b[200], *q = cat (b, "pdfs: receiving a file in the background: ");
+            cat (q, e->errmess);
+            pd_log (b);
+            continue;
+          }
+        more |= f->fill;
+        if ((int) (pd_time_cs () - until_cs) >= 0)
+          return 1;
+      }
+  /* streams whose file was closed before the end: the rest is dropped */
+  for (int d = 0; d < MAX_DEVICES; d++)
+    {
+      mtp_dev *m = &devices[d].mtp;
+      if (!devices[d].used || !m->rstreaming)
+        continue;
+      int owned = 0;
+      for (ofile *f = files; f; f = f->next)
+        owned |= f->fill && dev_of (f->n) == m && f->rgen == m->rgen;
+      if (owned)
+        continue;
+      while (m->rstreaming && m->rleft && (int) (pd_time_cs () - until_cs) < 0)
+        if (mtp_rstream_get (m, 0, READAHEAD) <= 0)
+          break;
+      if (m->rstreaming && !m->rleft)
+        mtp_rstream_end (m);
+      more |= m->rstreaming;
+    }
+  return more || fills;
+}
+
+int
+pdfs_reading (void)
+{
+  if (fills)
+    return 1;
+  for (int d = 0; d < MAX_DEVICES; d++)
+    if (devices[d].used && devices[d].mtp.rstreaming)
+      return 1;
+  return 0;
+}
+
 static const pd_error *
 fs_getbytes (pd_regs *r)
 {
@@ -2526,6 +2827,21 @@ fs_getbytes (pd_regs *r)
         return e;
       return f_read (f, off, dst, avail) < 0 ? &err_scrapio : 0;
     }
+  if (!f->fill && f->size > READAHEAD && !can_read_parts (dev_of (f->n)) && !f->n->pending)
+    {
+      /* A device that can't send part of a file: it comes whole, and is
+         received into the file's storage, mostly in the background
+         (pdfs_bg_run, from the filer's null events), so the desktop keeps
+         going; a read waits only for what isn't there yet */
+      if ((e = fill_start (f)))
+        return e;
+    }
+  if (f->fill)
+    {
+      if (off + avail > f->have && (e = fill_more (f, off + avail, 0)))
+        return e;
+      return f_read (f, off, dst, avail) < 0 ? &err_scrapio : 0;
+    }
   while (avail)
     {
       if (f->rbuf && off >= f->roff && off < f->roff + f->rlen)
@@ -2544,12 +2860,7 @@ fs_getbytes (pd_regs *r)
       uint32_t want = f->size - off < READAHEAD ? (uint32_t) (f->size - off) : READAHEAD, got;
       e = read_object (f->n, off, f->rbuf, want, &got);
       if (e == &err_unsupported)
-        {
-          /* No partial reads on this device: fetch the whole object once */
-          if ((e = load_whole (f)))
-            return e;
-          return f_read (f, off, dst, avail) < 0 ? &err_scrapio : 0;
-        }
+        return read_streamed (f, off, dst, avail);   /* no partial reads on this device */
       if (e)
         return e;
       if (!got)
@@ -2678,6 +2989,12 @@ fs_close (pd_regs *r)
     {
       *pp = f->next;            /* the job has it now, and the node's ref */
       return 0;
+    }
+  if (f->fill)
+    {
+      f->fill = 0;              /* the rest is dropped in the background (fill_run) */
+      f->dirty = 0;
+      fills--;
     }
   if (!e && f->dirty && !n->gone)
     e = commit (f);
@@ -3088,6 +3405,11 @@ fs_func (pd_regs *r)
 /* --- entry ------------------------------------------------------------------------------ */
 
 static void release (device *dv);
+static int add_storages (device *dv, unsigned look_cs);
+static int finish_storages (device *dv);
+
+int pdfs_mount_defer;           /* the filer is mounting: storages asked about from its poll */
+#define LOOK_CS 150             /* longest wait for the storage list while waiting (from the poll) */
 
 static void
 poll_events (void)
@@ -3105,12 +3427,68 @@ poll_events (void)
           release (dv);
           continue;
         }
+      if (dv->settle_until)
+        {
+          if ((int) (pd_time_cs () - dv->settle_until) < 0)
+            continue;
+          dv->settle_until = 0;
+          int defer = pdfs_mount_defer;
+          pdfs_mount_defer = 1;     /* asked about one per poll, as when the filer mounts */
+          int rc = add_storages (dv, 0);
+          pdfs_mount_defer = defer;
+          if (rc == RC_AccessDenied || rc == RC_DeviceBusy || (rc == RC_OK && dv->nst == 0))
+            {
+              dv->waiting = 1;
+              dv->next_look = pd_time_cs () + 100;
+              pd_log ("pdfs: the device has no storages yet: waiting for access to its data to be allowed on it");
+            }
+          else if (rc != RC_OK)
+            pd_log ("pdfs: the device didn't say what storages it has");
+          continue;
+        }
+      int look = 0;
+      int pending = 0;
+      for (int s = 0; s < dv->nst; s++)
+        pending |= dv->st[s].info_pending == 1;
+      if (pending && !dv->mtp.streaming)
+        {
+          finish_storages (dv);   /* one per poll */
+          continue;
+        }
       while (mtp_poll_event (&dv->mtp, &code, &p1))
         {
           pd_log_hex ("pdfs: event", code);
+          if (code == 0x4004)         /* StoreAdded */
+            look = 1;
           for (int s = 0; s < dv->nst; s++)
             invalidate_all (&dv->st[s].root);
         }
+      if (dv->waiting && (int) (pd_time_cs () - dv->next_look) >= 0)
+        look = 1;
+      if (!look || dv->mtp.streaming)
+        continue;
+      int rc = add_storages (dv, dv->waiting ? LOOK_CS : 0);
+      if (rc < 0 && !dv->waiting)
+        continue;               /* a transfer error: the next call finds it */
+      if (rc < 0)
+        {
+          /* no answer: give it a few more looks (a second each), then let it go */
+          if (++dv->silent < 5)
+            {
+              dv->next_look = pd_time_cs () + 100;
+              continue;
+            }
+          pd_log ("pdfs: the device stopped answering while waiting for access to be allowed");
+          release (dv);
+          continue;
+        }
+      dv->silent = 0;
+      if (dv->waiting && dv->nst)
+        {
+          dv->waiting = 0;
+          pd_log ("pdfs: access allowed: the device's storages are there now");
+        }
+      dv->next_look = pd_time_cs () + 100;
     }
 }
 
@@ -3247,6 +3625,88 @@ make_disc_name (device *dv, storage *st)
     }
 }
 
+/* Ask the device for its storages and add the ones not known yet: at the
+   mount, and later when it had none (access not allowed yet) or says one
+   was added (StoreAdded). RC_OK, an MTP response code, or a transport error. */
+static int
+add_storages (device *dv, unsigned look_cs)
+{
+  /* From the filer (pdfs_mount_defer, or a look from its poll): the new
+     storages are asked about one per poll (finish_storages), so a device
+     that's slow to answer holds the desktop for one answer at a time.
+     A *command asks about them all at once. */
+  mtp_data in = { 0, 0, 0 };
+  /* look_cs: how long the storage list may take (a look from the filer's
+     poll while waiting must be brief); 0 = the usual time. Storages found
+     are then asked about (GetStorageInfo) in the usual time. */
+  unsigned saved = dv->mtp.timeout_cs;
+  if (look_cs && look_cs < saved)
+    dv->mtp.timeout_cs = look_cs;
+  int rc = mtp_transaction (&dv->mtp, OP_GetStorageIDs, 0, 0, 0, 0, &in, 0);
+  dv->mtp.timeout_cs = saved;
+  if (rc != RC_OK || in.len < 4)
+    {
+      pd_free (in.buf);
+      return rc == RC_OK ? MTP_EPROTO : rc;
+    }
+  int had = dv->nst;
+  uint32_t n = get32 (in.buf);
+  for (uint32_t i = 0; i < n && dv->nst < MAX_STORAGES && 8 + 4 * i <= in.len; i++)
+    {
+      uint32_t id = get32 (in.buf + 4 + 4 * i);
+      if ((id & 0xFFFF) == 0)
+        continue;             /* a logical storage that isn't there (empty card slot) */
+      int known = 0;
+      for (int s = 0; s < dv->nst; s++)
+        known |= dv->st[s].id == id;
+      if (known)
+        continue;
+      storage *st = &dv->st[dv->nst];
+      memset (st, 0, sizeof *st);
+      st->dev = dv;
+      st->id = id;
+      st->root.st = st;
+      st->root.isdir = 1;
+      st->root.filetype = -1;
+      st->root.mtp_name = str_dup ("$", 1);
+      st->root.ro_name = str_dup ("$", 1);
+      st->info_pending = 1;
+      dv->nst++;
+    }
+  pd_free (in.buf);
+  (void) had;
+  if (!pdfs_mount_defer && !look_cs)
+    while (finish_storages (dv))
+      ;
+  return RC_OK;
+}
+
+/* Ask about one storage found but not yet asked about (GetStorageInfo).
+   When none are left, the new ones get their disc names: all of them the
+   first time, after that only the new ones, so discs in use keep theirs.
+   Returns 1 if there are more to ask about. */
+static int
+finish_storages (device *dv)
+{
+  for (int s = 0; s < dv->nst; s++)
+    if (dv->st[s].info_pending == 1)
+      {
+        storage_info (&dv->st[s]);
+        dv->st[s].info_pending = 2;   /* asked; named below */
+        break;
+      }
+  for (int s = 0; s < dv->nst; s++)
+    if (dv->st[s].info_pending == 1)
+      return 1;
+  for (int s = 0; s < dv->nst; s++)
+    if (dv->st[s].info_pending == 2)
+      {
+        dv->st[s].info_pending = 0;
+        make_disc_name (dv, &dv->st[s]);
+      }
+  return 0;
+}
+
 const pd_error *
 pdfs_mount (pd_transport *tr)
 {
@@ -3268,8 +3728,13 @@ pdfs_mount (pd_transport *tr)
       tr->close (tr);
       return &err_nomem;
     }
+  /* (mtp_open gives a device 3 seconds to answer its first request: one
+     set to charging only never does. After that, the usual time: a Fire
+     tablet just back on the bus after Allow took over 1.5 seconds to
+     answer GetStorageInfo.) */
   dv->mtp.timeout_cs = pdfs_timeout_cs;
   dv->mtp.busy_wait = busy_wait;
+  dv->mtp.rbusy = fill_busy;
   int rc = mtp_open (&dv->mtp);
   if (rc < 0)
     {
@@ -3277,40 +3742,44 @@ pdfs_mount (pd_transport *tr)
       mtp_finish (&dv->mtp);
       return e;
     }
-  mtp_data in = { 0, 0, 0 };
-  rc = mtp_transaction (&dv->mtp, OP_GetStorageIDs, 0, 0, 0, 0, &in, 0);
-  if (rc != RC_OK || in.len < 4)
-    {
-      pd_free (in.buf);
-      mtp_finish (&dv->mtp);
-      return rc == RC_OK ? &err_proto : rc_error (rc);
-    }
-  uint32_t n = get32 (in.buf);
   dv->used = 1;
-  for (uint32_t i = 0; i < n && dv->nst < MAX_STORAGES && 8 + 4 * i <= in.len; i++)
+  if (dv->mtp.android)
+    dv->mtp.gap_cs = pdfs_gap_cs >= 0 ? (unsigned) pdfs_gap_cs : ANDROID_GAP_CS;
+  if (dv->mtp.android && pdfs_settle_cs)
     {
-      storage *st = &dv->st[dv->nst];
-      memset (st, 0, sizeof *st);
-      st->dev = dv;
-      st->id = get32 (in.buf + 4 + 4 * i);
-      if ((st->id & 0xFFFF) == 0)
-        continue;             /* a logical storage that isn't there (empty card slot) */
-      st->root.st = st;
-      st->root.isdir = 1;
-      st->root.filetype = -1;
-      st->root.mtp_name = str_dup ("$", 1);
-      st->root.ro_name = str_dup ("$", 1);
-      storage_info (st);
-      dv->nst++;
+      char b[100], *q = cat (b, "pdfs: an Android device: leaving it ");
+      q = cat_tenths (q, pdfs_settle_cs / 10);
+      cat (q, " s to settle before asking about its storages");
+      pd_log (b);
+      if (pdfs_mount_defer)
+        {
+          /* the filer's poll looks for them when the time's up (poll_events) */
+          dv->settle_until = (pd_time_cs () + pdfs_settle_cs) | 1;
+          return 0;
+        }
+      unsigned t0 = pd_time_cs ();
+      while (pd_time_cs () - t0 < pdfs_settle_cs)
+        ;
     }
-  pd_free (in.buf);
-  for (int s = 0; s < dv->nst; s++)
-    make_disc_name (dv, &dv->st[s]);
-  if (dv->nst == 0)
+  rc = add_storages (dv, 0);
+  if (rc == RC_AccessDenied || rc == RC_DeviceBusy || (rc == RC_OK && dv->nst == 0))
+    {
+      /* Android asks the owner to allow access to the device's data when a
+         session is opened, and until they do, it has no storages (or
+         refuses). The session stays open, and the storages are looked for
+         again (poll_events). Closing it and trying again opened a new
+         session each time, and each one asked again: the owner's Allow
+         never reached a session that was still there. */
+      dv->waiting = 1;
+      dv->next_look = pd_time_cs () + 100;
+      pd_log ("pdfs: the device has no storages yet: waiting for access to its data to be allowed on it");
+      return 0;
+    }
+  if (rc != RC_OK)
     {
       dv->used = 0;
       mtp_finish (&dv->mtp);
-      return &err_nodevices;
+      return rc_error (rc);
     }
   return 0;
 }
@@ -3328,6 +3797,8 @@ release (device *dv)
         {
           *pp = f->next;
           f->n->refs--;
+          if (f->fill)
+            fills--;
           f_free (f);           /* and its scrap file */
           pd_free (f->rbuf);
           pd_free (f);
@@ -3380,7 +3851,7 @@ pdfs_disc_count (void)
   for (int d = 0; d < MAX_DEVICES; d++)
     if (devices[d].used)
       for (int s = 0; s < devices[d].nst; s++)
-        n += !devices[d].st[s].ejected;
+        n += !st_hidden (&devices[d].st[s]);
   return n;
 }
 
@@ -3390,7 +3861,7 @@ pdfs_disc_name (int i)
   for (int d = 0; d < MAX_DEVICES; d++)
     if (devices[d].used)
       for (int s = 0; s < devices[d].nst; s++)
-        if (!devices[d].st[s].ejected && i-- == 0)
+        if (!st_hidden (&devices[d].st[s]) && i-- == 0)
           return devices[d].st[s].disc;
   return 0;
 }
@@ -3405,12 +3876,23 @@ pdfs_free_space (const char *disc, uint64_t *size, uint64_t *free)
   int busy = st->dev->mtp.streaming;
   for (job *j = jobs; j; j = j->next)
     busy |= j->dv == st->dev;
-  if (!st->info_at || (!busy && pd_time_cs () - st->info_at > 300))
+  /* A device that didn't answer isn't asked again for 30 seconds (each
+     try waits for it): the window shows what was last known */
+  int failed_lately = st->info_failed_at && pd_time_cs () - st->info_failed_at < 3000;
+  if (!failed_lately && (!st->info_at || (!busy && pd_time_cs () - st->info_at > 300)))
     {
       const pd_error *e = storage_info (st);
       if (e)
-        return e;
-      st->info_at = pd_time_cs () | 1;
+        {
+          st->info_failed_at = pd_time_cs () | 1;
+          if (!st->capacity)
+            return e;
+        }
+      else
+        {
+          st->info_failed_at = 0;
+          st->info_at = pd_time_cs () | 1;
+        }
     }
   *size = st->capacity;
   *free = st->free;
@@ -3435,7 +3917,7 @@ pdfs_eject_info (const char *disc, int all, int *storages, const char **model)
     {
       *storages = 0;
       for (int s = 0; s < dv->nst; s++)
-        *storages += !dv->st[s].ejected;
+        *storages += !st_hidden (&dv->st[s]);
     }
   if (model)
     *model = dv->mtp.model[0] ? dv->mtp.model : "The device";
@@ -3497,7 +3979,7 @@ pdfs_disc_desc (int i)
   for (int d = 0; d < MAX_DEVICES; d++)
     if (devices[d].used)
       for (int s = 0; s < devices[d].nst; s++)
-        if (!devices[d].st[s].ejected && i-- == 0)
+        if (!st_hidden (&devices[d].st[s]) && i-- == 0)
           return devices[d].st[s].desc;
   return 0;
 }
@@ -3508,6 +3990,34 @@ cat (char *o, const char *s)
   while (*s)
     *o++ = *s++;
   *o = 0;
+  return o;
+}
+
+/* v tenths as "12.3" */
+static char *
+cat_tenths (char *o, uint64_t v)
+{
+  o = cat_num (o, v / 10);
+  *o++ = '.';
+  *o++ = (char) ('0' + v % 10);
+  *o = 0;
+  return o;
+}
+
+/* "24.0 MB in 12.1 s (2.0 MB/s)" */
+static char *
+cat_rate (char *o, uint64_t bytes, uint32_t cs)
+{
+  o = cat_tenths (o, bytes * 10 >> 20);
+  o = cat (o, " MB in ");
+  o = cat_tenths (o, cs / 10);
+  o = cat (o, " s");
+  if (cs)
+    {
+      o = cat (o, " (");
+      o = cat_tenths (o, (bytes * 1000 / cs) >> 20);   /* tenths of MB/s */
+      o = cat (o, " MB/s)");
+    }
   return o;
 }
 
@@ -3552,10 +4062,51 @@ pdfs_describe (void (*line) (const char *s))
       p = cat_num (p, dv->mtp.recoveries);
       cat (p, " recoveries");
       line (b);
+      if (dv->waiting)
+        line ("  waiting: allow access to its data on the device");
+      mtp_dev *m = &dv->mtp;
+      line (mtp_supports (m, OP_GetPartialObject64) || mtp_supports (m, OP_GetPartialObject)
+            ? "  reads files: in parts"
+            : "  reads files: whole (the device can't send part of one): received in the background");
+      line (mtp_supports (m, OP_GetObjectPropList) && !m->no_proplist
+            ? "  lists folders: all at once (property lists)"
+            : m->android ? "  lists folders: an object at a time (Android)"
+                         : "  lists folders: an object at a time");
+      if (m->lost)
+        {
+          p = cat (b, "  answers lost on the way (and asked for again): ");
+          cat_num (p, m->lost);
+          line (b);
+        }
+      if (m->gap_cs)
+        {
+          p = cat (b, "  leaves ");
+          p = cat_num (p, m->gap_cs);
+          cat (p, " cs between an answer and the next request");
+          line (b);
+        }
+      p = cat (b, "  received ");
+      p = cat_rate (p, m->bytes_in, m->in_cs);
+      p = cat (p, ", sent ");
+      p = cat_rate (p, m->bytes_out, m->out_cs);
+      p = cat (p, "; longest wait for one request ");
+      p = cat_tenths (p, m->slowest_cs / 10);
+      p = cat (p, " s");
+      if (m->slowest_cs)
+        {
+          char h[8];
+          p = cat (p, " (op &");
+          for (int i = 0; i < 4; i++)
+            h[i] = hexd[(m->slowest_op >> (12 - 4 * i)) & 15];
+          h[4] = 0;
+          p = cat (p, h);
+          cat (p, ")");
+        }
+      line (b);
       for (int s = 0; s < dv->nst; s++)
         {
           storage *st = &dv->st[s];
-          if (st->ejected)
+          if (st_hidden (st))
             continue;
           p = cat (b, "  PDFS::");
           p = cat (p, st->disc);

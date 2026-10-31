@@ -154,11 +154,15 @@ remove_icon (int k)
   icons[k].used = 0;
 }
 
+static int sending;             /* null events wanted: sending or receiving in the background */
+
 /* Make the icons match the mounted storages. */
 static void
 refresh (void)
 {
   pdfs_tick ();                 /* device events; drops unplugged devices */
+  if (pdfs_reading ())
+    sending = 1;                /* a file coming from a device: null events to receive it */
   /* a USB device plugged in: mount it. A phone may take a few seconds to be
      ready (or reconnects when File transfer is chosen): try a few times */
   static int attach_tries;
@@ -221,7 +225,6 @@ open_root (int k)
    a piece at a time on null events, so the desktop keeps going. Meanwhile
    Filer_Action's own window shows how it's going (sendwin.c). */
 
-static int sending;
 
 static void
 send_some (void)
@@ -229,7 +232,7 @@ send_some (void)
   int more = pdfs_bg_run (10);
   pdfs_bg_state st;
   pdfs_bg_status (&st);
-  sending = more && !st.paused;     /* paused: no need for null events */
+  sending = (more && !st.paused) || pdfs_reading ();   /* paused: no need for null events */
   static unsigned shown;
   regs t = {{ 0 }};
   swix_regs (0x42, &t);                             /* OS_ReadMonotonicTime */
@@ -610,7 +613,7 @@ filer_main (void)
         {
           pdfs_bg_state st;
           pdfs_bg_status (&st);
-          sending = st.active && !st.paused;
+          sending = (st.active && !st.paused) || pdfs_reading ();
           continue;
         }
       switch ((int) p.r[0])

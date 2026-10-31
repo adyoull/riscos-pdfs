@@ -224,6 +224,25 @@ tcp_reset (pd_transport *t, uint32_t tid, int level)
   return 1;
 }
 
+/* An event channel for the tests: PDFS_FAKE_EVENTS, hex bytes, served as
+   the USB transport serves its interrupt stream's buffer (what's there,
+   up to max; asked for 12 or more, nothing until 12 are there) */
+static uint8_t fake_ev[256];
+static int fake_ev_len, fake_ev_pos;
+
+static int
+fake_event (pd_transport *t, void *buf, uint32_t max)
+{
+  (void) t;
+  int used = fake_ev_len - fake_ev_pos;
+  if (!used || (used < 12 && max >= 12))
+    return 0;
+  int k = used < (int) max ? used : (int) max;
+  memcpy (buf, fake_ev + fake_ev_pos, (size_t) k);
+  fake_ev_pos += k;
+  return k;
+}
+
 static void
 tcp_close (pd_transport *t)
 {
@@ -258,6 +277,18 @@ tcp_open (const char *hostport)
   c->t.read = tcp_read;
   c->t.reset = tcp_reset;
   c->t.close = tcp_close;
+  const char *fe = getenv ("PDFS_FAKE_EVENTS");
+  if (fe)
+    {
+      for (fake_ev_len = 0; fe[0] && fe[1] && fake_ev_len < (int) sizeof fake_ev; fe += 2)
+        {
+          unsigned b;
+          if (sscanf (fe, "%2x", &b) != 1)
+            break;
+          fake_ev[fake_ev_len++] = (uint8_t) b;
+        }
+      c->t.event = fake_event;
+    }
   snprintf (c->name, sizeof c->name, "TCP %s", hostport);
   c->t.name = c->name;
   return &c->t;
@@ -688,6 +719,76 @@ run (int argc, char **argv)
       printf ("bg: done in %d steps\n", steps + 1);
       return 0;
     }
+  if (!strcmp (cmd, "getbg") && argc > 2)
+    {
+      /* read a file a block at a time, with the background running between
+         blocks (as the filer's null events do) and, half way, another
+         request to the device (a listing of argv[3]) */
+      char p[1024];
+      fspath (p, argv[1]);
+      pd_regs r = { { 0, (pd_reg) p, 0, 101 } };
+      if (check (call (PD_OPEN, &r), "open") || !r.r[1])
+        return -1;
+      pd_reg h = r.r[1];
+      uint32_t ext = (uint32_t) r.r[3], bs = 16384;
+      FILE *f = fopen (argv[2], "wb");
+      uint8_t *buf = malloc (bs);
+      int steps = 0;
+      for (uint32_t off = 0; off < ext; off += bs)
+        {
+          pd_regs g = { { 0, h, (pd_reg) buf, bs, off } };
+          if (check (call (PD_GETBYTES, &g), "getbytes"))
+            break;
+          fwrite (buf, 1, ext - off < bs ? ext - off : bs, f);
+          for (int i = 0; i < 2; i++)
+            steps += pdfs_bg_run (1);
+          if (argc > 3 && off < ext / 2 && off + bs >= ext / 2)
+            do_ls (argv[3]);
+        }
+      fclose (f);
+      free (buf);
+      pd_regs c = { { 0, h, 0, 0 } };
+      check (call (PD_CLOSE, &c), "close");
+      printf ("background steps with more to do: %d\n", steps);
+      return 0;
+    }
+  if (!strcmp (cmd, "waitdiscs") && argc > 1)
+    {
+      /* as the filer does once a second: device events, and storages that
+         appear once access is allowed on the device */
+      double end = atof (argv[1]);
+      int n = 0;
+      for (double t = 0; t < end && !(n = pdfs_disc_count ()); t += 0.25)
+        {
+          pdfs_tick ();
+          usleep (250000);
+        }
+      printf ("discs: %d\n", n);
+      return 0;
+    }
+  if (!strcmp (cmd, "freewin") && argc > 2)
+    {
+      /* as the Free window asks: N times, a second apart */
+      int n = atoi (argv[2]);
+      for (int i = 0; i < n; i++)
+        {
+          uint64_t size = 0, fr = 0;
+          struct timespec a, b;
+          clock_gettime (CLOCK_MONOTONIC, &a);
+          const pd_error *e = pdfs_free_space (argv[1], &size, &fr);
+          clock_gettime (CLOCK_MONOTONIC, &b);
+          printf ("freewin %s size %llu free %llu in %.1f s\n", e ? "error" : "ok",
+                  (unsigned long long) size, (unsigned long long) fr,
+                  (b.tv_sec - a.tv_sec) + (b.tv_nsec - a.tv_nsec) / 1e9);
+          usleep (200000);
+        }
+      return 0;
+    }
+  if (!strcmp (cmd, "tick"))
+    {
+      pdfs_tick ();             /* as the filer's poll: events */
+      return 0;
+    }
   if (!strcmp (cmd, "sleep") && argc > 1)
     {
       usleep ((useconds_t) (atof (argv[1]) * 1e6));
@@ -701,6 +802,8 @@ run (int argc, char **argv)
 int
 main (int argc, char **argv)
 {
+  if (getenv ("PDFS_VERBOSE"))
+    verbose = 1;
   if (argc > 1 && !strcmp (argv[1], "-v"))
     {
       verbose = 1;
@@ -714,6 +817,16 @@ main (int argc, char **argv)
     }
   if (getenv ("PDFS_TIMEOUT_CS"))
     pdfs_timeout_cs = (unsigned) atoi (getenv ("PDFS_TIMEOUT_CS"));
+  /* the settling wait after an Android device opens: none in the host
+     tests unless asked (each command opens the device afresh) */
+  if (getenv ("PDFS_GAP_CS"))
+    pdfs_gap_cs = atoi (getenv ("PDFS_GAP_CS"));
+  if (getenv ("PDFS_TID_START"))
+    {
+      extern uint32_t mtp_tid_after_open;
+      mtp_tid_after_open = (uint32_t) strtoul (getenv ("PDFS_TID_START"), 0, 16);
+    }
+  pdfs_settle_cs = getenv ("PDFS_SETTLE_CS") ? (unsigned) atoi (getenv ("PDFS_SETTLE_CS")) : 0;
   if (getenv ("PDFS_SHOW_EXT"))
     pdfs_set_hide_ext (0);
   if (getenv ("PDFS_TRACE"))

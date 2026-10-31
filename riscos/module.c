@@ -699,6 +699,28 @@ dev_eq (const char *a, const char *b)
 static oserror *
 mount_usb (const char *dev, int iface, int quiet)
 {
+  /* PDFS$Gap: the least time (cs) between an answer from an Android device
+     and the next request; unset, the default */
+  {
+    char v[16];
+    regs r = {{ (unsigned) "PDFS$Gap", (unsigned) v, sizeof v - 1, 0, 3 }};
+    if (!swix_regs (0x23 /* OS_ReadVarVal */, &r) && r.r[2] > 0)
+      {
+        int n = 0, any = 0;
+        for (unsigned i = 0; i < r.r[2] && v[i] >= '0' && v[i] <= '9'; i++)
+          n = n * 10 + (v[i] - '0'), any = 1;
+        pdfs_gap_cs = any && n <= 100 ? n : -1;
+      }
+    else
+      pdfs_gap_cs = -1;
+  }
+  {
+    /* PDFS$Events 0: the event pipe isn't opened (as OpenMTP's library) */
+    char v[8];
+    regs r = {{ (unsigned) "PDFS$Events", (unsigned) v, sizeof v - 1, 0, 3 }};
+    extern int usb_no_events;
+    usb_no_events = !swix_regs (0x23, &r) && r.r[2] == 1 && v[0] == '0';
+  }
   usb_iface c[24];
   int n = usb_scan (c, 24, dev != 0), mounted = 0;
   oserror *first = 0;
@@ -949,7 +971,9 @@ mod_command (int index, const char *tail, int argc)
         if (word_is (tail, "-auto"))
           {
             quiet = 1;
+            pdfs_mount_defer = 1;       /* the filer: storages are asked about from its poll */
             e = mount_usb (0, -1, 1);
+            pdfs_mount_defer = 0;
           }
         else if (!argc)
           {

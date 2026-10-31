@@ -24,6 +24,9 @@ Task Manager, start the filer with `*WimpTask Desktop_PDFSFiler`.
 
 - Android: plug it in, pull down the notification "Charging this device via
   USB" and choose **File transfer**. The phone reconnects as an MTP device.
+  If it asks "Allow access to device data?", tap **Allow**: PDFS waits for
+  that (*PDFSLog says so) and mounts the storages once they're there. An
+  Android device's icons appear about 5 seconds after it connects.
   Set to *Charging only*, a phone may show an MTP interface that never
   answers: PDFS gives up on it after 3 seconds (*PDFSLog says "the device
   isn't taking anything in") and mounts it once it's switched to File
@@ -45,7 +48,9 @@ class `06/01/01` and `- MTP`. Then:
 
     *PDFSMount
 
-- An interface with class `FF/..` (older Androids): `*PDFSMount USB<n>`.
+- Class `FF/FF/00` with an interrupt endpoint (Amazon Fire tablets,
+  Motorola phones in File transfer mode) is MTP, and mounted by itself.
+  Another `FF/..` interface (older Androids): `*PDFSMount USB<n>`.
 - "Can't open the device's USB endpoints": something else claimed it.
 - Nothing listed for the phone: it isn't in File transfer mode, or the USB
   stack doesn't see it (`*USBDevices`).
@@ -84,7 +89,11 @@ class `06/01/01` and `- MTP`. Then:
     *Spool
 
 and send `RAM:$.pdfslog`. With Reporter running, `*PDFSLog trace` also sends
-each FileSwitch call to it.
+each FileSwitch call to it. The trace logs every request to the device with
+the time it was made (in centiseconds), what came back, and, when an answer
+doesn't come, the state of the USB pipes. Lines starting "usb: an input
+transfer failed" give USBDriver's reason; many of them can mean a power or
+cable problem (a device charging from the computer: try a powered hub).
 
 If the machine freezes during a transfer, note which step; `*PDFSUSB control
 off` (the default) keeps PDFS away from the USB control requests that are

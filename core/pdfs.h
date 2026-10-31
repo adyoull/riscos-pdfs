@@ -9,7 +9,7 @@
 #include <stdint.h>
 #include "transport.h"
 
-#define PDFS_VERSION "0.15"
+#define PDFS_VERSION "0.16"
 
 /* Filing system number: provisional until allocated by RISC OS Open. */
 #define PDFS_FSNUM 0xFA
@@ -29,6 +29,7 @@ const pd_error *pdfs_fs_entry (int entry, pd_regs *r);
 const pd_error *pdfs_mount (pd_transport *tr);      /* takes ownership of tr */
 const pd_error *pdfs_dismount (const char *disc);   /* disc name, or "" for all */
 int pdfs_disc_count (void);
+extern int pdfs_mount_defer;    /* set while the filer mounts: storages are asked about from its poll */
 const char *pdfs_disc_name (int i);                 /* NULL past the end */
 const char *pdfs_disc_desc (int i);
 int pdfs_eject_info (const char *disc, int all, int *storages, const char **model);
@@ -44,7 +45,8 @@ void pdfs_finish (void);
 /* Big new files sent in the background, by the filer task (fs.c) */
 extern int pdfs_background;                /* sending in the background now */
 extern int pdfs_background_option;         /* *PDFSBackground on: the filer task does it */
-int pdfs_bg_run (unsigned cs);             /* send for cs centiseconds; 1: more to do */
+int pdfs_bg_run (unsigned cs);             /* send (and receive, pdfs_reading) for cs centiseconds; 1: more to do */
+int pdfs_reading (void);                   /* a file is coming from a device in the background */
 void pdfs_bg_finish (void);                /* send the rest now */
 int pdfs_bg_progress (const char *disc);   /* percent, or -1: nothing being sent */
 const pd_error *pdfs_bg_error (void);      /* a send that failed, once */
@@ -65,6 +67,8 @@ void pdfs_bg_abort_all (void);             /* stop: nothing half-sent is left */
 /* Settings */
 extern unsigned pdfs_dir_ttl_cs;          /* how long a directory listing stays fresh */
 extern unsigned pdfs_timeout_cs;          /* per-transfer time-out */
+extern unsigned pdfs_settle_cs;
+extern int pdfs_gap_cs;                  /* PDFS$Gap: cs between requests to Android devices (-1 default) */           /* an Android device is left this long after opening */
 extern int pdfs_trace;                     /* log every FileSwitch call (*PDFSLog trace) */
 extern int pdfs_hide_ext;                  /* show "Letter.txt" as "Letter" (*PDFSExtensions) */
 void pdfs_set_hide_ext (int on);

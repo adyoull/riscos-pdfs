@@ -11,6 +11,8 @@
 #define PDT_TIMEOUT   (-1)      /* nothing arrived in time */
 #define PDT_IO        (-2)      /* the transfer failed */
 #define PDT_GONE      (-3)      /* the device has been unplugged / disconnected */
+#define PDT_LOST      (-4)      /* the answer was lost on the way (the input pipe
+                                   failed, and has been cleared): ask again */
 
 typedef struct pd_transport pd_transport;
 struct pd_transport
@@ -21,7 +23,8 @@ struct pd_transport
      Returns the number of bytes (0 = an empty transfer, e.g. a USB ZLP),
      or a PDT_ error. */
   int (*read) (pd_transport *t, void *buf, uint32_t max, unsigned timeout_cs);
-  /* Poll the event (interrupt) channel: up to max bytes, 0 if nothing. */
+  /* Poll the event (interrupt) channel: up to max bytes, 0 if nothing;
+     asked for 12 or more, nothing until 12 are there (a whole header). */
   int (*event) (pd_transport *t, void *buf, uint32_t max);
   /* Recover after an error: cancel the transaction in progress (MTP class
      request Cancel), wait for the device to be ready, drop stale input.
@@ -39,6 +42,8 @@ struct pd_transport
   /* Set by the MTP layer around write: 1 while more of the same container
      follows this write (a container sent in pieces), 0 for its last. */
   int more;
+  /* Optional, for the trace: describe the pipes' state into buf. */
+  void (*state) (pd_transport *t, char *buf, int max);
   /* Set by the transport when the device has been unplugged. */
   volatile int gone;
 };

@@ -100,6 +100,13 @@ typedef struct
   int opening;                  /* mtp_open's first command: no recovery */
   unsigned timeout_cs;          /* per transfer: no progress for this long = stalled */
   uint16_t ops[160];            /* operations supported (from GetDeviceInfo) */
+  int android;                  /* its vendor extensions say "android.com" */
+  int no_proplist;              /* GetObjectPropList isn't used (Android's is unreliable) */
+  unsigned gap_cs;              /* least time between an answer and the next request (cs) */
+  unsigned last_done;           /* when the last answer came (pd_time_cs) */
+  int answered;                 /* (last_done is set) */
+  unsigned lost;                /* answers lost on the way, and asked for again */
+  int repeatable;               /* the request in progress only reads: if its answer is lost, ask again */
   int nops;
   char manufacturer[48], model[48], serial[40], version[24];
   /* input staging (bytes received beyond the container being read) */
@@ -107,6 +114,10 @@ typedef struct
   uint32_t stage_len, stage_pos, stage_size;
   /* statistics */
   uint32_t transactions, errors, recoveries;
+  uint64_t bytes_in, bytes_out;   /* file data (data phases) received and sent */
+  uint32_t in_cs, out_cs;         /* time spent receiving / sending them */
+  uint32_t slowest_cs;            /* the longest single request */
+  uint16_t slowest_op;
   mtp_fill_fn fill;             /* data out from a callback (mtp_transaction_fill) */
   /* A data phase being sent a piece at a time (mtp_stream_*) */
   int streaming;
@@ -116,6 +127,16 @@ typedef struct
   uint64_t sleft;               /* bytes of the container still to come */
   uint16_t sop;
   void *fill_ctx;
+  /* A data phase being received a piece at a time (mtp_rstream_*): the
+     device's GetObject for one without partial reads */
+  int rstreaming;
+  uint64_t rleft;               /* bytes of it still to come */
+  uint32_t rtid, rgen;          /* rgen: which stream (a new one each begin) */
+  uint16_t rop;
+  /* Called when another transaction is wanted while one is being
+     received a piece at a time: may finish receiving it (PDFS's reading in
+     the background) rather than have the rest dropped */
+  void (*rbusy) (void *d);
   /* Called when a transaction is wanted while one is being streamed: may
      finish the stream (PDFS's background sends) */
   void (*busy_wait) (void *d);
@@ -191,5 +212,19 @@ mtp_needs_zlp (const mtp_dev *d, uint32_t len)
   /* USB packet sizes are powers of two */
   return d->tr->no_zlp && d->tr->max_packet && ((12 + len) & (d->tr->max_packet - 1)) == 0;
 }
+
+
+/* Receiving a data phase a piece at a time (a whole object from a device
+   that can't send part of one, as the reader asks for it):
+   mtp_rstream_begin sends the command and reads the data container's
+   header (*total = its length, or ~0 if over 4 GB); RC_OK, or the
+   response code if the device answered without data, or an error.
+   mtp_rstream_get reads the next len bytes (dst NULL: drops them); it
+   returns the bytes read or an error. mtp_rstream_end drops the rest and
+   reads the response. Another transaction on the device ends the stream
+   first (dropping the rest): rgen then no longer matches. */
+int mtp_rstream_begin (mtp_dev *d, uint16_t op, const uint32_t *params, int nparams, uint64_t *total);
+int mtp_rstream_get (mtp_dev *d, void *dst, uint32_t len);
+int mtp_rstream_end (mtp_dev *d);
 
 #endif
