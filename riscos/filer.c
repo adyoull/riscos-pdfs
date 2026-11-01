@@ -20,6 +20,7 @@
 #include "pdfs.h"
 #include "filer.h"
 #include "usb.h"
+#include "plat.h"
 #include "sendwin.h"
 
 #define OS_CLI                  0x05
@@ -176,6 +177,30 @@ refresh (void)
       int before = pdfs_disc_count ();
       oscli ("PDFSMount -auto", 0, 0);
       attach_tries = pdfs_disc_count () > before ? 0 : attach_tries - 1;
+    }
+  /* A device that's connected but not letting PDFS see its storages: say
+     what to do on it, once (OpenMTP shows the same advice; the log alone
+     helped nobody) */
+  const char *waiting = pdfs_waiting_untold ();
+  if (waiting)
+    {
+      char msg[260];
+      *(unsigned *) msg = 0;
+      char *p = append (msg + 4, waiting);
+      append (p, " is connected, but isn't letting the computer see its files yet. On it: "
+                 "unlock it, choose File transfer (not Charging only), and tap Allow if it asks. "
+                 "Its icon then appears.");
+      if (usb_emu_build ())
+        {
+          char l[280];
+          append (append (l, "pdfs: told the owner: "), msg + 4);
+          pd_log (l);
+        }
+      else
+        {
+          regs r = {{ (unsigned) msg, 1 | 1 << 8 | 1 << 9, (unsigned) "PDFS Filer" }};   /* OK, information */
+          swix_regs (Wimp_ReportError, &r);
+        }
     }
   for (int k = 0; k < MAX_ICONS; k++)
     {
@@ -544,9 +569,12 @@ free_register (int on)
 
 /* --- the task --------------------------------------------------------------------------- */
 
+int filer_quitted;
+
 void
 filer_quit (void)
 {
+  filer_quitted = 1;
   pdfs_bg_pause (0);
   pdfs_bg_finish ();            /* files still to send: now */
   pdfs_background = 0;
@@ -577,6 +605,8 @@ filer_main (void)
       swix_regs (OS_Exit, &x);
     }
   filer_task = (int) r.r[1];
+  filer_quitted = 0;
+  filer_started ();
   pdfs_background = pdfs_background_option;
   sending = 0;
   free_register (1);

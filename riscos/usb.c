@@ -62,6 +62,42 @@ void buffer_purge (unsigned buffer);
 #define EVENT_BUFFER            1024u
 #define MAX_OPEN                4
 
+/* The test build: the first starts of the filer task are refused, as the
+   desktop refuses them when PDFS is loaded at the F12 command line
+   (PDFSEmu$RefuseStart <n>) */
+int
+usb_emu_build (void)
+{
+#ifdef USB_EMU
+  return 1;
+#else
+  return 0;
+#endif
+}
+
+int
+usb_emu_refuse_start (void)
+{
+#ifdef USB_EMU
+  static int left = -1;
+  if (left < 0)
+    {
+      char v[8];
+      regs r = {{ (unsigned) "PDFSEmu$RefuseStart", (unsigned) v, sizeof v - 1, 0, 3 }};
+      left = 0;
+      if (!swix_regs (0x23, &r))
+        for (unsigned i = 0; i < r.r[2] && v[i] >= '0' && v[i] <= '9'; i++)
+          left = left * 10 + (v[i] - '0');
+    }
+  if (left > 0)
+    {
+      left--;
+      return 1;
+    }
+#endif
+  return 0;
+}
+
 int usb_control_requests;       /* *PDFSUSB control on */
 int usb_no_events;              /* PDFS$Events 0: the event (interrupt) pipe isn't opened */
 volatile int usb_attached;      /* Service_USB Attach seen: the filer mounts */
@@ -723,7 +759,10 @@ usb_mount (const usb_iface *c)
   u->t.close = usb_close;
   u->t.max_packet = c->mps_out ? c->mps_out : 512;
   u->t.no_zlp = 1;
-  char *o = put_str (u->name, "USB ");
+  /* "USB9" (the device's name already says USB; was "USB USB9") */
+  char *o = u->name;
+  if ((c->dev[0] | 0x20) != 'u' || (c->dev[1] | 0x20) != 's' || (c->dev[2] | 0x20) != 'b')
+    o = put_str (o, "USB ");
   put_str (o, c->dev);
   u->t.name = u->name;
   open_list[slot] = u;

@@ -9,7 +9,7 @@
 #include <stdint.h>
 #include "transport.h"
 
-#define PDFS_VERSION "0.16"
+#define PDFS_VERSION "0.16.1"
 
 /* Filing system number: provisional until allocated by RISC OS Open. */
 #define PDFS_FSNUM 0xFA
@@ -67,7 +67,10 @@ void pdfs_bg_abort_all (void);             /* stop: nothing half-sent is left */
 /* Settings */
 extern unsigned pdfs_dir_ttl_cs;          /* how long a directory listing stays fresh */
 extern unsigned pdfs_timeout_cs;          /* per-transfer time-out */
+const char *pdfs_waiting_untold (void);  /* a device waiting for Allow, to tell its owner about (once) */
+void pdfs_settle_now (void);             /* finish mounts that wait for the filer's poll (from *commands) */
 extern unsigned pdfs_settle_cs;
+extern unsigned pdfs_hint_cs;            /* PDFS$AllowHint: cs before the "tap Allow" box (0 never) */
 extern int pdfs_gap_cs;                  /* PDFS$Gap: cs between requests to Android devices (-1 default) */           /* an Android device is left this long after opening */
 extern int pdfs_trace;                     /* log every FileSwitch call (*PDFSLog trace) */
 extern int pdfs_hide_ext;                  /* show "Letter.txt" as "Letter" (*PDFSExtensions) */

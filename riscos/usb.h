@@ -20,6 +20,8 @@ typedef struct
 } usb_iface;
 
 extern int usb_control_requests;
+int usb_emu_refuse_start (void);    /* the test build: PDFSEmu$RefuseStart, else 0 */
+int usb_emu_build (void);           /* 1 in the test build (no one to click OK there) */
 extern volatile int usb_attached;
 
 /* Connected devices' interfaces: MTP ones, or all of them. */

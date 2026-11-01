@@ -5,7 +5,7 @@ MTP (Media Transfer Protocol). A connected device's storages show up as
 discs, such as `PDFS::Pixel-Internal.$`, and work with the Filer, `*Copy`,
 BASIC's OPENIN/OPENOUT and every program that uses FileSwitch.
 
-Status: **0.16 beta.** It works with an Android phone (a Pixel) and an
+Status: **0.16.1 beta.** It works with an Android phone (a Pixel) and an
 Amazon Fire 7 tablet on a Raspberry Pi with RISC OS 5: browsing, copying
 both ways with the Filer, big files, unplugging, switching the phone between
 charging and file transfer, and Android's "Allow access" prompt. It's tested against a simulated device
@@ -39,8 +39,11 @@ From riscos-linux-testbed (RISC OS 5 for Linux) with the simulated device
 With PackMan: add the source https://adyoull.github.io/riscos-packages/pkg/index
 and install **PDFS**. It goes in !Boot's PreDesk, so it's loaded at start-up.
 
-Or unzip `PDFS-0.16-beta.zip` (from the GitHub release) and double-click
-`PDFS` to load it, or put it in `!Boot.Choices.Boot.PreDesk`. RISC OS 5
+Or unzip `PDFS-0.16.1-beta.zip` (from the GitHub release) and double-click
+`PDFS` to load it, or put it in `!Boot.Choices.Boot.PreDesk`. Either starts
+its icon bar task, "PDFS Filer", which notices devices being plugged in.
+(Loaded with `*RMLoad` at the F12 command line, the task can't start
+there: `*PDFSUSB` typed in a task window starts it.) RISC OS 5
 with its USB stack is needed for devices on USB.
 
 ## Layout
@@ -116,6 +119,7 @@ System variables, read when a device is mounted:
 |---|---|
 | `PDFS$Gap` | cs between an answer from an Android device and the next request (1 if unset; 0 for none) |
 | `PDFS$Events` | `0`: leave the device's event pipe closed |
+| `PDFS$AllowHint` | seconds a device waits for "Allow access" before a box says what to do on it (20 if unset; 0: never) |
 
 Paths are `PDFS::<Model>-<Storage>.$.…`, e.g. `PDFS::Pixel_7-Internal.$.DCIM`.
 

@@ -1,5 +1,27 @@
 # Changes
 
+## 0.16.1 beta (1 November 2026)
+
+For PDFS loaded at the F12 command line, and devices that ask for access.
+
+- PDFS's icon bar task couldn't start when PDFS was loaded with *RMLoad at
+  the F12 command line, and nothing said so: a device plugged in then did
+  nothing. Now `*PDFSUSB`, `*PDFSDevices` or `*PDFSMount` typed in a task
+  window starts it, and typed at F12 they say how to start it. *PDFSLog
+  notes it too.
+- A device mounted while the icon bar task wasn't running stayed "mounted"
+  with no storages: those commands now finish mounting it.
+- When a device is connected but still doesn't let PDFS see its storages
+  after 20 seconds (it waits for "Allow access"), a box says what to do on
+  it: unlock it, choose File transfer, tap Allow. Once per connection;
+  `PDFS$AllowHint` sets the seconds (0: never).
+- An Android device is asked about its storages 1 second after it
+  connects (was 5): the wait wasn't what made the Amazon Fire work.
+- Android's "Internal shared storage" is called "Internal" (its icon said
+  "Internal sha").
+- *PDFSLog says which device was opened, and each storage made ready.
+  *PDFSDevices names a USB device "USB9", not "USB USB9".
+
 ## 0.16 beta (31 October 2026)
 
 Android devices that ask for access, Amazon Fire tablets and Motorola

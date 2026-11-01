@@ -9,11 +9,11 @@
 unsigned pdfs_dir_ttl_cs = 500;
 int pdfs_hide_ext = 1;
 unsigned pdfs_timeout_cs = 1000;
-/* An Android device is left alone this long after its session opens
-   before it's asked about its storages: an Amazon Fire just back on the
-   bus after Allow answered a few requests at once and then nothing more
-   (0.16 tests 5 to 7); OpenMTP, used seconds later, works. */
-unsigned pdfs_settle_cs = 500;
+/* An Android device is left this long after its session opens before
+   it's asked about its storages (0.16: 5 s, for an Amazon Fire that
+   seemed to stop answering soon after Allow; the cause turned out to be
+   answers lost on the way in, now asked for again: 0.16.1, 1 s). */
+unsigned pdfs_settle_cs = 100;
 /* The least time between an answer from an Android device and the next
    request (see gap_wait in mtp.c); -1: the default. *PDFSMount sets it
    from PDFS$Gap. */
@@ -78,6 +78,8 @@ typedef struct device
   unsigned next_look;         /* when to ask for its storages again (pd_time_cs) */
   int silent;                 /* looks in a row it didn't answer */
   unsigned settle_until;      /* an Android device just opened: not asked about its storages before this */
+  unsigned waiting_since;     /* when it started waiting for access (pd_time_cs) */
+  int told;                   /* the owner has been told what to do on the device */
 } device;
 
 /* A storage ejected on its own, or not yet asked about, isn't shown */
@@ -3345,7 +3347,17 @@ storage_info (storage *st)
       st->capacity = get64 (in.buf + 6);
       st->free = get64 (in.buf + 14);
       if (in.len > 26)
-        mtp_get_string (in.buf + 26, in.buf + in.len, st->desc, sizeof st->desc);
+        {
+          mtp_get_string (in.buf + 26, in.buf + in.len, st->desc, sizeof st->desc);
+          /* Android's "Internal shared storage" was cut to "Internal sha"
+             under its icon: it's the device's own storage, "Internal" */
+          const char *a = "Internal shared storage";
+          int i = 0;
+          while (a[i] && st->desc[i] == a[i])
+            i++;
+          if (!a[i] && !st->desc[i])
+            st->desc[8] = 0;
+        }
     }
   pd_free (in.buf);
   return rc_error (rc);
@@ -3407,6 +3419,75 @@ fs_func (pd_regs *r)
 static void release (device *dv);
 static int add_storages (device *dv, unsigned look_cs);
 static int finish_storages (device *dv);
+static int add_storages (device *dv, unsigned look_cs);
+
+/* An Android device's settling time is over: ask about its storages,
+   one per poll from the filer (defer), or all at once from a command */
+static void
+settled (device *dv, int defer)
+{
+  dv->settle_until = 0;
+  int was = pdfs_mount_defer;
+  pdfs_mount_defer = defer;
+  int rc = add_storages (dv, 0);
+  pdfs_mount_defer = was;
+  if (rc == RC_AccessDenied || rc == RC_DeviceBusy || (rc == RC_OK && dv->nst == 0))
+    {
+      dv->waiting = 1;
+      dv->waiting_since = pd_time_cs ();
+      dv->next_look = pd_time_cs () + 100;
+      pd_log ("pdfs: the device has no storages yet: waiting for access to its data to be allowed on it");
+    }
+  else if (rc != RC_OK)
+    pd_log ("pdfs: the device didn't say what storages it has");
+}
+
+/* From a *command (*PDFSDevices, *PDFSUSB, *PDFSMount): finish what the
+   filer's poll would, so a device mounted while its icon bar task isn't
+   running still gets its storages (0.16: an Android device then stayed
+   "mounted" with none) */
+/* How long a device waits for access to be allowed on it before its owner
+   is told what to do (cs; PDFS$AllowHint, in seconds; 0: never). Long
+   enough that someone tapping Allow anyway doesn't see the box. */
+unsigned pdfs_hint_cs = 2000;
+
+/* For the filer: a device that has waited pdfs_hint_cs or more for access
+   to be allowed on it, and whose owner hasn't been told what to do (once
+   per connection): its name, else 0 */
+const char *
+pdfs_waiting_untold (void)
+{
+  for (int d = 0; d < MAX_DEVICES; d++)
+    {
+      device *dv = &devices[d];
+      if (pdfs_hint_cs && dv->used && dv->waiting && !dv->told
+          && pd_time_cs () - dv->waiting_since >= pdfs_hint_cs)
+        {
+          dv->told = 1;
+          return dv->mtp.model[0] ? dv->mtp.model : "The device";
+        }
+    }
+  return 0;
+}
+
+void
+pdfs_settle_now (void)
+{
+  for (int d = 0; d < MAX_DEVICES; d++)
+    {
+      device *dv = &devices[d];
+      if (!dv->used || (dv->mtp.tr && dv->mtp.tr->gone) || dv->mtp.streaming)
+        continue;
+      if (dv->settle_until)
+        {
+          while ((int) (pd_time_cs () - dv->settle_until) < 0)
+            ;
+          settled (dv, 0);
+        }
+      while (finish_storages (dv))
+        ;
+    }
+}
 
 int pdfs_mount_defer;           /* the filer is mounting: storages asked about from its poll */
 #define LOOK_CS 150             /* longest wait for the storage list while waiting (from the poll) */
@@ -3431,19 +3512,7 @@ poll_events (void)
         {
           if ((int) (pd_time_cs () - dv->settle_until) < 0)
             continue;
-          dv->settle_until = 0;
-          int defer = pdfs_mount_defer;
-          pdfs_mount_defer = 1;     /* asked about one per poll, as when the filer mounts */
-          int rc = add_storages (dv, 0);
-          pdfs_mount_defer = defer;
-          if (rc == RC_AccessDenied || rc == RC_DeviceBusy || (rc == RC_OK && dv->nst == 0))
-            {
-              dv->waiting = 1;
-              dv->next_look = pd_time_cs () + 100;
-              pd_log ("pdfs: the device has no storages yet: waiting for access to its data to be allowed on it");
-            }
-          else if (rc != RC_OK)
-            pd_log ("pdfs: the device didn't say what storages it has");
+          settled (dv, 1);
           continue;
         }
       int look = 0;
@@ -3703,6 +3772,12 @@ finish_storages (device *dv)
       {
         dv->st[s].info_pending = 0;
         make_disc_name (dv, &dv->st[s]);
+        char b[160], *p = cat (b, "pdfs: storage ready: PDFS::");
+        p = cat (p, dv->st[s].disc);
+        p = cat (p, " (");
+        p = cat (p, dv->st[s].desc);
+        cat (p, ")");
+        pd_log (b);
       }
   return 0;
 }
@@ -3743,6 +3818,15 @@ pdfs_mount (pd_transport *tr)
       return e;
     }
   dv->used = 1;
+  {
+    char b[200], *p = cat (b, "pdfs: opened ");
+    p = cat (p, tr->name ? tr->name : "a device");
+    p = cat (p, ": ");
+    p = cat (p, dv->mtp.manufacturer);
+    p = cat (p, " ");
+    cat (p, dv->mtp.model);
+    pd_log (b);
+  }
   if (dv->mtp.android)
     dv->mtp.gap_cs = pdfs_gap_cs >= 0 ? (unsigned) pdfs_gap_cs : ANDROID_GAP_CS;
   if (dv->mtp.android && pdfs_settle_cs)
@@ -3771,6 +3855,7 @@ pdfs_mount (pd_transport *tr)
          session each time, and each one asked again: the owner's Allow
          never reached a session that was still there. */
       dv->waiting = 1;
+      dv->waiting_since = pd_time_cs ();
       dv->next_look = pd_time_cs () + 100;
       pd_log ("pdfs: the device has no storages yet: waiting for access to its data to be allowed on it");
       return 0;

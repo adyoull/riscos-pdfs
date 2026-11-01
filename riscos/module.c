@@ -31,6 +31,11 @@ extern char module_start[], fs_info_block[];
 static void *private_word;
 static int callback_set;
 void pd_callback (void);        /* header.s */
+/* The filer task has started (filer.c) */
+void
+filer_started (void)
+{
+}
 
 
 /* in header.s */
@@ -670,19 +675,65 @@ word_is_prefix (const char *tail, const char *w)
   return *tail == ' ';
 }
 
-/* The callback set at initialisation in the desktop: start the filer */
+static unsigned starting_since;     /* when a start of the filer was asked for that hasn't come yet */
+
+/* The callback set at initialisation in the desktop, and by start_filer
+   until the filer has started: start it */
 void
 filer_callback (void)
 {
   callback_set = 0;
   regs w = {{ 3 }};
-  if (filer_task || swix_regs (Wimp_ReadSysInfo, &w) || !w.r[0] || filer_prepare (private_word))
+  if (filer_task || filer_quitted || swix_regs (Wimp_ReadSysInfo, &w) || !w.r[0]
+      || filer_prepare (private_word))
     return;
   filer_task = -1;
   regs st = {{ (unsigned) "Desktop_PDFSFiler" }};
-  swix_regs (Wimp_StartTask, &st);
-  if (filer_task == -1)         /* refused (no task running): leave it to *WimpTask */
+  int refused = usb_emu_refuse_start () || swix_regs (Wimp_StartTask, &st) != 0;
+  /* No error, but not running yet: the Wimp starts it a little later
+     (as when asked from a command); it stays "starting" (-1) till then */
+  if (filer_task == -1 && !refused)
+    starting_since = pd_time_cs () | 1;
+  if (refused && filer_task == -1)
+    {
+      /* Refused: no task was running then (loaded at the F12 command line,
+         say). It starts with the next desktop, or *Desktop_PDFSFiler, or
+         the next *PDFSUSB, *PDFSDevices or *PDFSMount typed in a task
+         window (start_filer); those at F12 say how. (0.16 said nothing:
+         loaded with *RMLoad at F12, PDFS had no icon bar task, and a
+         device plugged in did nothing. Starting it from a callback that can
+         come in the middle of a task had that task "gone wrong".) */
+      pd_log ("pdfs: the icon bar task couldn't start (loaded at the F12 command line?)");
+      filer_task = 0;
+    }
+}
+
+/* From *PDFSUSB, *PDFSDevices, *PDFSMount: in the desktop, with the icon
+   bar task not running, start it as the command returns to the task that
+   typed it (a callback, as when PDFS is loaded from a task; started from
+   inside the command, the Wimp ran it in a command window). At the F12
+   command line there's no task to start it from: say how instead. */
+static void
+start_filer (void)
+{
+  /* a start that never came (10 seconds): it can be tried again */
+  if (filer_task == -1 && starting_since && pd_time_cs () - starting_since > 1000)
     filer_task = 0;
+  regs w = {{ 3 }};
+  if (filer_task || callback_set || swix_regs (Wimp_ReadSysInfo, &w) || !w.r[0])
+    return;
+  regs c = {{ 5 }};
+  if (swix_regs (Wimp_ReadSysInfo, &c) || !c.r[0])
+    {
+      write0 ("PDFS's icon bar task isn't running, so devices plugged in get no icons. "
+              "Back in the desktop, double-click PDFS, or type *Desktop_PDFSFiler in a task window.");
+      newline ();
+      return;
+    }
+  filer_quitted = 0;
+  regs cb = {{ (unsigned) pd_callback, (unsigned) private_word }};
+  if (!swix_regs (OS_AddCallBack, &cb))
+    callback_set = 1;
 }
 
 /* "USB5" against a command's word (case-insensitive) */
@@ -713,6 +764,22 @@ mount_usb (const char *dev, int iface, int quiet)
       }
     else
       pdfs_gap_cs = -1;
+  }
+  {
+    /* PDFS$AllowHint: seconds a device waits for Allow before the box
+       saying what to do appears (0: never); unset, 20 */
+    char v[16];
+    regs r = {{ (unsigned) "PDFS$AllowHint", (unsigned) v, sizeof v - 1, 0, 3 }};
+    unsigned n = 20;
+    if (!swix_regs (0x23, &r) && r.r[2] > 0)
+      {
+        n = 0;
+        for (unsigned i = 0; i < r.r[2] && v[i] >= '0' && v[i] <= '9'; i++)
+          n = n * 10 + (unsigned) (v[i] - '0');
+        if (n > 3600)
+          n = 3600;
+      }
+    pdfs_hint_cs = n * 100;
   }
   {
     /* PDFS$Events 0: the event pipe isn't opened (as OpenMTP's library) */
@@ -895,6 +962,7 @@ mod_service (regs *r)
       add_fs ();
       break;
     case 0x49:                      /* Service_StartWimp */
+      filer_quitted = 0;
       if (filer_task == 0 && !filer_prepare (private_word))
         {
           filer_task = -1;
@@ -977,9 +1045,12 @@ mod_command (int index, const char *tail, int argc)
           }
         else if (!argc)
           {
+            start_filer ();
+            pdfs_settle_now ();         /* devices mounted earlier, waiting for the filer's poll */
             int had = pdfs_disc_count ();
             pdfs_uneject ();            /* storages ejected on their own come back */
             e = mount_usb (0, -1, pdfs_disc_count () > had);
+            pdfs_settle_now ();
           }
         else if ((tail[0] | 0x20) == 'u' && (tail[1] | 0x20) == 's' && (tail[2] | 0x20) == 'b')
           {
@@ -1037,6 +1108,8 @@ mod_command (int index, const char *tail, int argc)
         return e;
       }
     case 7:                         /* *PDFSUSB [control on|off] */
+      start_filer ();
+      pdfs_settle_now ();
       if (argc >= 2 && word_is_prefix (tail, "control"))
         {
           const char *q = tail;
@@ -1066,6 +1139,8 @@ mod_command (int index, const char *tail, int argc)
         return (oserror *) pdfs_dismount (disc);
       }
     case 3:                         /* *PDFSDevices */
+      start_filer ();
+      pdfs_settle_now ();
       pdfs_describe (line);
       return 0;
     case 5:                         /* *PDFSExtensions */
@@ -1107,6 +1182,7 @@ mod_command (int index, const char *tail, int argc)
         regs w = {{ 3 }};
         if (filer_task > 0 || (filer_task == 0 && (swix_regs (Wimp_ReadSysInfo, &w) || !w.r[0])))
           return ERR (err_desktop);
+        filer_quitted = 0;
         oserror *pe = filer_prepare (private_word);
         if (pe)
           return pe;

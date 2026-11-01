@@ -17,8 +17,11 @@ Copy `PDFS,ffa` to the Pi and double-click it, or:
 
     *RMLoad PDFS
 
-If it's loaded after the desktop has started and no icon task appears in the
-Task Manager, start the filer with `*WimpTask Desktop_PDFSFiler`.
+Double-clicking it also starts its icon bar task, "PDFS Filer" in the Task
+Manager, which notices devices being plugged in. Loaded with `*RMLoad` at
+the F12 command line, the module is there but that task isn't: type
+`*PDFSUSB` in a task window (or double-click PDFS) to start it. Simplest of
+all: put PDFS in `!Boot.Choices.Boot.PreDesk` and restart.
 
 ## 2. Connect the phone
 
@@ -26,7 +29,7 @@ Task Manager, start the filer with `*WimpTask Desktop_PDFSFiler`.
   USB" and choose **File transfer**. The phone reconnects as an MTP device.
   If it asks "Allow access to device data?", tap **Allow**: PDFS waits for
   that (*PDFSLog says so) and mounts the storages once they're there. An
-  Android device's icons appear about 5 seconds after it connects.
+  Android device's icons appear a second or two after it connects.
   Set to *Charging only*, a phone may show an MTP interface that never
   answers: PDFS gives up on it after 3 seconds (*PDFSLog says "the device
   isn't taking anything in") and mounts it once it's switched to File

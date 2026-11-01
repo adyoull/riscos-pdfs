@@ -158,7 +158,7 @@ if [ $DESKTOP = 0 ]; then
     fi
     check 'grep -q "PDFSEmu\$ShortPackets : 0" "$OUT/cli.txt"' "no transfer ends with a short packet inside a container"
     check 'grep -q "PDFSEmu\$MissingZLP : 0" "$OUT/cli.txt"' "every container ends with a short or zero-length packet"
-    check 'grep -q "USB8 .*08/06/50" "$OUT/cli.txt" && grep -q "PDFS test SimPhone (USB USB9)" "$OUT/cli.txt"' "the memory stick is listed but not mounted; the phone is, over USB"
+    check 'grep -q "USB8 .*08/06/50" "$OUT/cli.txt" && grep -q "PDFS test SimPhone (USB9)" "$OUT/cli.txt"' "the memory stick is listed but not mounted; the phone is, over USB"
   fi
 elif [ -n "$CHARGING" ]; then
   # A phone plugged in set to charging and switched to file transfer, as on
@@ -171,7 +171,10 @@ elif [ -n "$CHARGING" ]; then
   # CHARGING_WATCH: how long to watch (cs); CHARGING_SWITCH: when the phone
   # is switched, in cs after PDFS's first command to it (default 300)
   printf '%s\n%s\n%s\n%s\n' "$CHARGING" "$IRISRAM" "${CHARGING_WATCH:-6000}" "${CHARGING_SWITCH:-}" > "$T/w/opts,fff"
-  ROL_HARDDISC=$HD "$TB/bin/rol-run" ${ROL_VERBOSE:+-v} -t 300 -w 240 -s "$OUT/charging.png" -C "$T/w" -c 'Run charging' || true
+  # PDFS_ALLOWHINT=N: PDFS$AllowHint (seconds before the "tap Allow" box)
+  { [ -n "${PDFS_ALLOWHINT:-}" ] && echo "Set PDFS\$AllowHint $PDFS_ALLOWHINT"
+    echo "Run charging"; } > "$T/w/cgo,feb"
+  ROL_HARDDISC=$HD "$TB/bin/rol-run" ${ROL_VERBOSE:+-v} -t 300 -w 240 -s "$OUT/charging.png" -C "$T/w" -c 'Obey cgo' || true
   cat "$T/w/results" || true
   echo "--- *PDFSLog"; cat "$T/w/pdfslog" 2>/dev/null | tr -d '\r' || true
   check 'grep -q "^hazards: 0" "$T/w/results"' "none of USBDriver's hazards (seen on a Pi) happen"
@@ -192,7 +195,12 @@ elif [ -n "$CHARGING" ]; then
   grep "^leftover streams" "$T/w/results" || true
 else
   : "${ROL_HARDDISC:?set ROL_HARDDISC to a HardDisc4 (desktop mode)}"
-  ROL_HARDDISC=$ROL_HARDDISC "$TB/bin/rol-run" ${ROL_VERBOSE:+-v} -t 180 -w 120 -s "$OUT/desktop.png" -C "$T/w" -c 'Run desk' || true
+  # PDFS_RMLOAD=1: PDFS loaded with *RMLoad (as at the F12 command line),
+  # the desktop refusing the filer's first PDFS_RMLOAD_REFUSE starts
+  { [ -n "${PDFS_RMLOAD:-}" ] && echo "Set PDFSTest\$Load rmload"
+    [ -n "${PDFS_RMLOAD_REFUSE:-}" ] && echo "Set PDFSEmu\$RefuseStart $PDFS_RMLOAD_REFUSE"
+    echo "Run desk"; } > "$T/w/dgo,feb"
+  ROL_HARDDISC=$ROL_HARDDISC "$TB/bin/rol-run" ${ROL_VERBOSE:+-v} -t 180 -w 120 -s "$OUT/desktop.png" -C "$T/w" -c 'Obey dgo' || true
   cat "$T/w/results"
   check 'cmp -s "$T/w/ToPhone/Archive,ffd" "$T/phone/int/Documents/ToPhone/Archive"' "Filer_Action copies a folder to the phone"
   check 'cmp -s "$T/w/IMG_20261029_0910.jpg" "$T/phone/int/DCIM/Camera/IMG_20261029_0910.jpg"' "Filer_Action copies a photo back"

@@ -8,8 +8,14 @@ here$=FNstr(n%)
 log%=OPENOUT(here$+".results")
 PROClog("Work directory "+here$)
 REM OSCLI "PDFSLog trace"
-REM load PDFS as double-clicking it does (*RMRun): its filer starts
-SYS "Wimp_StartTask","Run "+here$+".PDFS"
+REM load PDFS as double-clicking it does (*RMRun): its filer starts;
+REM or (PDFSTest$Load rmload) with *RMLoad, as at the F12 command line,
+REM when the filer is started by the module (and PDFSEmu$RefuseStart has
+REM the first tries refused, as the desktop refuses them at F12)
+rmload%=FALSE
+SYS "XOS_ReadVarVal","PDFSTest$Load",n%,255,0,3 TO ,,l%;f%
+IF (f% AND 1)=0 AND l%>0 THEN n%?l%=13:IF FNstr(n%)="rmload" THEN rmload%=TRUE
+IF rmload% THEN OSCLI "RMLoad "+here$+".PDFS":PROClog("loaded with *RMLoad") ELSE SYS "Wimp_StartTask","Run "+here$+".PDFS"
 PROCwait(100)
 OSCLI "PDFSMount 127.0.0.1:7015"
 REM over USB the filer mounts the phone by itself, 2 seconds after it starts
