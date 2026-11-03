@@ -95,6 +95,28 @@ pd_time_cs (void)
   return r.r[0];
 }
 
+/* The hourglass, with how far a long job has got */
+void
+pd_busy (unsigned done, unsigned total)
+{
+  static int on;
+  regs r = {{ 0 }};
+  if (!total)
+    {
+      if (on)
+        swix_regs (0x406C1, &r);                 /* Hourglass_Off */
+      on = 0;
+      return;
+    }
+  if (!on)
+    {
+      swix_regs (0x406C0, &r);                   /* Hourglass_On */
+      on = 1;
+    }
+  r.r[0] = (unsigned) ((uint64_t) done * 100 / total);
+  swix_regs (0x406C4, &r);                       /* Hourglass_Percentage */
+}
+
 uint32_t
 pd_unix_time (void)
 {

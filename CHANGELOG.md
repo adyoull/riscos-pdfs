@@ -1,5 +1,19 @@
 # Changes
 
+## 0.16.3 beta (3 November 2026)
+
+For folders with thousands of files on Android devices.
+
+- A folder listed again (PDFS keeps a listing for 5 seconds) is no longer
+  read again an object at a time: PDFS asks for the list of what's in it
+  (one request), and only asks about what's new. A folder of 2,100 photos
+  took over 50 seconds to list, and was listed again when copying from it.
+- While a big folder is listed for the first time, the hourglass shows how
+  far it has got.
+- No gap between an answer and the next request on Android devices (0.16
+  added 1 cs for the Amazon Fire, but what lost its answers was fixed in
+  0.16.2). `PDFS$Gap` still sets one.
+
 ## 0.16.2 beta (3 November 2026)
 
 For devices whose answers went missing (an Amazon Fire, and probably the

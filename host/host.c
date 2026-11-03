@@ -59,6 +59,7 @@ pd_time_cs (void)
 
 uint32_t pd_unix_time (void) { return (uint32_t) time (0); }
 void pd_log (const char *s) { if (verbose) fprintf (stderr, "%s\n", s); }
+void pd_busy (unsigned done, unsigned total) { (void) done; (void) total; }
 void pd_log_hex (const char *w, uint32_t v) { if (verbose) fprintf (stderr, "%s &%X\n", w, v); }
 
 static const struct { const char *ext; int type; } types[] = {
@@ -826,6 +827,8 @@ main (int argc, char **argv)
       extern uint32_t mtp_tid_after_open;
       mtp_tid_after_open = (uint32_t) strtoul (getenv ("PDFS_TID_START"), 0, 16);
     }
+  if (getenv ("PDFS_DIR_TTL_CS"))
+    pdfs_dir_ttl_cs = (unsigned) atoi (getenv ("PDFS_DIR_TTL_CS"));
   pdfs_settle_cs = getenv ("PDFS_SETTLE_CS") ? (unsigned) atoi (getenv ("PDFS_SETTLE_CS")) : 0;
   if (getenv ("PDFS_SHOW_EXT"))
     pdfs_set_hide_ext (0);

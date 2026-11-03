@@ -18,7 +18,10 @@ unsigned pdfs_settle_cs = 100;
    request (see gap_wait in mtp.c); -1: the default. *PDFSMount sets it
    from PDFS$Gap. */
 int pdfs_gap_cs = -1;
-#define ANDROID_GAP_CS 1
+/* (0.16 test 10 added 1 cs for the Amazon Fire, but what lost its answers
+   was 0.16.1's USB reads: 0.16.3 leaves no gap, which listing a big folder
+   an object at a time is quicker for. PDFS$Gap sets one.) */
+#define ANDROID_GAP_CS 0
 
 #define MAX_DEVICES   4
 #define MAX_STORAGES  4
@@ -953,8 +956,8 @@ list_dir (node *dir)
   int ne = 0, rc;
   int root = dir == &st->root;
   uint32_t parent = root ? 0xFFFFFFFFu : dir->handle;
-  uint32_t *hs = 0, nh = 0;
-  int have_handles = 0;
+  uint32_t *hs = 0, nh = 0, *known = 0, nknown = 0;
+  int have_handles = 0, busy = 0;
   const pd_error *err = 0;
   unsigned saved_timeout = m->timeout_cs;
   if (m->timeout_cs < 3000)
@@ -1069,9 +1072,30 @@ list_dir (node *dir)
         got[i] = es[i].handle;
       sort_handles (got, (uint32_t) ne);
       int nprop = ne;             /* got[] covers these; ne grows below */
+      /* Listed before, and not by a property list just now: what's known
+         of the objects still there is kept, and only new ones are asked
+         about (a folder of 2000 photos took Android 50 s to list an object
+         at a time, and was listed again every few seconds while being
+         copied from) */
+      if (dir->listed && !nprop)
+        {
+          uint32_t nk = 0;
+          for (node *c = dir->child; c; c = c->next)
+            nk += !c->pending;
+          known = pd_alloc (4 * (size_t) (nk ? nk : 1));
+          if (known)
+            {
+              for (node *c = dir->child; c; c = c->next)
+                if (!c->pending)
+                  known[nknown++] = c->handle;
+              sort_handles (known, nknown);
+            }
+        }
       uint32_t missing = 0;
       for (uint32_t i = 0; i < nh; i++)
-        missing += !has_handle (got, (uint32_t) ne, hs[i]);
+        missing += !has_handle (got, (uint32_t) ne, hs[i]) && !has_handle (known, nknown, hs[i]);
+      unsigned asked = 0;
+      busy = missing >= 50;
       if (missing)
         {
           entry *n2 = pd_realloc (es, sizeof (entry) * (size_t) (ne + missing));
@@ -1084,9 +1108,11 @@ list_dir (node *dir)
           es = n2;
           for (uint32_t i = 0; i < nh; i++)
             {
-              if (has_handle (got, (uint32_t) nprop, hs[i]))
+              if (has_handle (got, (uint32_t) nprop, hs[i]) || has_handle (known, nknown, hs[i]))
                 continue;
               uint32_t h = hs[i];
+              if (busy && !(asked++ % 20))
+                pd_busy (asked, missing);
               mtp_data oi = { 0, 0, 0 };
               rc = mtp_transaction (m, OP_GetObjectInfo, &h, 1, 0, 0, &oi, 0);
               memset (&es[ne], 0, sizeof (entry));
@@ -1148,6 +1174,11 @@ list_dir (node *dir)
           }
         apply_entry (dir, x, mark);
       }
+    /* kept: known, and still there */
+    if (known)
+      for (node *c = dir->child; c; c = c->next)
+        if (c->seen != mark && has_handle (known, nknown, c->handle) && has_handle (hs, nh, c->handle))
+          c->seen = mark;
     pd_free (es);
     /* names shown with their suffixes because of a clash: check again */
     for (node *c = dir->child; c; c = c->next)
@@ -1171,6 +1202,9 @@ out:
   m->timeout_cs = saved_timeout;
   pd_free (es);
   pd_free (hs);
+  pd_free (known);
+  if (busy)
+    pd_busy (0, 0);
   return err;
 }
 

@@ -7,7 +7,7 @@ different device behaviours and check the results in the simulator's folders.
 Copyright 2026 Andrew Youll. Licensed under the Apache License, Version 2.0.
 """
 import struct
-import os, random, re, shutil, signal, subprocess, sys, tempfile, time
+import os, random, re, shutil, signal, subprocess, sys, tempfile, threading, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -328,9 +328,49 @@ def spec_details():
     ok(len(set(infos)) == 1 and "load" in infos[0], "the same time whatever the zone: %s" % infos)
 
 
+def big_folder_again():
+    print("== a big folder listed again (Android, an object at a time): only what's new is asked about")
+    s = Sim("--android", "-v")
+    try:
+        cam = local(s, "Download", "Camera")
+        os.makedirs(cam)
+        for i in range(120):
+            open(os.path.join(cam, "IMG_%04d.jpg" % i), "w").write("p%d" % i)
+        def change():
+            # once the first listing is done (the simulator's log: Download,
+            # Camera and the 120 photos asked about), not on a timer
+            logf = os.path.join(s.dir, "sim.log")
+            for _ in range(400):
+                s.log.flush()
+                if open(logf).read().count("op 1008") >= 122:
+                    break
+                time.sleep(0.05)
+            open(os.path.join(cam, "IMG_new.jpg"), "w").write("new")
+            os.remove(os.path.join(cam, "IMG_0005.jpg"))
+        th = threading.Thread(target=change)
+        th.start()
+        d = D + ".Download.Camera"
+        r = s.run(["ls", d], ["sleep", "2"], ["ls", d],
+                  env={"PDFS_TRACE": "", "PDFS_VERBOSE": "1", "PDFS_DIR_TTL_CS": "50"})
+        th.join()
+        infos = [l for l in r.stderr.splitlines() if " mtp> &1008" in l]
+        handles = [l for l in r.stderr.splitlines() if " mtp> &1007" in l]
+        out = r.stdout
+        parts = out.split(" entries")
+        second = parts[1] if len(parts) > 2 else ""
+        # (and one each for Download and Camera, to find the folder)
+        ok(len(infos) == 123, "120 objects asked about once, and the new one: %d GetObjectInfo" % len(infos))
+        ok(len(handles) >= 2, "the folder's handles asked for again (%d)" % len(handles))
+        ok("IMG_new " in second and "IMG_0005 " not in second and "IMG_0119 " in second
+           and "IMG_0005 " in parts[0],
+           "the second listing has the new photo, not the deleted one, and the rest")
+    finally:
+        s.stop()
+
+
 def android_gap():
     print("== an Android device: a gap between an answer and the next request")
-    for gap, want in ((None, 1), ("3", 3), ("0", 0)):
+    for gap, want in ((None, 0), ("3", 3), ("1", 1)):
         s = Sim("--android")
         try:
             for i in range(6):
@@ -665,6 +705,7 @@ def main():
     open_like_openmtp()
     spec_details()
     android_gap()
+    big_folder_again()
     stats()
     background_read()
     recovery()

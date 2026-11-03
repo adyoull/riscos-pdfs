@@ -12,6 +12,9 @@ void pd_free (void *p);
 void *pd_realloc (void *p, size_t n);   /* contents kept; NULL on failure (p kept) */
 
 unsigned pd_time_cs (void);
+/* A long job (listing a big folder): done of total so far, to show (RISC
+   OS: the hourglass with a percentage); total 0 when it's over */
+void pd_busy (unsigned done, unsigned total);
 uint32_t pd_current_task (void);        /* the Wimp task running now (0: none) */             /* monotonic centiseconds */
 uint32_t pd_unix_time (void);           /* seconds since 1970, UTC */
 
