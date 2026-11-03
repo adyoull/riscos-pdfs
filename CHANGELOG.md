@@ -1,5 +1,24 @@
 # Changes
 
+## 0.16.2 beta (3 November 2026)
+
+For devices whose answers went missing (an Amazon Fire, and probably the
+tablets that "do nothing" on some machines).
+
+- PDFS took what had come in from a device with OS_GBPB. On a USB device,
+  DeviceFS passes each OS_GBPB's byte count to USBDriver as the length of
+  the next USB read, so after a short answer (say 343 bytes) the next read
+  was too short for a whole 512-byte packet. The controller then reports
+  "babble", the packet is lost and the input pipe stops: the lost answers
+  0.16 cleared up and asked again for. PDFS now takes the bytes straight
+  from DeviceFS's buffer (as Dave Higton's !MTP does), which starts no USB
+  read, and asks for every read itself: always 16 KB, a whole number of
+  packets, with the next one asked for as soon as the last is taken (so
+  big copies are as fast as before).
+- Unplugging a device while PDFS is in the middle of a USB call: PDFS
+  stops using the device's streams straight after the call (they may have
+  been closed during it).
+
 ## 0.16.1 beta (1 November 2026)
 
 For PDFS loaded at the F12 command line, and devices that ask for access.

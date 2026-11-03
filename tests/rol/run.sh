@@ -107,7 +107,9 @@ if [ $USBEMU = 1 ]; then
   [ $OLDUSB = 1 ] && sed -i '1i Set PDFSEmu$OldDriver 1' "$T/w/t,feb"
   [ ${FIRE:-0} = 1 ] && sed -i '1i Set PDFSEmu$Phone fire' "$T/w/t,feb"
   sed -i '1i Set PDFSEmu$MissingZLP 0' "$T/w/t,feb"
+  sed -i '1i Set PDFSEmu$Babbles 0' "$T/w/t,feb"
   echo "Show PDFSEmu\$MissingZLP" >> "$T/w/t,feb"
+  echo "Show PDFSEmu\$Babbles" >> "$T/w/t,feb"
   python3 - "$T/w/desk,ffb" <<'PY'
 import sys
 p = sys.argv[1]; b = open(p, "rb").read()
@@ -133,7 +135,7 @@ sleep 1
 kill -0 $SIM 2>/dev/null || { echo "the simulator did not start (port 7015 in use?): see $OUT/sim.log" >&2; exit 1; }
 
 if [ $DESKTOP = 0 ]; then
-  "$TB/bin/rol-run" -t 200 -C "$T/w" -c 'Obey t' > "$OUT/cli.txt" 2>&1 || true
+  "$TB/bin/rol-run" ${ROL_VERBOSE:+-v} -t 200 -C "$T/w" -c 'Obey t' > "$OUT/cli.txt" 2>&1 || true
   cat "$OUT/cli.txt"
   [ -n "${PDFS_TRACE:-}" ] && { echo "--- trace"; tr -d '\r' < "$T/w/trlog" 2>/dev/null; }
   check 'grep -q "pic/jpg .*&C85 .* 3  bytes" "$OUT/cli.txt"' "*Info: type from the extension"
@@ -158,6 +160,7 @@ if [ $DESKTOP = 0 ]; then
     fi
     check 'grep -q "PDFSEmu\$ShortPackets : 0" "$OUT/cli.txt"' "no transfer ends with a short packet inside a container"
     check 'grep -q "PDFSEmu\$MissingZLP : 0" "$OUT/cli.txt"' "every container ends with a short or zero-length packet"
+    check 'grep -q "PDFSEmu\$Babbles : 0" "$OUT/cli.txt"' "no USB read is shorter than the packet that comes (babble: a lost answer)"
     check 'grep -q "USB8 .*08/06/50" "$OUT/cli.txt" && grep -q "PDFS test SimPhone (USB9)" "$OUT/cli.txt"' "the memory stick is listed but not mounted; the phone is, over USB"
   fi
 elif [ -n "$CHARGING" ]; then

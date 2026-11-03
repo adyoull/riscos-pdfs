@@ -121,9 +121,14 @@ log_chars (const char *s)
     logbuf[logpos++ % LOGSIZE] = *s++;
 }
 
+/* (the USB emulator's test build: a copy of the log to a file) */
+void (*pd_log_tap) (const char *s);
+
 void
 pd_log (const char *s)
 {
+  if (pd_log_tap)
+    pd_log_tap (s);
   if (!logging)
     return;
   log_chars (s);

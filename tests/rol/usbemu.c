@@ -32,6 +32,7 @@
 #define Socket_Send             0x41208
 #define Socket_Close            0x41210
 #define Socket_Select           0x41211
+#define Socket_Ioctl            0x41212
 
 #define FAKE_BASE  0x7E00     /* our stream "handles"; real ones are small numbers */
 #define NSTREAM    6
@@ -46,13 +47,44 @@ typedef struct
   int inflight;             /* a transfer the charging phone NAKs is on the bus */
   unsigned toggle;          /* host side: packets sent since the pipe was opened (or ClearStall) */
   unsigned flags;           /* Get/Set Options: bit 1 'short' */
-  int halted;               /* PDFSEmu$InHaltAfter: this input pipe has failed on the host's side */
+  int halted;               /* this input pipe's read failed (babble, or PDFSEmu$InHaltAfter): no more until ClearStall */
+  unsigned rd_len, rd_got;  /* the bulk IN read in progress: its length, and bytes so far (0: none) */
+  unsigned next_len;        /* the next read's length (WakeUpRX's count while a read is going; 0: none) */
   unsigned cap, len;        /* buffer size and bytes in it */
   uint8_t *buf;
 } stream;
 
 static stream streams[NSTREAM];
 static int sock = -1;
+
+/* The bulk IN pipe as USBDriver and a host controller run it (0.16.2):
+   - one read at a time; its length is WakeUpRX's count (DeviceFS's
+     OS_GBPB 4 passes its byte count as WakeUpRX's count too), cut to the
+     free space in whole packets; a WakeUpRX while a read is going only sets
+     the next read's length, which starts when the read ends;
+   - the device sends each container as 512-byte packets, the last one
+     short, and a zero-length packet after a container of 512n bytes;
+   - a read ends at a short packet, or when it's full;
+   - a packet bigger than the room left in the read is babble: the read
+     fails (TransferInfo -1), the packet is lost, and no more reads start
+     until ClearStall.
+   Data from the simulator waits in rxq until a read takes it. */
+#define RX_MPS 512
+static uint8_t rxq[131072];
+static unsigned rxq_len;
+static unsigned rxq_head;          /* where its first byte is (moved down at each fill) */
+static uint32_t rx_cont_left;       /* bytes of the IN container in hand still to send; 0 between containers */
+static int rx_zlp_due;
+unsigned usbemu_babbles;
+
+static void
+rx_reset (void)
+{
+  rxq_len = 0;
+  rxq_head = 0;
+  rx_cont_left = 0;
+  rx_zlp_due = 0;
+}
 unsigned usbemu_transfers, usbemu_short;
 static uint32_t container_left;     /* bytes of the current OUT container still to come */
 static uint8_t hdr_bytes[4];
@@ -117,6 +149,45 @@ log_line (const char *s)
   pd_log (s);
 }
 
+/* PDFSEmu$LogFile set: every log line (and the trace) to that file as it
+   happens, for a test that hangs before *PDFSLog can be asked */
+extern void (*pd_log_tap) (const char *s);
+static int tap_handle = -1;
+
+static void
+tap (const char *s)
+{
+  if (tap_handle <= 0)
+    return;
+  unsigned n = 0;
+  while (s[n])
+    n++;
+  regs w = {{ 2, (unsigned) tap_handle, (unsigned) s, n }};
+  swix_regs (0x0C, &w);                   /* OS_GBPB 2 */
+  regs c = {{ 2, (unsigned) tap_handle, (unsigned) "\n", 1 }};
+  swix_regs (0x0C, &c);
+  regs fl = {{ 255, (unsigned) tap_handle }};
+  swix_regs (0x09, &fl);                  /* OS_Args 255: to the disc now */
+}
+
+static void
+tap_open (void)
+{
+  if (tap_handle >= 0)
+    return;
+  tap_handle = 0;
+  char name[256];
+  regs v = {{ (unsigned) "PDFSEmu$LogFile", (unsigned) name, sizeof name - 1, 0, 3 }};
+  if (swix_regs (0x23, &v))               /* OS_ReadVarVal */
+    return;
+  name[v.r[2]] = 0;
+  regs f = {{ 0x83, (unsigned) name }};   /* OS_Find: open out */
+  if (swix_regs (0x0D, &f) || !f.r[0])
+    return;
+  tap_handle = (int) f.r[0];
+  pd_log_tap = tap;
+}
+
 static int
 connect_sim (void)
 {
@@ -145,6 +216,7 @@ connect_sim (void)
   regs cl = {{ (unsigned) sock }};
   swix_regs (Socket_Close, &cl);
   sock = -1;
+  rx_reset ();
   return -1;
 }
 
@@ -412,6 +484,7 @@ run_events (void)
           regs cl = {{ (unsigned) sock }};
           swix_regs (Socket_Close, &cl);
           sock = -1;
+          rx_reset ();
         }
       gone_at[phone_gen] = emu_now () | 1;
       phone_present = 0;
@@ -539,6 +612,8 @@ open_fake (const char *path, int output)
         s->failed = 0;
         s->inflight = 0;
         s->toggle = 0;
+        s->halted = 0;
+        s->rd_len = s->rd_got = s->next_len = 0;
         if (gone_at[phone_gen])
           hazard_note ("a stream opened on a device that has gone (before its Service_DeviceDead)");
         if (s->ep == 1 && !output && !charging_gen (s->gen) && connect_sim ())
@@ -565,37 +640,239 @@ send_all (const uint8_t *p, unsigned n)
     }
 }
 
-/* WakeUpRX: fetch what the "device" has, up to bytes */
-static void
-fetch (stream *s, unsigned bytes)
+/* Socket_Recv without waiting: the test bed's Socket_Select can say a
+   socket is readable after its data has been taken (a stale SIGIO), and a
+   blocking recv then waits for ever (the simulator waiting for the next
+   command): seen as hangs in 0.16.2's reads */
+static int
+recv_now (void *dst, unsigned n)
 {
-  if (sock < 0 || s->ep != 1)
-    return;
-  read_scenario ();
-  if (in_halt_after && !in_halt_done && in_delivered + 1 >= in_halt_after)
+  unsigned on = 1, off = 0;
+  regs a = {{ (unsigned) sock, 0x8004667Eu /* FIONBIO */, (unsigned) &on }};
+  swix_regs (Socket_Ioctl, &a);
+  regs r = {{ (unsigned) sock, (unsigned) dst, n, 0 }};
+  int k = swix_regs (Socket_Recv, &r) ? -1 : (int) r.r[0];
+  regs b = {{ (unsigned) sock, 0x8004667Eu, (unsigned) &off }};
+  swix_regs (Socket_Ioctl, &b);
+  return k;
+}
+
+/* What the simulator has sent: into rxq */
+static void
+rx_fill (void)
+{
+  if (rxq_head)
     {
-      in_halt_done = 1;
-      s->halted = 1;
-      log_line ("usbemu: the input pipe fails on the host's side (the device holds its answer)");
+      memmove (rxq, rxq + rxq_head, rxq_len);
+      rxq_head = 0;
     }
-  if (s->halted)
-    return;
-  if (bytes > s->cap - s->len)
-    bytes = s->cap - s->len;
-  if (!bytes)
+  if (sock < 0 || rxq_len >= sizeof rxq)
     return;
   uint32_t set[8] = { 0 };
   set[sock / 32] |= 1u << (sock % 32);
-  uint32_t tv[2] = { 0, 2000 };
+  uint32_t tv[2] = { 0, 1000 };
   regs sel = {{ (unsigned) sock + 1, (unsigned) set, 0, 0, (unsigned) tv }};
   if (swix_regs (Socket_Select, &sel) || sel.r[0] == 0)
-    return;
-  regs r = {{ (unsigned) sock, (unsigned) (s->buf + s->len), bytes, 0 }};
-  if (!swix_regs (Socket_Recv, &r) && (int) r.r[0] > 0)
     {
-      s->len += r.r[0];
-      in_delivered++;
+      static unsigned quiet;
+      if (pd_log_tap && emu_now () - quiet > 300)
+        {
+          quiet = emu_now ();
+          char m[120], *q = m;
+          const char *t = "usbemu: nothing more from the simulator; rxq ";
+          while (*t)
+            *q++ = *t++;
+          unsigned v = rxq_len; char d[12]; int k = 0;
+          do d[k++] = (char) ('0' + v % 10); while (v /= 10);
+          while (k) *q++ = d[--k];
+          t = ", cont_left ";
+          while (*t) *q++ = *t++;
+          v = rx_cont_left; k = 0;
+          do d[k++] = (char) ('0' + v % 10); while (v /= 10);
+          while (k) *q++ = d[--k];
+          *q = 0;
+          log_line (m);
+        }
+      return;
     }
+  int k = recv_now (rxq + rxq_len, sizeof rxq - rxq_len);
+  if (k > 0)
+    rxq_len += (unsigned) k;
+}
+
+/* The size of the next packet the device would send, or -1 if it hasn't
+   all arrived yet */
+static int
+rx_packet (void)
+{
+  if (rx_zlp_due)
+    return 0;
+  if (!rx_cont_left)
+    {
+      if (rxq_len < 4)
+        return -1;
+      const uint8_t *h = rxq + rxq_head;
+      uint32_t len = h[0] | h[1] << 8 | h[2] << 16 | (uint32_t) h[3] << 24;
+      if (len < 12 || len > 0x7FFFFFFF)
+        len = rxq_len;            /* not a container start (out of step): as it comes */
+      rx_cont_left = len;
+    }
+  unsigned pkt = rx_cont_left < RX_MPS ? rx_cont_left : RX_MPS;
+  return rxq_len >= pkt ? (int) pkt : -1;
+}
+
+static void
+rx_consume (unsigned pkt, uint8_t *dst)
+{
+  if (rx_zlp_due && !pkt)
+    {
+      rx_zlp_due = 0;
+      return;
+    }
+  if (dst)
+    memcpy (dst, rxq + rxq_head, pkt);
+  rxq_head += pkt;
+  rxq_len -= pkt;
+  if (!rxq_len)
+    rxq_head = 0;
+  rx_cont_left -= pkt;
+  if (!rx_cont_left && pkt == RX_MPS)
+    rx_zlp_due = 1;
+}
+
+/* Time passes on the bulk IN pipe: the read in progress takes what has come */
+static void
+rx_pump (stream *s)
+{
+  if (sock < 0 || s->ep != 1 || s->output || s->halted || gone_at[s->gen] || charging_gen (s->gen))
+    return;
+  for (;;)
+    {
+      if (!s->rd_len)
+        {
+          if (!s->next_len)
+            return;
+          unsigned n = (s->cap - s->len) & ~(RX_MPS - 1);
+          if (n > s->next_len)
+            n = s->next_len;
+          s->next_len = 0;
+          if (!n)
+            return;
+          read_scenario ();
+          if (in_halt_after && !in_halt_done && in_delivered + 1 >= in_halt_after)
+            {
+              in_halt_done = 1;
+              s->halted = 1;
+              log_line ("usbemu: the input pipe fails on the host's side (the device holds its answer)");
+              return;
+            }
+          s->rd_len = n;
+          s->rd_got = 0;
+        }
+      rx_fill ();
+      int pkt = rx_packet ();
+      if (pkt < 0)
+        return;
+      if ((unsigned) pkt > s->rd_len - s->rd_got)
+        {
+          /* babble: the packet doesn't fit the read: lost, and the pipe stops */
+          char m[120];
+          char *q = m;
+          const char *t = "usbemu: babble: a read with ";
+          while (*t)
+            *q++ = *t++;
+          unsigned room = s->rd_len - s->rd_got, v = room;
+          char d[12];
+          int k = 0;
+          do d[k++] = (char) ('0' + v % 10); while (v /= 10);
+          while (k)
+            *q++ = d[--k];
+          t = " bytes of room got a bigger packet: lost, the pipe stops (TransferInfo -1)";
+          while (*t)
+            *q++ = *t++;
+          *q = 0;
+          log_line (m);
+          rx_consume ((unsigned) pkt, 0);
+          s->halted = 1;
+          s->rd_len = 0;
+          set_count ("PDFSEmu$Babbles", ++usbemu_babbles);
+          return;
+        }
+      rx_consume ((unsigned) pkt, s->buf + s->len);
+      s->len += (unsigned) pkt;
+      s->rd_got += (unsigned) pkt;
+      if (pkt < RX_MPS || s->rd_got == s->rd_len)
+        {
+          s->rd_len = 0;
+          in_delivered++;
+        }
+    }
+}
+
+/* WakeUpRX with a count (USBDriver: the next read's length) */
+static void
+rx_wake (stream *s, unsigned count)
+{
+  if (!count || s->ep != 1 || s->output || s->halted)
+    return;
+  s->next_len = count;
+  rx_pump (s);
+}
+
+/* The buffer manager on a fake stream's buffer (buffer handle = handle +
+   0x200): what's there, and taking it, without starting a USB read (as
+   PDFS 0.16.2 does it; OS_GBPB 4 starts one) */
+static void
+put_num (char **q, const char *label, unsigned v)
+{
+  while (*label)
+    *(*q)++ = *label++;
+  char d[12];
+  int k = 0;
+  do d[k++] = (char) ('0' + v % 10); while (v /= 10);
+  while (k)
+    *(*q)++ = d[--k];
+}
+
+unsigned
+usbemu_used (unsigned buffer)
+{
+  stream *s = fake (buffer - 0x200);
+  if (!s)
+    return 0;
+  rx_pump (s);
+  static unsigned last_state;
+  if (pd_log_tap && emu_now () - last_state > 200)
+    {
+      /* (with PDFSEmu$LogFile: what the pipe is doing while PDFS waits) */
+      char m[200], *q = m;
+      last_state = emu_now ();
+      put_num (&q, "usbemu: waiting: rd_len ", s->rd_len);
+      put_num (&q, " rd_got ", s->rd_got);
+      put_num (&q, " next_len ", s->next_len);
+      put_num (&q, " halted ", (unsigned) s->halted);
+      put_num (&q, " rxq ", rxq_len);
+      put_num (&q, " cont_left ", rx_cont_left);
+      put_num (&q, " zlp_due ", (unsigned) rx_zlp_due);
+      put_num (&q, " sock ", (unsigned) sock);
+      put_num (&q, " len ", s->len);
+      *q = 0;
+      log_line (m);
+    }
+  return s->len;
+}
+
+unsigned
+usbemu_take (unsigned buffer, void *dst, unsigned n)
+{
+  stream *s = fake (buffer - 0x200);
+  if (!s)
+    return 0;
+  unsigned k = n < s->len ? n : s->len;
+  memcpy (dst, s->buf, k);
+  memmove (s->buf, s->buf + k, s->len - k);
+  s->len -= k;
+  return k;
 }
 
 /* --- the SWIs ---------------------------------------------------------------------------- */
@@ -604,6 +881,7 @@ oserror *
 usbemu_swix (unsigned swi, regs *r)
 {
   stream *s;
+  tap_open ();
   switch (swi)
     {
     case 0x54A45:                                /* USBDriver_Version */
@@ -715,6 +993,9 @@ usbemu_swix (unsigned swi, regs *r)
             }
           else if (r->r[0] == 4 && !s->output)
             {
+              /* DeviceFS's gbpb_get calls WakeUpRX with the byte count
+                 first: USBDriver takes it as the next read's length */
+              rx_wake (s, n);
               unsigned k = n < s->len ? n : s->len;
               memcpy (p, s->buf, k);
               memmove (s->buf, s->buf + k, s->len - k);
@@ -735,6 +1016,7 @@ usbemu_swix (unsigned swi, regs *r)
             {
               if (stream_dead (s, "BufferSpace on a stream after its device's Service_DeviceDead"))
                 return (oserror *) &err_notfound;
+              rx_pump (s);
               r->r[3] = s->cap;
               r->r[4] = s->cap - s->len;
               return 0;
@@ -755,10 +1037,14 @@ usbemu_swix (unsigned swi, regs *r)
           r->r[3] = 1;                           /* done */
           if ((s = fake_stream (r->r[2])))
             {
+              if (!s->output)
+                rx_pump (s);
               if (s->failed || s->halted)
                 r->r[3] = (unsigned) -1;         /* failed */
               else if (charging_gen (s->gen) && (s->len || s->inflight))
                 r->r[3] = 0;                     /* NAKed: still going */
+              else if (!s->output && (s->rd_len || s->next_len))
+                r->r[3] = 0;                     /* a read going, or one to come */
             }
           return 0;
         case 13:                                 /* MonitorRX: why the transfer failed */
@@ -790,8 +1076,14 @@ usbemu_swix (unsigned swi, regs *r)
               if (s->output)
                 dev_toggle[s->gen][s->ep & 15] = 0;
               s->toggle = 0;
+              if (!s->output)
+                {
+                  s->rd_len = 0;
+                  s->next_len = 0;
+                }
               if (s->halted && in_halt_drop)
                 {
+                  rx_reset ();
                   /* the device's answer is lost: what the bridge has (or
                      gets in the next 50 ms) is dropped */
                   uint8_t junk[512];
@@ -804,10 +1096,10 @@ usbemu_swix (unsigned swi, regs *r)
                       regs sel = {{ (unsigned) sock + 1, (unsigned) set, 0, 0, (unsigned) tv }};
                       if (swix_regs (Socket_Select, &sel) || sel.r[0] == 0)
                         continue;
-                      regs rr = {{ (unsigned) sock, (unsigned) junk, sizeof junk, 0 }};
-                      if (swix_regs (Socket_Recv, &rr) || (int) rr.r[0] <= 0)
-                        break;
-                      dropped += rr.r[0];
+                      int k = recv_now (junk, sizeof junk);
+                      if (k <= 0)
+                        continue;
+                      dropped += (unsigned) k;
                     }
                   log_line (dropped ? "usbemu: ClearStall on the failed input pipe: the answer it held is lost"
                                     : "usbemu: ClearStall on the failed input pipe (nothing held)");
@@ -873,7 +1165,7 @@ usbemu_swix (unsigned swi, regs *r)
         case 3:                                  /* WakeUpRX */
           run_events ();
           if ((s = fake_stream (r->r[2])) && !gone_at[s->gen] && !charging_gen (s->gen))
-            fetch (s, r->r[3]);
+            rx_wake (s, r->r[3]);
           return 0;
         }
       break;

@@ -564,6 +564,8 @@ class Device:
 
 
 def log(m):
+    if os.environ.get("MTPSIM_TS"):
+        m = "%.3f " % time.time() + m
     print("mtpsim: " + m, file=sys.stderr, flush=True)
 
 

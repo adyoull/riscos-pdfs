@@ -37,11 +37,28 @@
 #ifdef USB_EMU                   /* the test build: tests/rol/usbemu.c */
 oserror *usbemu_swix (unsigned swi, regs *r);
 void usbemu_purge (unsigned buffer);
+unsigned usbemu_used (unsigned buffer);
+unsigned usbemu_take (unsigned buffer, void *dst, unsigned n);
 #define swix_regs usbemu_swix
 #define buffer_purge usbemu_purge
+#define buffer_used usbemu_used
+#define buffer_take usbemu_take
 #else
 void buffer_purge (unsigned buffer);
+unsigned buffer_used (unsigned buffer);
+unsigned buffer_take (unsigned buffer, void *dst, unsigned n);
 #endif
+
+/* The length of every bulk IN read PDFS asks USBDriver for: whole packets
+   (512 at high speed, 64 at full), and at most 16 KB (an EHCI qTD's worth).
+   0.16.1 and before read with OS_GBPB, whose byte count DeviceFS passes to
+   USBDriver as the next read's length: after taking an answer of, say, 343
+   bytes, the next read was 343 bytes long, too short for a full packet,
+   and the controller's babble lost the packet and stopped the pipe (the
+   Amazon Fire's lost answers, and probably Jim's tablet answering nothing
+   on an older machine). Bytes are now taken from the buffer with the
+   buffer manager (buffer_take), which starts no read. */
+#define READ_CHUNK 16384u
 
 #define OS_GBPB                 0x0C
 #define OS_Find                 0x0D
@@ -109,6 +126,7 @@ typedef struct usbt
   int h_in, h_out, h_int;       /* FileSwitch handles of the streams */
   unsigned s_in, s_out;         /* USBDriver's stream handles (GetHandles2 R5) */
   unsigned b_out;               /* the output stream's buffer (GetHandles2 R3) */
+  unsigned b_in;                /* the input stream's buffer: bytes taken from it directly */
   int out_failed;               /* the output stream's transfer failed */
   unsigned out_failed_at;       /* when (now_cs) */
   int out_stuck;                /* a transfer didn't finish in time (the device NAKs it) */
@@ -393,6 +411,7 @@ close_streams (usbt *u)
   close_stream (&u->h_int);
   u->s_in = u->s_out = 0;
   u->b_out = 0;
+  u->b_in = 0;
   u->out_failed = 0;
 }
 
@@ -403,7 +422,7 @@ open_streams (usbt *u)
   u->h_out = open_stream (&u->c, u->c.ep_out, "bulk", BULK_BUFFER, 1);
   if (u->c.ep_int && !usb_no_events)
     u->h_int = open_stream (&u->c, u->c.ep_int, "interrupt", EVENT_BUFFER, 0);
-  if (!u->h_in || !u->h_out || handles (u, u->h_in, &u->s_in, 0) || handles (u, u->h_out, &u->s_out, &u->b_out))
+  if (!u->h_in || !u->h_out || handles (u, u->h_in, &u->s_in, &u->b_in) || handles (u, u->h_out, &u->s_out, &u->b_out))
     {
       close_streams (u);
       return -1;
@@ -425,6 +444,8 @@ out_idle (usbt *u, unsigned timeout_cs)
         return u->t.gone = 1, PDT_GONE;
       regs ti = {{ DFS_TRANSFER_INFO, (unsigned) u->c.dev, u->s_out, 0, 0 }};
       int status = swix_regs (DeviceFS_CallDevice, &ti) ? 1 : (int) ti.r[3];
+      if (u->t.gone)            /* unplugged during the call: the streams are closed */
+        return PDT_GONE;
       if (status < 0)
         {
           if (!u->out_failed)
@@ -444,6 +465,8 @@ out_idle (usbt *u, unsigned timeout_cs)
         }
       else
         wake (u, DEVCALL_WAKEUP_TX, u->s_out, 0);
+      if (u->t.gone)
+        return PDT_GONE;
       if (now_cs () - start > timeout_cs)
         return u->out_stuck = 1, PDT_TIMEOUT;
     }
@@ -473,6 +496,8 @@ usb_write (pd_transport *t, const void *buf, uint32_t len, unsigned timeout_cs)
       if (!n)
         return PDT_IO;
       int k = gbpb (u->h_out, (void *) p, n, 1);
+      if (t->gone)
+        return PDT_GONE;
       if (k != (int) n)
         return PDT_IO;
       p += n;
@@ -488,36 +513,44 @@ static int
 usb_read (pd_transport *t, void *buf, uint32_t max, unsigned timeout_cs)
 {
   usbt *u = (usbt *) t;
-  unsigned start = now_cs (), used, free;
+  unsigned start = now_cs ();
   if (t->gone)
     return PDT_GONE;
   for (;;)
     {
-      if (t->gone || buffer_space (u, u->h_in, &used, &free))
+      /* (Service_DeviceDead may come during any call below, and close the
+         streams: then nothing more is asked of them) */
+      if (t->gone || !u->b_in)
         return t->gone = 1, PDT_GONE;
+      unsigned used = buffer_used (u->b_in);
       if (used)
         {
-          int k = gbpb (u->h_in, buf, used < max ? used : max, 0);
+          int k = (int) buffer_take (u->b_in, buf, used < max ? used : max);
           if (k > 0)
             u->last_in = now_cs (), u->in_bytes += (unsigned) k;
-          return k < 0 ? PDT_IO : k;
+          /* and keep the next read asked for (one is always going, or set
+             to follow the one going: the speed of 0.16.1's reads) */
+          if (!t->gone)
+            wake (u, DEVCALL_WAKEUP_RX, u->s_in, READ_CHUNK);
+          return t->gone ? PDT_GONE : k;
         }
-      /* ask for a transfer: as much as the buffer has room for, in whole
-         packets (it ends early at a short packet) */
-      unsigned want = free > 32768 ? 32768 : free;
-      unsigned mps = u->c.mps ? u->c.mps : 64;
-      want &= ~(mps - 1);
-      if (want)
-        wake (u, DEVCALL_WAKEUP_RX, u->s_in, want);
+      /* Nothing there: keep a read asked for. Always READ_CHUNK (whole
+         packets): a WakeUpRX while a read is going only sets the next
+         read's length, so one is always ready, and never too short. */
+      wake (u, DEVCALL_WAKEUP_RX, u->s_in, READ_CHUNK);
+      if (t->gone)
+        return PDT_GONE;
       /* Has the input transfer failed? USBDriver doesn't start another
          after a failure (every read is refused until ClearStall), so
-         nothing more would come in, and the answer on its way is lost:
-         an Amazon Fire's, now and then (0.16 tests 5 to 11; it answers
-         the next request at once). Clear it, say why it failed, and let
-         the MTP layer ask again (PDT_LOST). */
+         nothing more would come in, and the answer on its way is lost
+         (0.16 tests 5 to 11, an Amazon Fire). Clear it, say why it failed,
+         and let the MTP layer ask again (PDT_LOST). */
       unsigned waited = now_cs () - start;
       regs ti = {{ DFS_TRANSFER_INFO, (unsigned) u->c.dev, u->s_in, 0, 0 }};
-      if (!swix_regs (DeviceFS_CallDevice, &ti) && (int) ti.r[3] < 0 && !t->gone)
+      int tierr = swix_regs (DeviceFS_CallDevice, &ti) != 0;
+      if (t->gone)
+        return PDT_GONE;
+      if (!tierr && (int) ti.r[3] < 0)
         {
           char b[160], *q = put_str (b, "usb: an input transfer failed (");
           regs mr = {{ 13 /* DeviceCall_MonitorRX */, (unsigned) u->c.dev, u->s_in }};
@@ -529,13 +562,17 @@ usb_read (pd_transport *t, void *buf, uint32_t max, unsigned timeout_cs)
           q = put_dec (q, waited);
           put_str (q, " cs: clearing the input pipe");
           pd_log (b);
+          if (t->gone)
+            return PDT_GONE;
           regs ci = {{ DFS_CLEAR_STALL, (unsigned) u->c.dev, (unsigned) u->h_in }};
           swix_regs (DeviceFS_CallDevice, &ci);
           u->in_clears++;
+          if (t->gone)
+            return PDT_GONE;
           /* what's left of the answer (if the device sends it after all)
              is dropped, so a request asked again is read in step */
           drain (u, 30);
-          return PDT_LOST;
+          return t->gone ? PDT_GONE : PDT_LOST;
         }
       if (waited > timeout_cs)
         return PDT_TIMEOUT;
@@ -570,22 +607,21 @@ static void
 drain (usbt *u, unsigned cs)
 {
   uint8_t junk[512], first[16];
-  unsigned start = now_cs (), used, free, total = 0;
-  unsigned want = u->c.mps > 512 ? u->c.mps : 512;   /* whole packets */
+  unsigned start = now_cs (), total = 0;
   while (now_cs () - start < cs)
     {
-      if (u->t.gone || buffer_space (u, u->h_in, &used, &free))
+      if (u->t.gone || !u->b_in)
         break;
+      unsigned used = buffer_used (u->b_in);
       if (used)
         {
-          int k = gbpb (u->h_in, junk, used < sizeof junk ? used : sizeof junk, 0);
-          for (int i = 0; i < k && total + (unsigned) i < 16; i++)
-            first[total + (unsigned) i] = junk[i];
-          if (k > 0)
-            total += (unsigned) k;
+          unsigned k = buffer_take (u->b_in, junk, used < sizeof junk ? used : sizeof junk);
+          for (unsigned i = 0; i < k && total + i < 16; i++)
+            first[total + i] = junk[i];
+          total += k;
         }
-      else if (free >= want)
-        wake (u, DEVCALL_WAKEUP_RX, u->s_in, want);
+      else
+        wake (u, DEVCALL_WAKEUP_RX, u->s_in, READ_CHUNK);
     }
   if (total)
     {

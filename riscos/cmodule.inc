@@ -141,6 +141,66 @@ buffer_purge:
 	mov	pc, r3
 1:	ldmfd	sp!, {r4-r11, pc}
 
+@ The buffer manager's routine, in SVC mode with IRQs off (an IRQ may be
+@ filling the buffer, and the routine is for SVC or IRQ mode only). From USR
+@ mode (the filer task), OS_EnterOS first; the mode and IRQ state are put
+@ back after. In: r0 reason, r1 private id, r2/r3 as the reason wants, r12
+@ workspace, r4 the routine. Out: r0-r3 as the routine leaves them. r9-r10
+@ corrupted.
+bm_call:
+	stmfd	sp!, {lr}
+	mrs	r9, cpsr
+	tst	r9, #0xF			@ USR mode: mode bits 0b10000
+	bne	1f
+	swi	0x20016				@ XOS_EnterOS: SVC mode, IRQs as they were
+1:	mrs	r10, cpsr
+	orr	r10, r10, #0x80			@ IRQs off
+	msr	cpsr_c, r10
+	stmfd	sp!, {r9}			@ (on the SVC stack)
+	mov	lr, pc
+	mov	pc, r4
+	ldmfd	sp!, {r9}
+	msr	cpsr_c, r9			@ back to the caller's mode and IRQ state
+	ldmfd	sp!, {pc}
+
+@ unsigned buffer_used(unsigned buffer): the bytes in a buffer manager
+@ buffer (reason 6, UsedSpace), read without OS_GBPB: DeviceFS's OS_GBPB
+@ starts a USB read of its byte count (WakeUpRX), which a short count makes
+@ too short for the packet that comes (babble: lost)
+	.global	buffer_used
+buffer_used:
+	stmfd	sp!, {r4-r11, lr}
+	swi	0x62949				@ XBuffer_InternalInfo
+	movvs	r0, #0
+	bvs	1f
+	mov	r12, r2
+	mov	r4, r1
+	mov	r1, r0
+	mov	r0, #6				@ BufferReason_UsedSpace
+	bl	bm_call
+	mov	r0, r2
+1:	ldmfd	sp!, {r4-r11, pc}
+
+@ unsigned buffer_take(unsigned buffer, void *dst, unsigned n): takes up to
+@ n bytes (reason 3, RemoveBlock); returns how many
+	.global	buffer_take
+buffer_take:
+	stmfd	sp!, {r4-r11, lr}
+	mov	r5, r1
+	mov	r6, r2
+	swi	0x62949				@ XBuffer_InternalInfo
+	movvs	r0, #0
+	bvs	1f
+	mov	r12, r2
+	mov	r4, r1
+	mov	r1, r0
+	mov	r2, r5
+	mov	r3, r6
+	mov	r0, #3				@ BufferReason_RemoveBlock
+	bl	bm_call
+	sub	r0, r6, r3			@ asked for, less not taken
+1:	ldmfd	sp!, {r4-r11, pc}
+
 	.pushsection .data.got_base, "aw"
 	.align	2
 got_base:
