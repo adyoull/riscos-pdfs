@@ -5,7 +5,7 @@ through an emulation of RISC OS's USB stack. These steps try it with a real
 device on a Raspberry Pi (or any machine with RISC OS 5's USB stack).
 
 
-> **Use at your own risk.** PDFS is a beta. It's provided as it is, without
+> **Use at your own risk.** PDFS is provided as it is, without
 > warranty of any kind, and without liability for any loss or damage,
 > including lost data, as the Apache License 2.0 says (sections 7 and 8).
 > Only use it with devices whose data you have backed up, and keep copies

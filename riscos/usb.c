@@ -769,9 +769,9 @@ usb_is_open (const char *dev)
 const pd_error *
 usb_mount (const usb_iface *c)
 {
-  static const pd_error err_open = { 0x1FAE4, "Can't open the device's USB endpoints (is something else using it?)" };
-  static const pd_error err_full = { 0x1FAE5, "Too many USB devices mounted" };
-  static const pd_error err_mem = { 0x1FAB8, "Not enough memory" };
+  static const pd_error err_open = { PDFS_ERRBASE | 0xE4, "Can't open the device's USB endpoints (is something else using it?)" };
+  static const pd_error err_full = { PDFS_ERRBASE | 0xE5, "Too many USB devices mounted" };
+  static const pd_error err_mem = { PDFS_ERRBASE | 0xB8, "Not enough memory" };
   int slot = -1;
   for (int i = 0; i < MAX_OPEN; i++)
     if (!open_list[i])

@@ -5,7 +5,7 @@ MTP (Media Transfer Protocol). A connected device's storages show up as
 discs, such as `PDFS::Pixel-Internal.$`, and work with the Filer, `*Copy`,
 BASIC's OPENIN/OPENOUT and every program that uses FileSwitch.
 
-Status: **0.16.3 beta.** It works with an Android phone (a Pixel) and an
+Status: **0.16.3.** It works with an Android phone (a Pixel) and an
 Amazon Fire 7 tablet on a Raspberry Pi with RISC OS 5: browsing, copying
 both ways with the Filer, big files, unplugging, switching the phone between
 charging and file transfer, and Android's "Allow access" prompt. It's tested against a simulated device
@@ -13,7 +13,7 @@ too, over TCP and through an emulation of USBDriver and DeviceFS. Reports
 from other devices (tablets, cameras, media players) and machines are
 welcome: see docs/TESTING-ON-A-PI.md.
 
-> **Use at your own risk.** PDFS is a beta. It's provided as it is, without
+> **Use at your own risk.** PDFS is provided as it is, without
 > warranty of any kind, and without liability for any loss or damage,
 > including lost data, as the Apache License 2.0 says (sections 7 and 8).
 > Only use it with devices whose data you have backed up, and keep copies
@@ -39,7 +39,7 @@ From riscos-linux-testbed (RISC OS 5 for Linux) with the simulated device
 With PackMan: add the source https://adyoull.github.io/riscos-packages/pkg/index
 and install **PDFS**. It goes in !Boot's PreDesk, so it's loaded at start-up.
 
-Or unzip `PDFS-0.16.3-beta.zip` (from the GitHub release) and double-click
+Or unzip `PDFS-0.16.3.zip` (from the GitHub release) and double-click
 `PDFS` to load it, or put it in `!Boot.Choices.Boot.PreDesk`. Either starts
 its icon bar task, "PDFS Filer", which notices devices being plugged in.
 (Loaded with `*RMLoad` at the F12 command line, the task can't start
@@ -71,7 +71,7 @@ and Python 3 for the host build and tests.
 
     make            # out/PDFS,ffa, out/PDFS-usbemu,ffa (for the tests) and out/pdfs-host
     make check      # host tests
-    make dist       # out/PDFS-<version>-beta.zip, filetypes kept
+    make dist       # out/PDFS-<version>.zip, filetypes kept
 
 Or in riscos-crossdev's container image:
 
@@ -241,5 +241,5 @@ ROOL's documentation; on the Pi they didn't work, so they were taken out.)
 ## Not done yet
 
 - Testing with more real devices: phones, tablets, media players, cameras (docs/TESTING-ON-A-PI.md).
-- SWIs (no SWI chunk yet). Filing system number &FA and error base &1FA00 are
-  provisional until allocated by ROOL.
+- SWIs (none yet, so no SWI chunk). The filing system number, 201 (&C9), and
+  the error numbers, &1C900-&1C9FF, are allocated by ROOL.

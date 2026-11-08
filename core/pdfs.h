@@ -12,7 +12,7 @@
 #define PDFS_VERSION "0.16.3"
 
 /* Filing system number: provisional until allocated by RISC OS Open. */
-#define PDFS_FSNUM 0xFA
+#define PDFS_FSNUM 0xC9                /* 201: allocated by ROOL (Nov 2026) */
 
 /* Registers in and out of a FileSwitch entry point. On RISC OS these are
    the real R0-R7; pointers fit because pd_reg is pointer-sized. */

@@ -27,7 +27,7 @@ module_start:
 	.word	flags - module_start
 
 title:	.asciz	"PDFS"
-help:	.asciz	"PDFS\t\t0.16.3 (3 Nov 2026)"
+help:	.asciz	"PDFS\t\t0.16.3 (8 Nov 2026)"
 	.align	2
 flags:	.word	1				@ 32-bit compatible
 
@@ -44,8 +44,9 @@ fs_info_block:
 	.word	fs_file - module_start
 	@ information word: MultiFS extensions (23), FileSwitch does load and
 	@ save with open/GBPB/close (20, 19), extra info word present (17),
-	@ no limit on open files, filing system number PDFS_FSNUM (&FA)
-	.word	(1 << 23) | (1 << 20) | (1 << 19) | (1 << 17) | 0xFA
+	@ no limit on open files, filing system number PDFS_FSNUM (&C9, 201:
+	@ allocated by ROOL)
+	.word	(1 << 23) | (1 << 20) | (1 << 19) | (1 << 17) | 0xC9
 	.word	fs_func - module_start
 	.word	0				@ no unbuffered GBPB
 	.word	(1 << 5)			@ extra: no CatalogObjects (FileSwitch makes them)

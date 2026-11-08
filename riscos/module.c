@@ -524,13 +524,13 @@ typedef struct
   char name[40];
 } tcp;
 
-ERROR_BLOCK (err_connect, 0x1FAE0, "Can't connect to the simulated device");
-ERROR_BLOCK (err_syntax, 0x1FAE1, "Give an address as a.b.c.d:port");
-ERROR_BLOCK (err_nomem, 0x1FAB8, "Not enough memory");
-ERROR_BLOCK (err_desktop, 0x1FAE3, "Use *Desktop to start the PDFS filer");
-ERROR_BLOCK (err_usb_syntax, 0x1FAE8, "Syntax: *PDFSUSB [control on|off]");
-ERROR_BLOCK (err_ext_syntax, 0x1FAE2, "Syntax: *PDFSExtensions [show|hide]");
-ERROR_BLOCK (err_bg_syntax, 0x1FAE9, "Syntax: *PDFSBackground [on|off]");
+ERROR_BLOCK (err_connect, PDFS_ERRBASE | 0xE0, "Can't connect to the simulated device");
+ERROR_BLOCK (err_syntax, PDFS_ERRBASE | 0xE1, "Give an address as a.b.c.d:port");
+ERROR_BLOCK (err_nomem, PDFS_ERRBASE | 0xB8, "Not enough memory");
+ERROR_BLOCK (err_desktop, PDFS_ERRBASE | 0xE3, "Use *Desktop to start the PDFS filer");
+ERROR_BLOCK (err_usb_syntax, PDFS_ERRBASE | 0xE8, "Syntax: *PDFSUSB [control on|off]");
+ERROR_BLOCK (err_ext_syntax, PDFS_ERRBASE | 0xE2, "Syntax: *PDFSExtensions [show|hide]");
+ERROR_BLOCK (err_bg_syntax, PDFS_ERRBASE | 0xE9, "Syntax: *PDFSBackground [on|off]");
 
 static int
 tcp_connect (tcp *c)
@@ -685,8 +685,8 @@ mount_tcp (const char *arg)
 
 /* --- USB ---------------------------------------------------------------------------- */
 
-ERROR_BLOCK (err_nomtp, 0x1FAE6, "No MTP device found (*PDFSUSB lists the USB devices; an Android device must be set to File transfer)");
-ERROR_BLOCK (err_nousbdev, 0x1FAE7, "That USB device has no interface with bulk endpoints (see *PDFSUSB)");
+ERROR_BLOCK (err_nomtp, PDFS_ERRBASE | 0xE6, "No MTP device found (*PDFSUSB lists the USB devices; an Android device must be set to File transfer)");
+ERROR_BLOCK (err_nousbdev, PDFS_ERRBASE | 0xE7, "That USB device has no interface with bulk endpoints (see *PDFSUSB)");
 
 static int word_is (const char *tail, const char *w);
 

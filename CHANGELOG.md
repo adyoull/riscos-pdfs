@@ -1,5 +1,14 @@
 # Changes
 
+## 0.16.3 (8 November 2026)
+
+The first release that isn't a beta. Since 0.16.3 beta:
+
+- PDFS uses the filing system number ROOL allocated it, 201 (&C9), in place
+  of the provisional &FA, and its error numbers are now &1C900-&1C9FF (they
+  were &1FA00-&1FAFF). Nothing else changes: PDFS:: paths, commands and
+  variables are as before.
+
 ## 0.16.3 beta (3 November 2026)
 
 For folders with thousands of files on Android devices.

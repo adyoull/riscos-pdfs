@@ -12,7 +12,7 @@
 
 RCD_DIR ?= $(abspath ../riscos-crossdev)
 RISCOS_TOOLCHAIN ?= $(RCD_DIR)/toolchain/env
-RELEASE_SUFFIX ?= -beta
+RELEASE_SUFFIX ?=
 VERSION := $(shell sed -n 's/^\#define PDFS_VERSION "\(.*\)"/\1/p' core/pdfs.h)$(RELEASE_SUFFIX)
 T := $(RISCOS_TOOLCHAIN)/bin/arm-riscos-gnueabihf-
 CC := $(T)gcc
